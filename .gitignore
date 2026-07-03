@@ -1,0 +1,5 @@
+iknowledge
+/iknowledge
+*.test
+*.out
+.DS_Store
