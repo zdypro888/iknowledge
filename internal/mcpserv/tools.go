@@ -85,7 +85,7 @@ var allTools = map[string]any{
 	},
 	"kb_remember": map[string]any{
 		"name":        "kb_remember",
-		"description": "沉淀知识(有阈值:费了功夫才懂的、代码上看不出来的才存;一眼懂的不存)。新写的函数直接报符号名,服务端自动落锚建节点。supersedes 是更新/合并旧条目的唯一入口。",
+		"description": "沉淀知识(有阈值:费了功夫才懂的、代码上看不出来的才存;一眼懂的不存)。只收锚定本仓库代码的知识——判据:代码变了它会失效吗;通用编程知识/会话偏好/任务待办三不进(待办归 kb_task,偏好归宿主 memory)。新写的函数直接报符号名,服务端自动落锚建节点。supersedes 是更新/合并旧条目的唯一入口。",
 		"inputSchema": obj(map[string]any{
 			"node": str("节点 ID:file.go#Symbol(方法带接收者,如 file.go#Service.Login)"),
 			"entries": arr(obj(map[string]any{

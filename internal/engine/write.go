@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 
 	"github.com/zdypro888/iknowledge/internal/index"
@@ -61,6 +62,13 @@ func (e *Engine) Remember(a RememberArgs, sid, author string) (string, error) {
 	if n.Status == model.StatusOrphaned {
 		return "", kbErr("NODE_ORPHANED", "节点 "+n.ID+" 的符号已消失,无锚可落",
 			"符号在新位置则对新节点 remember;认领/送葬走 kb_adopt")
+	}
+	// 边界提醒(定案:知识库对应代码,不是记忆库):无锚节点是最容易被当
+	// 通用记忆垃圾桶的地方——每次写入都亮边界,写入方自检。警示不拒收(§12.7)。
+	if len(a.Entries) > 0 && n.Anchor.Hash == "" && !n.PendingAnchor &&
+		(n.Level == model.LevelDir || n.Level == model.LevelProject) {
+		warns = append(warns, "无锚节点只收【约束本仓库代码的业务规则/外部契约】(90 天复核周期);"+
+			"通用编程知识、会话/用户偏好、任务待办不属于知识库——判据:代码变了它会失效吗?偏好归宿主 memory,待办归 kb_task")
 	}
 
 	// 乐观并发校验(impl §7.3 定案)。重锚/升级的【落地】推迟到全部校验通过之后
@@ -123,6 +131,9 @@ func (e *Engine) Remember(a RememberArgs, sid, author string) (string, error) {
 			warnList = append(warnList, warn)
 		}
 		if w := echoWarn(in.Text, cur.sig); w != "" {
+			warnList = append(warnList, w)
+		}
+		if w := boundaryWarn(in.Text); w != "" {
 			warnList = append(warnList, w)
 		}
 		// 机械查重:范围含 refuted/superseded/retired(impl §7.3 定案)。
@@ -330,6 +341,19 @@ func (e *Engine) currentAnchorLocked(ref *index.NodeRef) curAnchor {
 		}
 	}
 	return curAnchor{missing: true, anchor: n.Anchor}
+}
+
+// boundaryRe 是"任务态内容混进知识库"的机械信号(边界定案:知识库只收锚定本仓库
+// 代码的知识——进行中/待办是状态不是知识,归 kb_task;判据:代码变了它会失效吗)。
+// 模式收得极窄防误杀:技术陈述里的"下次重连时会重放"这类合法用语不碰。
+var boundaryRe = regexp.MustCompile(`\bTODO\b|\bFIXME\b|待办|别忘了`)
+
+// boundaryWarn 检测任务态词——警示不拒收(语义边界终归 AI 判,同 §12.7 哲学)。
+func boundaryWarn(text string) string {
+	if m := boundaryRe.FindString(text); m != "" {
+		return "疑似任务态内容(命中:" + m + ")——进行中/待办是状态不是知识,归 kb_task;知识库只收结论(判据:代码变了它会失效吗)"
+	}
+	return ""
 }
 
 // echoWarn 复述检测(2026-07-04,实战反馈"inferred 摘要基本是代码复述"的机械子集):
