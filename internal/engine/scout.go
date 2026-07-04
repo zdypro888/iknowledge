@@ -20,7 +20,7 @@ import (
 // 与 aibridge 方案的关键差异:交卷信号走协议(SubmitFindings→job.done),
 // 不解析终端画面,故无需终端仿真库(铁律一:零重依赖,PTY 原语手写)。
 
-// defaultScoutCommand 缺省侦察兵命令(config scout_command 可覆盖):
+// defaultScoutCommand 缺省侦察兵命令(config scout_command 可覆盖;仅作展示):
 // 禁用 claude -p(独立限流池,CLAUDE.md 铁律),走交互式 + PTY;
 // --strict-mcp-config 只用注入的 scout 配置;--allowedTools 免审批放行 kb 工具。
 const defaultScoutCommand = `claude --mcp-config {mcp} --strict-mcp-config --allowedTools "mcp__knowledge__*"`
@@ -64,12 +64,7 @@ func (e *Engine) selfDispatch(job *scoutJob, brief string, cfg *store.Config) (s
 	}
 	defer os.Remove(cfgPath)
 
-	command := cfg.ScoutCommand
-	if strings.TrimSpace(command) == "" {
-		command = defaultScoutCommand
-	}
-	command = strings.ReplaceAll(command, "{mcp}", cfgPath)
-	cmd := exec.Command("sh", "-c", command)
+	cmd := scoutCommand(cfg.ScoutCommand, cfgPath)
 	cmd.Dir = e.Store.RepoRoot()
 	cmd.Env = append(os.Environ(), "TERM=xterm-256color")
 
@@ -168,6 +163,14 @@ func mcpServerEntry(url string, s *store.Store) map[string]any {
 		entry["headers"] = map[string]string{"Authorization": "Bearer " + tok}
 	}
 	return entry
+}
+
+func scoutCommand(configured, cfgPath string) *exec.Cmd {
+	if strings.TrimSpace(configured) == "" {
+		return exec.Command("claude", "--mcp-config", cfgPath, "--strict-mcp-config", "--allowedTools", "mcp__knowledge__*")
+	}
+	command := strings.ReplaceAll(configured, "{mcp}", cfgPath)
+	return exec.Command("sh", "-c", command)
 }
 
 // scoutActivityMarks 是"回合已启动"的屏幕信号:spinner/响应符只在回合运行时出现,

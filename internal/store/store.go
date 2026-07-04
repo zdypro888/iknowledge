@@ -83,7 +83,7 @@ func (s *Store) ProjectShardPath() string {
 // SrcRelOfShard 由分片路径反推源文件相对路径(正斜杠);非 tree 分片返回 ""。
 func (s *Store) SrcRelOfShard(shardPath string) string {
 	rel, err := filepath.Rel(filepath.Join(s.dir, "tree"), shardPath)
-	if err != nil || strings.HasPrefix(rel, "..") {
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
 		return ""
 	}
 	rel = filepath.ToSlash(rel)

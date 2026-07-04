@@ -22,7 +22,7 @@ go vet ./...
 go test -race ./...
 ```
 
-一期 lint 只用 `go vet`,**不引入 golangci-lint**(与零重依赖哲学一致、减小 CI 面;复评点 M1.4)。CI(.github/workflows/ci.yml)与本节保持一致:ubuntu + macos 矩阵跑同三条命令(flock/rename/目录 fsync 平台敏感,双平台护栏;-race 因并发面是核心:rt.mu/flock/会话台账)。
+一期 lint 只用 `go vet`,**不引入 golangci-lint**(与零重依赖哲学一致、减小 CI 面;复评点 M1.4)。CI(.github/workflows/ci.yml)与本节保持一致:ubuntu + macos + windows 矩阵跑同三条命令(flock/LockFileEx/rename/目录 fsync 平台敏感,三平台护栏;-race 因并发面是核心:rt.mu/flock/会话台账)。
 
 ## 当前进度
 

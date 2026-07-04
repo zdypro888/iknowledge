@@ -42,9 +42,16 @@ func hooksJSONSnippet(root string) string {
 // codexTOMLSnippet 是 Codex 接入片段(~/.codex/config.toml;CLI 与桌面 App 共用)。
 // 实测(impl §7.1 轮 25):codex-cli 0.142 的 rmcp 客户端走 streamable HTTP 直连
 // /mcp/main,服务端不开 SSE 也兼容,Mcp-Session-Id 正常回带(台账/过时警报有效)。
-func codexTOMLSnippet(root string, port int) string {
-	return fmt.Sprintf(`[mcp_servers.knowledge]
+func codexTOMLSnippet(root string, port int, token string) string {
+	base := fmt.Sprintf(`[mcp_servers.knowledge]
 url = "http://127.0.0.1:%d/mcp/main?repo=%s"`, port, url.QueryEscape(root))
+	if token == "" {
+		return base
+	}
+	return base + fmt.Sprintf(`
+
+[mcp_servers.knowledge.http_headers]
+Authorization = "Bearer %s"`, token)
 }
 
 // runSetup 打印接入三件套:.mcp.json、CLAUDE.md 纪律段、hooks 片段。
@@ -102,7 +109,7 @@ func runSetup(args []string, out io.Writer) int {
 验证:iknowledge serve --repo %s 启动后,
   curl "http://127.0.0.1:%d/inject?file=<某个 .go 文件路径>"
 `, root, root, mcpJSONSnippet(root, cfg.Port, token), root, engine.DisciplinePrompt,
-		root, hooksJSONSnippet(root), codexTOMLSnippet(root, cfg.Port), root, root, cfg.Port)
+		root, hooksJSONSnippet(root), codexTOMLSnippet(root, cfg.Port, token), root, root, cfg.Port)
 	return 0
 }
 

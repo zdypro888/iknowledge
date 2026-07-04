@@ -75,6 +75,25 @@ func TestShardRoundTrip(t *testing.T) {
 	}
 }
 
+func TestSrcRelOfShardAllowsDotDotPrefixName(t *testing.T) {
+	s := newStore(t)
+	path := s.ShardPathFor("..cache/a.go")
+	if path == "" {
+		t.Fatal("ShardPathFor should allow a repo-local path segment that merely starts with '..'")
+	}
+	if err := s.SaveShard(path, &Shard{Schema: model.SchemaVersion, Nodes: []model.Node{{
+		ID: "..cache/a.go", Level: model.LevelFile,
+		Anchor: model.Anchor{File: "..cache/a.go"},
+		Status: model.StatusUndigested,
+		Since:  time.Date(2026, 7, 4, 0, 0, 0, 0, time.UTC),
+	}}}, nil); err != nil {
+		t.Fatalf("SaveShard: %v", err)
+	}
+	if got := s.SrcRelOfShard(path); got != "..cache/a.go" {
+		t.Fatalf("SrcRelOfShard = %q, want ..cache/a.go", got)
+	}
+}
+
 // TestShardUnknownFieldPreserved 未知字段往返保留(impl §4 定案):
 // 新版本二进制在分片各层写入的未知字段,旧二进制改写分片后必须原样带回。
 func TestShardUnknownFieldPreserved(t *testing.T) {

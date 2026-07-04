@@ -191,3 +191,30 @@ func TestSetupPrints(t *testing.T) {
 		}
 	}
 }
+
+func TestSetupPrintsCodexAuthHeaders(t *testing.T) {
+	repo := setupGitRepo(t)
+	e, _ := initRepo(t, repo, engine.InitOptions{})
+	if _, err := e.Store.EnsureConfig(); err != nil {
+		t.Fatal(err)
+	}
+	tok, err := e.Store.EnsureAuthToken()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var out bytes.Buffer
+	if code := runSetup([]string{"--repo", repo}, &out); code != 0 {
+		t.Fatalf("setup 退出码 %d", code)
+	}
+	got := out.String()
+	for _, want := range []string{
+		`"headers": { "Authorization": "Bearer ` + tok,
+		"[mcp_servers.knowledge.http_headers]",
+		`Authorization = "Bearer ` + tok + `"`,
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("auth setup 输出缺 %q\n%s", want, got)
+		}
+	}
+}
