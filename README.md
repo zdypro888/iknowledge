@@ -39,22 +39,22 @@ iknowledge init --repo /path/to/your/repo
 # 3. Print the three integration snippets; paste each where indicated (iknowledge only prints — it never writes your files)
 iknowledge setup --repo /path/to/your/repo
 
-# 4. Start the server (long-running; re-run after a machine reboot)
-iknowledge serve --repo /path/to/your/repo
+# (No manual server start needed: with the stdio form in .mcp.json,
+#  the first AI session brings the background serve up automatically)
 ```
 
 The three snippets printed by `setup` go into three files of the target repo:
 
 | Where | What | Why |
 |---|---|---|
-| `.mcp.json` | MCP server address | Claude Code / Codex sees the 13 `kb_*` tools (required) |
+| `.mcp.json` | MCP stdio bridge (`command: iknowledge stdio`) | The agent sees the 13 `kb_*` tools; the bridge auto-starts the background serve on demand — zero service management (required) |
 | `CLAUDE.md` | Discipline prompt | The working rules for the AI: query before locating, record after changing, distill what was hard-won (required) |
 | `.claude/settings.json` | Hook snippet | Every time the AI Reads/Edits a file, that file's knowledge + staleness alerts are injected into context automatically (recommended) |
 
 Multiple repos coexist naturally: each repo gets its own port (`18000 + hash(path) % 2000`), and one process can serve several repos at once (`iknowledge serve --repo A --repo B` — each repo keeps its own port, so no client config changes).
 
 <details>
-<summary><b>Start on boot (optional)</b> — if you'd rather not re-run serve after each reboot</summary>
+<summary><b>Manual daemon / start on boot (optional)</b> — the stdio bridge already manages the server; only needed for remote or explicitly-shared setups</summary>
 
 macOS (launchd): save as `~/Library/LaunchAgents/com.iknowledge.serve.plist`, then `launchctl load` it:
 
@@ -105,7 +105,7 @@ iknowledge init --repo . --reanchor-all   # bulk re-anchor after a global change
 
 A screen full of `undigested` right after init is **by design**: skeleton first, knowledge gaps honestly labeled. When the AI hits one it says "skeleton only — read the source", automatically attaches the file's recent commit trail ("how it got here"), and never fabricates. To warm up the hot zones, `kb_status` ranks an undigested-hotspot list by *recent git churn × cross-file fan-in*; have the AI do one seeding pass over it (read hotspot files + `kb_remember`).
 
-A stopped server never breaks anything: with the MCP tools unavailable the AI just works normally, the hook is silently inert, and the AI reminds you to `iknowledge serve` at the end of the task.
+You never manage the server: the stdio bridge auto-starts the background serve on demand (the first session after a reboot brings it back). And even if everything is down, the AI just works normally and the hook stays silently inert.
 
 ## The 13 tools at a glance
 

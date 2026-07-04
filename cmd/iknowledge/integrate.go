@@ -18,9 +18,17 @@ import (
 	"github.com/zdypro888/iknowledge/internal/store"
 )
 
-// mcpJSONSnippet 是 .mcp.json 接入片段(init/setup 共用)。
-// token 非空(serve --auth 已启用)时附 headers——.mcp.json 会含密钥,提醒勿提交。
-func mcpJSONSnippet(root string, port int, token string) string {
+// mcpJSONSnippet 是 .mcp.json 接入片段(init/setup 共用;2026-07-04 定案修订):
+// 推荐 stdio 桥形态——客户端按需拉起,桥自动带起后台 serve,零服务管理;
+// 鉴权令牌由桥自读 token 文件,.mcp.json 不再含密钥。
+func mcpJSONSnippet(root string) string {
+	return fmt.Sprintf(`{ "mcpServers": { "knowledge": { "command": "iknowledge",
+  "args": ["stdio", "--repo", %q] } } }`, root)
+}
+
+// mcpJSONHTTPSnippet 是 http 直连备选(远程/自管 serve/多客户端显式共享场景);
+// token 非空(serve --auth)时附 headers——此形态 .mcp.json 含密钥,提醒勿提交。
+func mcpJSONHTTPSnippet(root string, port int, token string) string {
 	if token != "" {
 		return fmt.Sprintf(`{ "mcpServers": { "knowledge": { "type": "http",
   "url": "http://127.0.0.1:%d/mcp/main?repo=%s",
@@ -39,10 +47,17 @@ func hooksJSONSnippet(root string) string {
   "hooks": [ { "type": "command", "command": "iknowledge hook --repo %s" } ] } ] } }`, root)
 }
 
-// codexTOMLSnippet 是 Codex 接入片段(~/.codex/config.toml;CLI 与桌面 App 共用)。
-// 实测(impl §7.1 轮 25):codex-cli 0.142 的 rmcp 客户端走 streamable HTTP 直连
-// /mcp/main,服务端不开 SSE 也兼容,Mcp-Session-Id 正常回带(台账/过时警报有效)。
-func codexTOMLSnippet(root string, port int, token string) string {
+// codexTOMLSnippet 是 Codex 接入片段(~/.codex/config.toml;CLI 与桌面 App 共用;
+// 2026-07-04 定案修订):推荐 stdio 桥(command 形态是 Codex 最经典的 MCP 支持路径,
+// 且自动拉起 serve、令牌自读);http 直连留作备选(轮 25 实测 rmcp streamable HTTP 可用)。
+func codexTOMLSnippet(root string) string {
+	return fmt.Sprintf(`[mcp_servers.knowledge]
+command = "iknowledge"
+args = ["stdio", "--repo", %q]`, root)
+}
+
+// codexTOMLHTTPSnippet 是 Codex http 直连备选;token 非空时附 http_headers。
+func codexTOMLHTTPSnippet(root string, port int, token string) string {
 	base := fmt.Sprintf(`[mcp_servers.knowledge]
 url = "http://127.0.0.1:%d/mcp/main?repo=%s"`, port, url.QueryEscape(root))
 	if token == "" {
@@ -80,15 +95,18 @@ func runSetup(args []string, out io.Writer) int {
 		return 1
 	}
 	root := s.RepoRoot()
-	// serve --auth 已启用过(token 在位)则片段带 headers;.mcp.json 因此含密钥。
+	// http 备选片段:serve --auth 已启用(token 在位)时带 headers,因此含密钥。
 	token, _ := s.LoadAuthToken()
 	authNote := ""
 	if token != "" {
-		authNote = "\n   ⚠ 已启用鉴权:.mcp.json 含 token,勿提交版本库(加进 .gitignore);serve 需带 --auth 启动。"
+		authNote = "\n   ⚠ 已启用鉴权:http 备选片段含 token,勿提交版本库;stdio 桥无此问题(令牌自读)。"
 	}
-	fmt.Fprintf(out, `接入三件套(iknowledge 只打印不代写,铁律二;贴完运行 iknowledge serve --repo %s):
+	fmt.Fprintf(out, `接入三件套(iknowledge 只打印不代写,铁律二):
 
 ① MCP 服务(必装)——贴进 %s/.mcp.json:
+%s
+   stdio 桥按需自动拉起后台 serve(零服务管理,机器重启也不用管);鉴权令牌自动携带。
+   备选(远程/自管 serve/多客户端显式共享时用 http 直连,需先手动 iknowledge serve):
 %s`+authNote+`
 
 ② 纪律提示词(必装)——贴进 %s/CLAUDE.md(或 codex 等 agent 的指令文件):
@@ -101,15 +119,20 @@ func runSetup(args []string, out io.Writer) int {
 
 ④ Codex 接入(可选)——把下面段落合并进 ~/.codex/config.toml(CLI 与桌面 App 共用):
 %s
+   备选(http 直连):
+%s
    纪律提示词贴进 %s/AGENTS.md(内容同②)。Codex 无 hook 注入机制,靠纪律主动查询。
    注意:Codex 对 MCP 工具调用会弹审批,交互界面点允许即可;headless exec 需
    --dangerously-bypass-approvals-and-sandbox。多仓库共存时把条目名 knowledge
    改成不重复的名字(如 knowledge-<项目名>)。
 
-验证:iknowledge serve --repo %s 启动后,
+验证:任一 AI 会话连上后调 kb_status;或手动 iknowledge serve --repo %s 后
   curl "http://127.0.0.1:%d/inject?file=<某个 .go 文件路径>"
-`, root, root, mcpJSONSnippet(root, cfg.Port, token), root, engine.DisciplinePrompt,
-		root, hooksJSONSnippet(root), codexTOMLSnippet(root, cfg.Port, token), root, root, cfg.Port)
+`, root, mcpJSONSnippet(root), mcpJSONHTTPSnippet(root, cfg.Port, token),
+		root, engine.DisciplinePrompt,
+		root, hooksJSONSnippet(root),
+		codexTOMLSnippet(root), codexTOMLHTTPSnippet(root, cfg.Port, token),
+		root, root, cfg.Port)
 	return 0
 }
 

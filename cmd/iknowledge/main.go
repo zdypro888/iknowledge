@@ -26,6 +26,7 @@ const usage = `iknowledge——AI 代码知识库(MCP 服务)
 
 用法:
   iknowledge init   --repo <path> [--force] [--reanchor-all]   骨架秒建/对账(纯 AST,零 LLM)
+  iknowledge stdio  --repo <path>                              MCP stdio 桥(推荐接入形态:客户端拉起,自动带起后台 serve)
   iknowledge serve  --repo <path> [--repo <path2> …] [--auth]  启动 MCP 服务;--repo 可重复(单进程多仓库);--auth 启用 token 鉴权
                     [--addr host:port]                         (仅单仓库)覆盖监听地址
   iknowledge status --repo <path> [--prompt]                   库状态;--prompt 打印纪律提示词
@@ -49,6 +50,8 @@ func run(args []string) int {
 		return runInit(args[1:])
 	case "serve":
 		return runServe(args[1:])
+	case "stdio":
+		return runStdio(args[1:], os.Stdin, os.Stdout)
 	case "status":
 		return runStatus(args[1:])
 	case "maintain":
@@ -339,13 +342,12 @@ func runInit(args []string) int {
 	// agent 接入片段(impl §1 修订:init 只打印,由用户/主 AI 自行粘贴——
 	// 工具不写 .knowledge/ 之外的任何文件,铁律二)。
 	if cfg, err := s.LoadConfig(); err == nil && cfg != nil {
-		token, _ := s.LoadAuthToken()
 		fmt.Printf(`
 接入:把下面片段粘贴进 %s/.mcp.json(iknowledge 不代写):
 %s
-然后运行:iknowledge serve --repo %s
+(stdio 桥会按需自动拉起后台 serve,无需手动启动)
 完整接入三件套(含 CLAUDE.md 纪律段与 hook 自动注入):iknowledge setup --repo %s
-`, s.RepoRoot(), mcpJSONSnippet(s.RepoRoot(), cfg.Port, token), s.RepoRoot(), s.RepoRoot())
+`, s.RepoRoot(), mcpJSONSnippet(s.RepoRoot()), s.RepoRoot())
 	}
 	return 0
 }
