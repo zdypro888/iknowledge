@@ -32,6 +32,27 @@ type runtime struct {
 	// cg 是全仓调用图(auto 派生值,不落盘;文件指纹增量,见 callgraph.go)。
 	// 生命周期独立于 ix:reloadLocked 重建索引不清它,指纹自会对账。
 	cg *callGraph
+
+	// gitCounts 热区频率因子缓存(60s TTL;git log 大仓库百毫秒级)。
+	// 用独立小锁:计算在 rt.mu 之外跑(#21 同族,git 子进程不占大锁)。
+	gitCountsMu sync.Mutex
+	gitCounts   map[string]int
+	gitCountsAt time.Time
+}
+
+// gitCountsCached 返回近 90 天每文件改动计数(60s TTL)。不持 rt.mu 调用。
+func (e *Engine) gitCountsCached() map[string]int {
+	e.rt.gitCountsMu.Lock()
+	if e.rt.gitCounts != nil && e.now().Sub(e.rt.gitCountsAt) < time.Minute {
+		defer e.rt.gitCountsMu.Unlock()
+		return e.rt.gitCounts
+	}
+	e.rt.gitCountsMu.Unlock()
+	counts := gitChangeCounts(e.Store.RepoRoot(), "90.days")
+	e.rt.gitCountsMu.Lock()
+	e.rt.gitCounts, e.rt.gitCountsAt = counts, e.now()
+	e.rt.gitCountsMu.Unlock()
+	return counts
 }
 
 // sessionLedger 是一个会话的读取台账(knowledge.md §9.3):

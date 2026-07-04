@@ -413,16 +413,26 @@ func driveSession(repo, mcpCfg, prompt, model string, timeout time.Duration) (*r
 		}
 	}
 
-	// 阶段三:优雅退出(触发遥测终态导出与可能的转录落盘)。
+	// 阶段三:优雅退出——OTEL console 导出主要在进程退出时 flush(实测:周期导出
+	// 在 TUI 下不可靠),硬杀=计量丢失,必须把退出确认走完。
+	// 会话若开过后台任务,/exit 会弹"Exit anyway?"确认框(默认项即退出)——补回车确认。
 	ptmx.Write([]byte("/exit"))
 	time.Sleep(1 * time.Second)
 	ptmx.Write([]byte("\r"))
 	exited := make(chan struct{})
 	go func() { cmd.Wait(); close(exited) }()
+	for i := 0; i < 3; i++ { // 最多补 3 次确认回车,每次等 8s
+		select {
+		case <-exited:
+			i = 3
+		case <-time.After(8 * time.Second):
+			ptmx.Write([]byte("\r"))
+		}
+	}
 	select {
 	case <-exited:
-	case <-time.After(20 * time.Second):
-		pty.KillGroup(cmd)
+	case <-time.After(8 * time.Second):
+		pty.KillGroup(cmd) // 实在不退才硬杀(计量此时大概率已丢,错误信息带现场)
 	}
 	time.Sleep(2 * time.Second) // 终态导出落进缓冲
 

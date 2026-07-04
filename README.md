@@ -109,7 +109,7 @@ curl -fsSL https://raw.githubusercontent.com/zdypro888/iknowledge/main/uninstall
 
 ## 状态
 
-第一期已全量交付并持续加固:13 个 MCP 工具 + `/mcp/main`、`/mcp/scout` 双端点 + `GET /inject` + `iknowledge hook/setup/maintain` 套件,经多轮对抗审查与第三方全仓审计修复,Claude Code 真实客户端连接已实测通过。2026-07-04 补齐原二/三/四期计划中的:全仓调用图与结构扩展检索、热点待消化清单、矛盾裁决登记、非代码知识复核提醒、`--auth` 鉴权、单进程多仓库、Windows 支持(CI 三平台矩阵)、PTY 自派侦查备模式。遗留:Codex 客户端实测、M1.4 的 10 任务 A/B 验收协议。
+第一期已全量交付并持续加固:13 个 MCP 工具 + `/mcp/main`、`/mcp/scout` 双端点 + `GET /inject` + `iknowledge hook/setup/maintain` 套件,经多轮对抗审查与第三方全仓审计修复。2026-07-04 补齐原二/三/四期计划:全仓调用图与结构扩展检索、热点待消化清单、矛盾裁决登记、非代码知识复核提醒、`--auth` 鉴权、单进程多仓库、Windows 支持(CI 三平台真机全绿)、PTY 自派侦查备模式。**客户端双实测通过**(Claude Code + Codex,含 instructions 语义)。**M1.4 A/B 验收达标**:10 个固定定位任务,接知识库(种子覆盖 19%)vs 裸 grep 同模型双跑——中位 token 省 41%(59% ≤ 60% 阈值)、8/10 任务更省、用时更短;协议、工装(`cmd/kbeval`)与两轮全量数据在 [eval/m14/](eval/m14/)。
 
 - [`knowledge.md`](knowledge.md) — 概念设计全案(20 轮设计讨论的收敛:五个维度、自愈机制、经济学、安全、四篇推演)
 - [`knowledge-impl.md`](knowledge-impl.md) — 第一期工程方案(包结构、数据模型、存储、MCP API 全量规范、里程碑)

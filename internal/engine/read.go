@@ -60,8 +60,9 @@ func (e *Engine) Status() (string, error) {
 			}
 		}
 	}
-	// 热区频率因子同样锁外跑 git(knowledge.md §12.1)。
-	gitCounts := gitChangeCounts(e.Store.RepoRoot(), "90.days")
+	// 热区频率因子同样锁外跑 git(knowledge.md §12.1);60s TTL 缓存——
+	// git log 在大仓库百毫秒级,频繁 kb_status 不该每次付。
+	gitCounts := e.gitCountsCached()
 
 	e.rt.mu.Lock()
 	defer e.rt.mu.Unlock()
@@ -188,8 +189,8 @@ func (e *Engine) Status() (string, error) {
 			}
 			return hot[i].file < hot[j].file
 		})
-		if len(hot) > 5 {
-			hot = hot[:5]
+		if len(hot) > 10 {
+			hot = hot[:10] // TOP10:对齐 M1.4 种子协议("消化 10 个热点")
 		}
 		if len(hot) > 0 && hot[0].heat > 1 { // 双因子全零(冷库无 git)时不值得占版面
 			b.WriteString("热点待消化(90 天改动 × 跨文件被调;kb_recall 读原文后 kb_remember 沉淀):\n")

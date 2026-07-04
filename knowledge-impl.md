@@ -926,5 +926,20 @@ eval/m14/tasks-aibridge.yaml(5×N1 + 5×N2,难度混合,答案栏仅供人工判
 - go/no-go 数据输入:一次浅种子(6% 覆盖)即带来 31% 中位节省 + 26% 提速 + 9/10 胜率
   ——方向有效性成立,幅度未达标;二期已提前建成,该数据作为后续投入的基线而非闸门。
 
+**M1.4 复测(2026-07-04 第二轮,判 PASS 销案)**:
+- 种子加深:kb_status 热点 TOP5→TOP10(config/runner/agent 按热度自然入列,未看任务集)
+  + 第二轮种子会话 → 覆盖率 6%→19%(91 节点);B 组复用第一轮数据(B 不接库,与种子无关,
+  同任务同模型,复用合法且省半程成本);
+- 结果:**中位 tokens A=349,985 vs B=593,607(A/B=59% ≤ 60%)——PASS**;
+  A 赢 8/10、合计 82%、中位用时 149s vs 161s;10 会话零失败,遥测全捕获;
+  数据落盘 eval/m14/results-2026-07-04-r2/(第一轮 FAIL 数据保留于 results-2026-07-04/,
+  两轮并列可溯,不许删除败绩)。
+- 复测中抓到并修复的遥测丢失根因:会话开过后台任务时 /exit 弹"Exit anyway?"确认框,
+  未确认 → 20s 硬杀 → OTEL 终态导出(实测主要在进程退出时 flush,周期导出在 TUI 下
+  不可靠)丢失;kbeval 退出阶段补确认回车(至多 3 次)后计量稳定。
+- 附:同日 Codex 端到端实测通过(App 内嵌 codex-cli 0.142.5,casino 库):kb_status
+  repoRoot 正确、kb_recall 命中、**instructions 语义验证**(Codex 准确复述"修改后必须
+  kb_record_change 记录 what/why/rejected")——§7.1 客户端兼容矩阵最后一格补齐。
+
 第一期完成后,用 aibridge 本身当第一个真实用户(两个 agent review 时接入 iknowledge MCP)
 做实战检验,再进第二期。
