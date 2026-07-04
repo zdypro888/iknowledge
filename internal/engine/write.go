@@ -704,6 +704,20 @@ func (e *Engine) RecordChange(a ChangeArgs, sid, author string) (string, error) 
 			}
 		}
 	}
+	// 置信度桥接(2026-07-04,实战反馈"116/116 条 inferred、0 verified——阶梯塌成单层"):
+	// 本次带 verified(测试/红绿证据)且触及节点有 inferred 条目时,当下就是升级黄金时点
+	// (AI 手里正握着验证上下文)。只提示不自动升——测试验证的是代码行为,不是知识文本
+	// 本身的正确性,必须 AI 读过条目确认它仍准确描述当前代码才 confirm。
+	if strings.TrimSpace(a.Verified) != "" {
+		for _, id := range resolved {
+			if ref := e.rt.ix.Node(id); ref != nil && ref.Node.Status == model.StatusFresh {
+				if n := countInferred(ref.Node); n > 0 {
+					fmt.Fprintf(&b, "\n顺手确认:节点 %s 有 %d 条 inferred 知识,本次改动已带验证——对其中仍准确描述当前代码的条目 kb_verify confirm 升 verified(测试验证的是代码,知识文本要你亲自确认)", id, n)
+					break
+				}
+			}
+		}
+	}
 	// 时代摘要摊销检查(§12.3:>10 条或 >600 token 触发,维护欠账承载)。
 	for _, id := range resolved {
 		if e.eraDebtLocked(id) {

@@ -33,6 +33,27 @@ func debtID(kind, node string) string {
 	return "d_" + hex.EncodeToString(sum[:4])
 }
 
+// countInferred 数节点里活跃的 inferred 条目(置信度桥接判定,write/maintain 共用)。
+func countInferred(n *model.Node) int {
+	c := 0
+	for i := range n.Entries {
+		if e := &n.Entries[i]; e.Active() && e.Confidence == model.ConfidenceInferred {
+			c++
+		}
+	}
+	return c
+}
+
+// historyHasVerified 判断变更历史里有无带验证依据的记录(测试/红绿证据)。
+func historyHasVerified(hist []model.Change) bool {
+	for i := range hist {
+		if strings.TrimSpace(hist[i].Verified) != "" {
+			return true
+		}
+	}
+	return false
+}
+
 // computeDebtsLocked 现算全部欠账(排除已消解的,#11)。前提:已持锁。
 func (e *Engine) computeDebtsLocked() []Debt {
 	dismissed, _ := e.Store.LoadDismissedDebts()
@@ -108,6 +129,19 @@ func (e *Engine) computeDebtsLocked() []Debt {
 						Hint: "重读该文件的函数级知识与近期变更,kb_remember 一条新 summary 并 supersedes 旧摘要",
 					})
 				}
+			}
+		}
+		// ⑦ 置信度滞后(2026-07-04,实战反馈"阶梯塌成单层"):节点 fresh、有 inferred
+		// 条目、且历史里有带 verified 的变更(测试/红绿证据)——代码有验证背书、知识仍
+		// 匹配代码,却没人 confirm 升级。补账通道(即时提示在 record_change 回执,此处
+		// 捞存量:种子期写入、后来才被验证过的知识)。
+		if n.Anchor.Hash != "" && n.Status == model.StatusFresh {
+			if inf := countInferred(n); inf > 0 && historyHasVerified(e.rt.ix.History(id)) {
+				debts = append(debts, Debt{
+					ID: debtID("conflag", id), Kind: "confidence-lag", Node: id,
+					Desc: fmt.Sprintf("%d 条 inferred 知识,但该节点有测试验证过的变更记录", inf),
+					Hint: "读该节点知识与其 history(kb_recall mode=history 看 verified 依据):对仍准确描述当前代码的条目 kb_verify confirm 升 verified;不准的 refute。测试验证的是代码行为,知识文本的准确性要你确认",
+				})
 			}
 		}
 		// ④ 非代码知识超期未复核(§8.4:无锚知识的时间锚)。零值时间按超期处理

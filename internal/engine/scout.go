@@ -20,11 +20,6 @@ import (
 // 与 aibridge 方案的关键差异:交卷信号走协议(SubmitFindings→job.done),
 // 不解析终端画面,故无需终端仿真库(铁律一:零重依赖,PTY 原语手写)。
 
-// defaultScoutCommand 缺省侦察兵命令(config scout_command 可覆盖;仅作展示):
-// 禁用 claude -p(独立限流池,CLAUDE.md 铁律),走交互式 + PTY;
-// --strict-mcp-config 只用注入的 scout 配置;--allowedTools 免审批放行 kb 工具。
-const defaultScoutCommand = `claude --mcp-config {mcp} --strict-mcp-config --allowedTools "mcp__knowledge__*"`
-
 // SetScoutAddr 注入 serve 实际监听地址(自派侦察兵回连用;--addr 覆盖端口时
 // config 端口不可信)。serve 启动期调用,先于任何请求,不加锁。
 func (e *Engine) SetScoutAddr(addr string) { e.scoutAddr = addr }

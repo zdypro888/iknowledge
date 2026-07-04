@@ -195,7 +195,7 @@ var allTools = map[string]any{
 	},
 	"kb_maintain": map[string]any{
 		"name":        "kb_maintain",
-		"description": "维护欠账:next 取一条(时代摘要压缩/文件摘要落后/疑似重复条目);complete 销账(era 债携带 era_summary 落库,负知识必须逐条保留在摘要里)。任务尾顺手偿还 ≤2 条。",
+		"description": "维护欠账:next 取一条(时代摘要压缩/文件摘要落后/疑似重复/待重验 suspect/矛盾待裁决/非代码知识超期复核/置信度滞后即有 inferred 知识却已被测试验证过);complete 销账(era 债携带 era_summary 落库,负知识必须逐条保留在摘要里)。任务尾顺手偿还 ≤2 条。",
 		"inputSchema": obj(map[string]any{
 			"action":      map[string]any{"type": "string", "enum": []string{"next", "complete", "dismiss"}, "description": "next 取一条;complete 销账;dismiss 消解假阳性(如 dup-entries 判定实为不同)"},
 			"id":          str("complete/dismiss 必填:欠账 ID"),

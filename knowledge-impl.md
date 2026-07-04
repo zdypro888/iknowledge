@@ -658,7 +658,13 @@ type Parser interface {
       矛盾待裁决,见下方 §12.4 落地留痕)/suspect-reverify(2026-07-04 增,实战反馈
       "发现不等于修复,欠账要有人还"——suspect 原先只在读到时提醒,冷区可以烂很久;
       现进欠账队列,hint 给 confirm 重验/refute/补记账三条路;**超 20 个聚合为一条
-      mass 债**指向 kb_init reanchor_all,mass-suspect 逐条派账刷屏无意义)。
+      mass 债**指向 kb_init reanchor_all,mass-suspect 逐条派账刷屏无意义)/
+      confidence-lag(2026-07-04 增,实战反馈"casino 116/116 条 inferred、0 verified——
+      五级置信阶梯塌成单层":节点 fresh + 有 inferred 条目 + 历史有带 verified 的变更——
+      代码有测试背书、知识仍匹配代码,却没人 kb_verify confirm 升级。桥接账本 verified
+      字段与条目 confidence,让阶梯重新携带信息。**不自动升级**:测试验证的是代码行为,
+      知识文本本身的正确性必须 AI 读过条目确认——即时提示在 record_change 回执
+      带 verified 时的黄金时点,存量走本债种)。
       "语义矛盾服务端测不出"的定案不变(§12.7)——dispute-open 派的是"AI 已声明、
       尚未裁决"的账,识别仍归 AI。】
 返回: 债务项 / ack
