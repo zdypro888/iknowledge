@@ -12,19 +12,17 @@
 
 两条铁律:**知识导航、原文定论**(知识库永不替代读代码);**工具永不改码**(对源码只读,唯一写入 `.knowledge/`,改代码永远是主力 AI)。
 
-## 最省事:对 AI 说一句
-
-装一次 [`skills/kb-bootstrap`](skills/kb-bootstrap/SKILL.md) 技能(个人级,一次管所有项目):
+## 最省事:一条命令装机,之后对 AI 说一句
 
 ```bash
-mkdir -p ~/.claude/skills/kb-bootstrap
-curl -fsSL https://raw.githubusercontent.com/zdypro888/iknowledge/main/skills/kb-bootstrap/SKILL.md \
-  -o ~/.claude/skills/kb-bootstrap/SKILL.md
+curl -fsSL https://raw.githubusercontent.com/zdypro888/iknowledge/main/install.sh | sh
 ```
 
-之后在任何项目里对 Claude Code 说:**"初始化当前项目知识库"**——AI 自己装二进制、建骨架、代写三件套、拉起服务;重启会话后 13 个 kb_* 工具与 hook 注入就位。机器重启后说一句"启动知识库服务"即可。
+装机脚本做三件事:`go install` 二进制、把 [`kb-bootstrap`](skills/kb-bootstrap/SKILL.md) 技能装进 Claude Code(`~/.claude/skills/`)、检测到 Codex 时同步装进 `~/.codex/skills/`。
 
-> AI 代写三件套不违反铁律:铁律约束的是 iknowledge 二进制(只写 `.knowledge/`),配置粘贴在设计上本就是"由用户/主 AI 完成"。不想用 skill 就走下面的手动路线。
+之后在任何项目里,对 **Claude Code 或 Codex** 说:**"初始化当前项目知识库"**——AI 自己建骨架、代写全部接入配置(Claude Code 三件套 + Codex 的 config.toml/AGENTS.md)、拉起服务、验证连通(两侧均已实测)。重启会话后 kb_* 工具与 hook 注入就位;机器重启后说一句"启动知识库服务"即可。
+
+> AI 代写配置不违反铁律:铁律约束的是 iknowledge 二进制(只写 `.knowledge/`),配置粘贴在设计上本就是"由用户/主 AI 完成"。不想用 skill 就走下面的手动路线。
 
 ## 30 秒装好(傻瓜部署)
 
