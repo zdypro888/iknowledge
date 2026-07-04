@@ -246,6 +246,22 @@ type MaintainArgs struct {
 	EraSummary string `json:"era_summary,omitempty"` // era-compress 完成时提交
 }
 
+func debtInScope(node, scope string) bool {
+	scope = strings.Trim(strings.TrimSpace(model.ToSlash(scope)), "/")
+	if scope == "" {
+		return true
+	}
+	if strings.Contains(scope, "#") {
+		return node == scope
+	}
+	file, _ := model.SplitNodeID(node)
+	file = strings.TrimSuffix(file, "/")
+	if scope == model.ProjectNodeID {
+		return file == model.ProjectNodeID
+	}
+	return file == scope || strings.HasPrefix(file, scope+"/")
+}
+
 // Maintain 维护欠账:next 取一条最高优先级欠账;complete 销账(era 债携带摘要落库)。
 func (e *Engine) Maintain(a MaintainArgs, sid, author string) (string, error) {
 	if err := e.requireInit(); err != nil {
@@ -262,7 +278,7 @@ func (e *Engine) Maintain(a MaintainArgs, sid, author string) (string, error) {
 	switch a.Action {
 	case "next":
 		for _, d := range debts {
-			if a.Scope != "" && !strings.HasPrefix(d.Node, strings.TrimSuffix(a.Scope, "/")) {
+			if !debtInScope(d.Node, a.Scope) {
 				continue
 			}
 			return fmt.Sprintf("欠账 %s(%s)\n节点: %s\n成因: %s\n操作: %s\n完成后 kb_maintain complete id=%s",

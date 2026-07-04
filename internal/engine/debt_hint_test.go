@@ -47,6 +47,42 @@ func TestInjectDebtHint(t *testing.T) {
 	}
 }
 
+func TestMaintainScopeTreatsFileAsBoundary(t *testing.T) {
+	e, repo := initEngine(t, map[string]string{
+		"a/a.go":     "package a\n\nfunc F() int { return 1 }\n",
+		"a/a.go2.go": "package a\n\nfunc H() int { return 1 }\n",
+	})
+	sid := "s-scope"
+	if _, err := e.Remember(RememberArgs{
+		Node:    "a/a.go2.go#H",
+		Entries: []RememberEntry{{Kind: "summary", Text: "返回常量,调用方依赖非零语义 H"}},
+	}, sid, "claude-code"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repo, "a", "a.go2.go"),
+		[]byte("package a\n\nfunc H() int { return 2 }\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.Init(InitOptions{}); err != nil {
+		t.Fatal(err)
+	}
+
+	out, err := e.Maintain(MaintainArgs{Action: "next", Scope: "a/a.go"}, sid, "claude-code")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(out, "a/a.go2.go") || !strings.Contains(out, "范围 a/a.go 内无欠账") {
+		t.Fatalf("文件 scope 不应匹配同名前缀文件:\n%s", out)
+	}
+	out, err = e.Maintain(MaintainArgs{Action: "next", Scope: "a/a.go2.go"}, sid, "claude-code")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, "节点: a/a.go2.go#H") {
+		t.Fatalf("精确文件 scope 应匹配本文件符号债:\n%s", out)
+	}
+}
+
 // 查重警告的三种结局指引(disputes 的自然发现点)。
 func TestDupWarnThreeWay(t *testing.T) {
 	e, _ := initEngine(t, map[string]string{"a/a.go": "package a\n\nfunc F() int { return 1 }\n"})
