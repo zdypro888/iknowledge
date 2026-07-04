@@ -1,9 +1,14 @@
 package engine
 
-// DisciplinePrompt 是纪律注入提示词(impl §9,一期唯一的注入腿):
-// `iknowledge status --prompt` 打印,供粘贴进 CLAUDE.md / codex 指令 / aibridge 模板。
-const DisciplinePrompt = `本仓库配有 knowledge MCP。规则:
-0. knowledge 工具不可用(服务未启动)时:照常干活,任务尾提醒用户运行 ` + "`iknowledge serve`" + `;
+// DisciplinePrompt 是纪律注入提示词(impl §9 注入腿①,仓库携带):
+// `iknowledge status --prompt` 打印,供粘贴进 CLAUDE.md / AGENTS.md / aibridge 模板。
+// 首句即降级门(轮 25,借鉴 serena 的"连接携带"哲学后的对偶设计):仓库文档会被
+// clone 到没装 iknowledge 的机器上,kb_* 不在场时本段必须自我失效成一句安装指引,
+// 不能变成指向不存在工具的死指令。
+const DisciplinePrompt = `本仓库配有 knowledge MCP(代码知识库,工具皆以 kb_ 前缀)。
+若本会话不存在 kb_* 工具(本机未装或服务未启动):忽略本节其余规则照常干活,仅在任务尾
+提醒用户接入——装过:iknowledge serve;没装过:github.com/zdypro888/iknowledge(install.sh 一条命令)。
+kb_* 可用时,遵守:
 1. 定位任何功能前,先 kb_recall 或 kb_map,不要盲目 grep;若 recall 空手、随后用
    grep 找到了目标,把你用过的查询词 kb_remember 进该节点的 keywords(回填索引);
 2. 修改任何函数前,必须 kb_recall(node, mode=history) 查看来时路与负知识;
@@ -15,6 +20,12 @@ const DisciplinePrompt = `本仓库配有 knowledge MCP。规则:
    结论先蒸馏(remember / kb_task)再动手;修改阶段不依赖分析期的记忆,重读目标原文;
 7. 开始多步任务先 kb_task start(声明 touching),收尾 kb_task complete 归档。`
 
-// InitializeInstructions 是 initialize 返回的最短纪律(增强而非依赖——
-// 纪律的正身是上面的粘贴提示词;客户端是否注入 instructions 需实测,impl §7.1)。
-const InitializeInstructions = "代码知识库:读前 kb_recall/kb_map 导航,改后 kb_record_change 记账(一个逻辑修改一条),悟到的坑 kb_remember 沉淀。知识仅导航,修改前必读原文。"
+// InitializeInstructions 是 initialize 返回的连接携带纪律(轮 25 扩为紧凑全纪律,
+// 参照 serena:能注入 instructions 的客户端不再依赖仓库文档那条腿;不注入的客户端
+// 仍有 13 个 kb_* 工具描述里的微纪律兜底——工具描述是连接存在即必在上下文的钩子)。
+// 与 DisciplinePrompt 的差别:连接已建立,无需降级门与安装指引。
+const InitializeInstructions = "代码知识库纪律:定位先 kb_recall/kb_map,不盲目 grep;" +
+	"改任何函数前 kb_recall(node,mode=history) 查来时路与负知识;知识仅导航,修改前必读原文," +
+	"冲突以原文为准并勘误;每个逻辑修改收尾必须 kb_record_change(一次重构=一条,nodes 列全);" +
+	"费功夫读懂的结论 kb_remember 沉淀(一眼懂的不存);大范围定位交 kb_investigate 派子代理;" +
+	"多步任务 kb_task start/complete。"
