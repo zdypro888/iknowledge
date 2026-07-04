@@ -112,7 +112,8 @@ func (e *Engine) Status() (string, error) {
 
 	var b strings.Builder
 	fmt.Fprintf(&b, "repoRoot: %s\nschema: %d\n", e.Store.RepoRoot(), model.SchemaVersion)
-	fmt.Fprintf(&b, "节点: %d(已消化 %d,覆盖率 %.0f%%)\n", total, digested, pct(digested, total))
+	// 覆盖率一位小数:68/15598 取整成 "0%" 会把正常的按需消化误读成没干活。
+	fmt.Fprintf(&b, "节点: %d(已消化 %d,覆盖率 %.1f%%)\n", total, digested, pct(digested, total))
 	fmt.Fprintf(&b, "suspect: %d | 孤儿: %d | 待补锚: %d | 冲突分片: %d | 解析失败文件: %d | journal 坏行: %d\n",
 		suspect, orphaned, pending, conflicts, parseFailed, jstats.BadLines)
 	if len(orphanIDs) > 0 { // 供 kb_adopt 认领/送葬(#2:hint 指向这里)

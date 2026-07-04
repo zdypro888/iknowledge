@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/url"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -72,6 +73,12 @@ func (s *Server) Handler() http.Handler {
 		http.Redirect(w, r, target, http.StatusPermanentRedirect)
 	})
 	mux.HandleFunc("/inject", s.serveInject)
+	// 子代理只读腿(2026-07-04,实战反馈:受限工具集的审计/侦查子代理没有 kb_* 工具,
+	// 主 AI 手工转录知识进 brief 必有损耗——但子代理有 shell,curl 即可查库):
+	// 纯只读,记账/沉淀仍归有 MCP 的主 AI;同受 auth/origin 门;usage 照记。
+	mux.HandleFunc("/recall", s.serveRecall)
+	mux.HandleFunc("/map", s.serveMap)
+	mux.HandleFunc("/status", s.serveStatus)
 	return s.authGuard(originGuard(mux))
 }
 
@@ -420,6 +427,77 @@ func kbInvalid(err error) *engine.KBError {
 }
 
 // serveInject 是 hook 注入端点(GET /inject?file=&session=,非 MCP,impl §7.1)。
+// serveRecall GET /recall?q=<查询>[&mode=usage|history|flow][&limit=N][&session=<sid>]
+// ——kb_recall 的纯 HTTP 只读腿(输出与工具一致,text/plain)。
+func (s *Server) serveRecall(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	q := r.URL.Query()
+	if q.Get("q") == "" {
+		http.Error(w, "missing ?q=(查询词或节点 ID)", http.StatusBadRequest)
+		return
+	}
+	limit, _ := strconv.Atoi(q.Get("limit"))
+	started := time.Now()
+	out, meta, err := s.E.Recall(engine.RecallArgs{
+		Query: q.Get("q"), Mode: q.Get("mode"), Limit: limit, Before: q.Get("before"),
+	}, q.Get("session"))
+	s.logReadOnly("kb_recall", q.Get("session"), meta, err, started)
+	writeReadOnly(w, out, err)
+}
+
+// serveMap GET /map[?path=<前缀>][&depth=N][&session=<sid>]。
+func (s *Server) serveMap(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	q := r.URL.Query()
+	depth, _ := strconv.Atoi(q.Get("depth"))
+	started := time.Now()
+	out, meta, err := s.E.Map(q.Get("path"), depth, q.Get("session"))
+	s.logReadOnly("kb_map", q.Get("session"), meta, err, started)
+	writeReadOnly(w, out, err)
+}
+
+// serveStatus GET /status。
+func (s *Server) serveStatus(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	out, err := s.E.Status()
+	writeReadOnly(w, out, err)
+}
+
+// logReadOnly 只读腿的使用日志(与工具调用同一口径,月度 JSONL)。
+func (s *Server) logReadOnly(tool, sid string, meta engine.ReadMeta, err error, started time.Time) {
+	rec := engine.UsageRecord{
+		At: time.Now().UTC().Format(time.RFC3339), Session: sid, Tool: tool,
+		OK: err == nil, Hit: meta.Hit, HitStatus: meta.HitStatus, Stale: meta.Stale,
+		MS: time.Since(started).Milliseconds(),
+	}
+	if kbe, ok := errors.AsType[*engine.KBError](err); ok {
+		rec.ErrCode = kbe.Code
+	}
+	s.E.LogUsage(monthNow(), rec)
+}
+
+func writeReadOnly(w http.ResponseWriter, out string, err error) {
+	if err != nil {
+		if kbe, ok := errors.AsType[*engine.KBError](err); ok {
+			http.Error(w, kbe.Error(), http.StatusUnprocessableEntity)
+			return
+		}
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	io.WriteString(w, out)
+}
+
 func (s *Server) serveInject(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		w.WriteHeader(http.StatusMethodNotAllowed)

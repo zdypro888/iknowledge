@@ -18,7 +18,11 @@ kb_* 可用时,遵守:
 5. 读懂一段费了功夫的代码或发现代码上看不出的约定后,kb_remember 沉淀(一眼懂的不存);
 6. 上下文卫生:大范围分析定位交给 kb_investigate(把简报原样交给子代理执行),
    结论先蒸馏(remember / kb_task)再动手;修改阶段不依赖分析期的记忆,重读目标原文;
-7. 开始多步任务先 kb_task start(声明 touching),收尾 kb_task complete 归档。`
+7. 开始多步任务先 kb_task start(声明 touching),收尾 kb_task complete 归档;
+8. 给【无 kb_* 工具】的受限子代理(自定义审计/侦查 agent)写任务书时,不要手工转录
+   知识(必有损耗)——附上只读腿让它自己查:
+   curl "http://127.0.0.1:<端口>/recall?q=<词>"(/map、/status 同理;端口见 .knowledge/config.yaml)。
+   子代理只读不记账,沉淀与记账仍由你收尾。`
 
 // InitializeInstructions 是 initialize 返回的连接携带纪律(轮 25 扩为紧凑全纪律,
 // 参照 serena:能注入 instructions 的客户端不再依赖仓库文档那条腿;不注入的客户端
@@ -28,4 +32,5 @@ const InitializeInstructions = "代码知识库纪律:定位先 kb_recall/kb_map
 	"改任何函数前 kb_recall(node,mode=history) 查来时路与负知识;知识仅导航,修改前必读原文," +
 	"冲突以原文为准并勘误;每个逻辑修改收尾必须 kb_record_change(一次重构=一条,nodes 列全);" +
 	"费功夫读懂的结论 kb_remember 沉淀(一眼懂的不存);大范围定位交 kb_investigate 派子代理;" +
-	"多步任务 kb_task start/complete。"
+	"多步任务 kb_task start/complete;给无 kb_* 工具的受限子代理写任务书时附只读腿 " +
+	"curl /recall?q=…(/map、/status 同理),勿手工转录知识。"

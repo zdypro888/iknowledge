@@ -383,6 +383,13 @@ type Parser interface {
   【轮 25 勘误】挂接点从设计初稿的 PreToolUse 改为 **PostToolUse(matcher
   `Read|Edit|Write|MultiEdit`)**:现版 Claude Code 里 PreToolUse 只能放行/拦截,唯有
   PostToolUse 的 additionalContext 能注入上下文。配置片段由 `iknowledge setup` 统一打印(§9)。
+- **子代理只读腿(非 MCP;2026-07-04 增,实战反馈驱动)**:受限工具集的自定义子代理
+  (审计/侦查 agent,无 kb_* 工具)以前只能靠主 AI 手工转录知识进任务书——实测有损
+  (转录错数值被子代理纠正的真实案例)。现补三个纯 HTTP GET:
+  `GET /recall?q=<查询>[&mode=][&limit=][&session=]`、`GET /map[?path=][&depth=]`、
+  `GET /status`——输出与同名工具一致(text/plain),有 shell 即可 curl,零 MCP 配置;
+  同受 auth/origin 门,usage 照记(与工具同一口径)。**只读**:记账/沉淀仍归有 MCP 的
+  主 AI(author 推导与写纪律不被绕过);纪律段新增第 8 条指引任务书作者附 curl 只读腿。
 - **M1.2 客户端兼容实测清单(定案:以下是假设不是事实,验收前逐项实测并把结果写回本节)**:
   Claude Code 与 Codex 各测三项——① HTTP 传输连通(Codex 若不支持 HTTP MCP,启用 fallback:
   stdio 模式作"单 agent 独占"变体,启动时同样取 §4 的 flock);② `Mcp-Session-Id` 回带

@@ -105,6 +105,7 @@ curl -fsSL https://raw.githubusercontent.com/zdypro888/iknowledge/main/uninstall
 - **代码改了知识会不会过时?** 会,而且系统知道:双哈希锚定检测腐烂,改名/挪动自动迁移,失配标 `suspect` 等重验;同会话内重读到已变更节点会收到过时警报。
 - **安全模型?** 默认仅监听 `127.0.0.1`,无鉴权(本地信任模型);带 Origin 校验挡浏览器 DNS rebinding;监听非回环地址会打警告。共享多用户机器用 `serve --auth`:token 生成在 `.knowledge/local/token`(0600),全端点要求 `Authorization: Bearer`,`setup` 会打印带 headers 的接入片段(含密钥,勿提交 git)。工具对源码只读。
 - **没有子代理能力的宿主怎么用侦查?** `kb_investigate` 缺省是委派模式(简报交给宿主子代理跑)。宿主没有子代理时,在 `.knowledge/config.yaml` 加 `scout: self`——服务端自己用 PTY 拉起一个侦察兵进程(缺省 `claude`,`scout_command` 可换)执行简报、阻塞等交卷,主 AI 一次调用直接拿到结论。仅 macOS/Linux。
+- **自定义子代理(审计 agent 等)没有 kb_* 工具怎么查库?** 用只读腿:`curl "http://127.0.0.1:<端口>/recall?q=<词>"`(`/map`、`/status` 同理)——有 shell 就能查,零 MCP 配置,输出与工具一致。只读:记账与沉淀仍由主 AI 收尾。
 - **Codex 能用吗?** 能,已实测(codex-cli 0.142,含桌面 App):`iknowledge setup` 的第 ④ 段贴进 `~/.codex/config.toml`(`[mcp_servers.knowledge] url = …`,rmcp 走 HTTP 直连),纪律段贴进仓库 `AGENTS.md`。差异两点:Codex 对 MCP 工具调用会弹一次审批(交互界面点允许;headless `exec` 需 `--dangerously-bypass-approvals-and-sandbox`);无 hook 注入机制,靠纪律主动查询。
 
 ## 状态
