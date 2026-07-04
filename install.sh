@@ -41,8 +41,19 @@ else
     echo "==> 未检测到 Codex($CODEX_DIR 不存在),跳过"
 fi
 
+# stdio 桥由 MCP 客户端直接 spawn(GUI 启动的客户端 PATH 常没有 ~/go/bin),
+# 尽力软链进 /usr/local/bin 保证裸命令可解析;不行则明确提示。
 if ! command -v iknowledge >/dev/null 2>&1; then
-    echo "提示: $(go env GOPATH)/bin 不在 PATH 里,建议加入(hook 与 skill 都会用全路径回退,不加也能用)"
+    if [ -w /usr/local/bin ] || ln -sf "$BIN" /usr/local/bin/iknowledge 2>/dev/null; then
+        ln -sf "$BIN" /usr/local/bin/iknowledge 2>/dev/null || true
+    fi
+    if command -v iknowledge >/dev/null 2>&1 || [ -x /usr/local/bin/iknowledge ]; then
+        echo "==> 已软链 /usr/local/bin/iknowledge(MCP 客户端 spawn stdio 桥需要裸命令可解析)"
+    else
+        echo "提示: iknowledge 不在 PATH——请执行(MCP stdio 桥依赖它):"
+        echo "  sudo ln -sf \"$BIN\" /usr/local/bin/iknowledge"
+        echo "(或让 AI 接入时在 .mcp.json 里用绝对路径 $BIN,skill 会自动这么做)"
+    fi
 fi
 
 echo ""

@@ -17,7 +17,11 @@ description: 一句话初始化/接入/卸载 iknowledge 代码知识库(MCP)。
 4. **写 Claude Code 三件套(读旧→合并→写回)**:
    - `<root>/.mcp.json`:把 `knowledge` 条目合并进 `mcpServers`——**stdio 形态**
      `{"command":"iknowledge","args":["stdio","--repo","<root>"]}`(文件不存在则新建;
-     已有 `knowledge` 键则整体替换为 stdio 形态,旧 http url 形态一并升级);
+     已有 `knowledge` 键则整体替换为 stdio 形态,旧 http url 形态一并升级)。
+     **command 可解析性**:MCP 客户端直接 spawn 该命令(GUI 客户端 PATH 常没有
+     ~/go/bin)——若 `command -v iknowledge` 失败且 `/usr/local/bin/iknowledge`
+     不存在,先试软链 `ln -sf <绝对路径> /usr/local/bin/iknowledge`,仍不行则
+     `command` 字段直接写第 1 步解析出的**绝对路径**;
    - `<root>/CLAUDE.md`:追加 setup 输出的纪律段(文件里已含"本仓库配有 knowledge MCP"则跳过);
    - `<root>/.claude/settings.json`:把 hooks 片段合并进 `hooks.PostToolUse`(已有相同 `iknowledge hook` command 的条目则跳过)。
 5. **写 Codex 接入(本机存在 Codex 时;判定:`${CODEX_HOME:-$HOME/.codex}` 目录存在)**:
@@ -27,7 +31,7 @@ description: 一句话初始化/接入/卸载 iknowledge 代码知识库(MCP)。
    `printf '%s\n' '{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"clientInfo":{"name":"probe"}}}' | iknowledge stdio --repo <root>`
    ——输出含 `"repoRoot"` 即通(此时后台 serve 已被带起,hook 注入立即可用;
    再对任意真实 `.go` 文件 `curl "http://127.0.0.1:<端口>/inject?file=<相对路径>"` 可复核 hook 腿)。
-8. **收尾告知用户**(务必说清):
+7. **收尾告知用户**(务必说清):
    - MCP 工具与 hook 在**下一个会话**生效(Claude Code / Codex 都在启动时加载配置),请重启会话;
    - Codex 对 MCP 工具调用会弹一次审批,交互界面点允许即可;
    - `.knowledge/` 建议随 git 提交(知识随代码走、团队共享);

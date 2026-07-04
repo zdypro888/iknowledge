@@ -16,7 +16,8 @@ if [ -d "$CODEX_DIR/skills/kb-bootstrap" ]; then
     rm -rf "$CODEX_DIR/skills/kb-bootstrap"
 fi
 
-echo "==> 移除二进制"
+echo "==> 移除二进制(含 /usr/local/bin 软链)"
+rm -f /usr/local/bin/iknowledge 2>/dev/null || true
 if command -v go >/dev/null 2>&1; then
     rm -f "$(go env GOPATH)/bin/iknowledge"
 else

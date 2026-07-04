@@ -22,7 +22,7 @@ curl -fsSL https://raw.githubusercontent.com/zdypro888/iknowledge/main/install.s
 
 装机脚本做三件事:`go install` 二进制、把 [`kb-bootstrap`](skills/kb-bootstrap/SKILL.md) 技能装进 Claude Code(`~/.claude/skills/`)、检测到 Codex 时同步装进 `~/.codex/skills/`。
 
-之后在任何项目里,对 **Claude Code 或 Codex** 说:**"初始化当前项目知识库"**——AI 自己建骨架、代写全部接入配置(Claude Code 三件套 + Codex 的 config.toml/AGENTS.md)、拉起服务、验证连通(两侧均已实测)。重启会话后 kb_* 工具与 hook 注入就位;机器重启后说一句"启动知识库服务"即可。
+之后在任何项目里,对 **Claude Code 或 Codex** 说:**"初始化当前项目知识库"**——AI 自己建骨架、代写全部接入配置(Claude Code 三件套 + Codex 的 config.toml/AGENTS.md)并验证连通(两侧均已实测)。重启会话后 kb_* 工具与 hook 注入就位;服务由 stdio 桥按需自动拉起,机器重启后也不用管。
 
 > AI 代写配置不违反铁律:铁律约束的是 iknowledge 二进制(只写 `.knowledge/`),配置粘贴在设计上本就是"由用户/主 AI 完成"。不想用 skill 就走下面的手动路线。
 
@@ -144,7 +144,7 @@ curl -fsSL https://raw.githubusercontent.com/zdypro888/iknowledge/main/uninstall
 - **安全模型?** 默认仅监听 `127.0.0.1`,无鉴权(本地信任模型);带 Origin 校验挡浏览器 DNS rebinding;监听非回环地址会打警告。共享多用户机器用 `serve --auth`:token 生成在 `.knowledge/local/token`(0600),全端点要求 `Authorization: Bearer`,`setup` 会打印带 headers 的接入片段(含密钥,勿提交 git)。工具对源码只读。
 - **没有子代理能力的宿主怎么用侦查?** `kb_investigate` 缺省是委派模式(简报交给宿主子代理跑)。宿主没有子代理时,在 `.knowledge/config.yaml` 加 `scout: self`——服务端自己用 PTY 拉起一个侦察兵进程(缺省 `claude`,`scout_command` 可换)执行简报、阻塞等交卷,主 AI 一次调用直接拿到结论。仅 macOS/Linux。
 - **自定义子代理(审计 agent 等)没有 kb_* 工具怎么查库?** 用只读腿:`curl "http://127.0.0.1:<端口>/recall?q=<词>"`(`/map`、`/status` 同理)——有 shell 就能查,零 MCP 配置,输出与工具一致;侦查简报也会自动附上这条降级路径。只读:记账与沉淀仍由主 AI 收尾。
-- **Codex 能用吗?** 能,已实测(codex-cli 0.142,含桌面 App):`iknowledge setup` 的第 ④ 段贴进 `~/.codex/config.toml`(`[mcp_servers.knowledge] url = …`,rmcp 走 HTTP 直连),纪律段贴进仓库 `AGENTS.md`。差异两点:Codex 对 MCP 工具调用会弹一次审批(交互界面点允许;headless `exec` 需 `--dangerously-bypass-approvals-and-sandbox`);无 hook 注入机制,靠纪律主动查询。
+- **Codex 能用吗?** 能,已实测(codex-cli 0.142,含桌面 App):`iknowledge setup` 的第 ④ 段贴进 `~/.codex/config.toml`(stdio 形态 `command = "iknowledge"`;http 直连备选也在输出里),纪律段贴进仓库 `AGENTS.md`。差异两点:Codex 对 MCP 工具调用会弹一次审批(交互界面点允许;headless `exec` 需 `--dangerously-bypass-approvals-and-sandbox`);无 hook 注入机制,靠纪律主动查询。
 
 ## 状态
 
