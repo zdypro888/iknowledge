@@ -33,6 +33,14 @@ func hooksJSONSnippet(root string) string {
   "hooks": [ { "type": "command", "command": "iknowledge hook --repo %s" } ] } ] } }`, root)
 }
 
+// codexTOMLSnippet 是 Codex 接入片段(~/.codex/config.toml;CLI 与桌面 App 共用)。
+// 实测(impl §7.1 轮 25):codex-cli 0.142 的 rmcp 客户端走 streamable HTTP 直连
+// /mcp/main,服务端不开 SSE 也兼容,Mcp-Session-Id 正常回带(台账/过时警报有效)。
+func codexTOMLSnippet(root string, port int) string {
+	return fmt.Sprintf(`[mcp_servers.knowledge]
+url = "http://127.0.0.1:%d/mcp/main?repo=%s"`, port, url.QueryEscape(root))
+}
+
 // runSetup 打印接入三件套:.mcp.json、CLAUDE.md 纪律段、hooks 片段。
 func runSetup(args []string, out io.Writer) int {
 	fs := flag.NewFlagSet("setup", flag.ContinueOnError)
@@ -72,10 +80,17 @@ func runSetup(args []string, out io.Writer) int {
    效果:AI 每次 Read/Edit/Write 一个文件,该文件的知识+过时警报自动进上下文;
    serve 未启动时 hook 静默无操作,不影响任何工具调用。
 
+④ Codex 接入(可选)——把下面段落合并进 ~/.codex/config.toml(CLI 与桌面 App 共用):
+%s
+   纪律提示词贴进 %s/AGENTS.md(内容同②)。Codex 无 hook 注入机制,靠纪律主动查询。
+   注意:Codex 对 MCP 工具调用会弹审批,交互界面点允许即可;headless exec 需
+   --dangerously-bypass-approvals-and-sandbox。多仓库共存时把条目名 knowledge
+   改成不重复的名字(如 knowledge-<项目名>)。
+
 验证:iknowledge serve --repo %s 启动后,
   curl "http://127.0.0.1:%d/inject?file=<某个 .go 文件路径>"
 `, root, root, mcpJSONSnippet(root, cfg.Port), root, engine.DisciplinePrompt,
-		root, hooksJSONSnippet(root), root, cfg.Port)
+		root, hooksJSONSnippet(root), codexTOMLSnippet(root, cfg.Port), root, root, cfg.Port)
 	return 0
 }
 

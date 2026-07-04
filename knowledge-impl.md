@@ -361,8 +361,20 @@ type Parser interface {
   `.knowledge/.mcp.json` 指向的 `/mcp/main`,服务端 usage 日志确证:① HTTP MCP 传输连通
   ——`kb_status`、`kb_recall` 两次调用 ok=True;② `Mcp-Session-Id` 回带——两次同会话
   ID(台账/过时警报的前提成立);③ instructions 进上下文——模型正确选工具并语义调用,
-  且 `kb_recall(登录)` hit=True 命中预埋知识。**Codex 侧三项待用户接入时同法验证**
-  (方式定案:禁 `-p`,用 PTY 交互式;协议正确性仍首选 curl/httptest)。
+  且 `kb_recall(登录)` hit=True 命中预埋知识。
+  **Codex 侧实测结果(2026-07-04,轮 25——codex-cli 0.142.5,`codex exec` 隔离
+  CODEX_HOME)**:① HTTP 传输连通 ✓——rmcp 客户端走 streamable HTTP 直连 `/mcp/main`
+  (`[mcp_servers.knowledge] url = …` 原生支持,无需 stdio fallback;服务端不开 SSE,
+  rmcp 日志明确"server doesn't support sse, skip common stream"并继续正常工作;启动时的
+  OAuth/.well-known 探测得 404/405 属正常回退,无害);`kb_status` 调用 ok=True 返回正确
+  内容。② `Mcp-Session-Id` 回带 ✓——usage 台账记到稳定 session id,台账/过时警报对
+  Codex 生效。③ instructions 是否进上下文:未单独验证(不依赖——Codex 侧纪律正身贴
+  AGENTS.md,`iknowledge setup` ④ 已打印)。
+  **行为差异记录**:Codex 对每个 MCP 工具调用弹审批征询(elicitation
+  `mcp_tool_call_approval`),交互界面(桌面 App/TUI)点允许即可;headless `codex exec`
+  无人应答会自动 Cancel(表现为"user cancelled MCP tool call"),需
+  `--dangerously-bypass-approvals-and-sandbox` 才全自动。Codex 无 hook 注入机制,
+  注入腿③不适用,靠腿①纪律驱动主动查询。
 - **协议方法**:
 
 | 方法 | 行为 |

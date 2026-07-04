@@ -125,6 +125,7 @@ func TestSetupPrints(t *testing.T) {
 		"mcpServers", "/mcp/main?repo=",
 		"本仓库配有 knowledge MCP", // 纪律段(engine.DisciplinePrompt 首行)
 		"PostToolUse", "iknowledge hook --repo",
+		"[mcp_servers.knowledge]", "AGENTS.md", // Codex 段(config.toml + 纪律载体)
 	} {
 		if !strings.Contains(out.String(), want) {
 			t.Errorf("setup 输出缺 %q", want)
