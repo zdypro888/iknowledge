@@ -101,9 +101,12 @@ type result struct {
 
 const seedPrompt = `请为本仓库的知识库做一轮种子消化(M1.4 种子步骤):
 1. 调 kb_status,取"热点待消化"清单;
-2. 依次精读每个热点文件的原文(以及它的关键被调方),把读懂的门道按沉淀阈值 kb_remember:
-   每个热点文件至少 1 条 summary + 值得记的 contract/pitfall/usage;顺手把你用过的检索词回填 keywords;
-3. 全部完成后再调一次 kb_status,报告覆盖率变化,然后结束。
+2. 对每个热点文件:先 git log -n 5 -- <文件> 看来时路(为什么长这样),再精读原文与关键被调方;
+3. 沉淀标准=【代码上看不出来的】:契约/前置条件、坑与易错、来自提交历史的"为什么"。
+   禁止复述代码结构("X 函数做了 Y"这种 recall 自带签名与调用关系,存了是噪音)。
+   每文件 kb_remember:1 条 summary(一句话职责,面向导航)+ ≥1 条 contract/pitfall/usage 洞见;
+   顺手把你用过的检索词回填 keywords;
+4. 全部完成后再调一次 kb_status,报告覆盖率变化,然后结束。
 只读与沉淀,不修改任何源码。`
 
 func runSeed(args []string) int {

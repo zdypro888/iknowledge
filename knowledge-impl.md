@@ -498,6 +498,11 @@ type Parser interface {
       ——这是记账纪律被跳过(必然发生)时的退化兜底:没有它,一期会把过时知识以 fresh 呈现,
       比没装更糟(knowledge.md §3.4);
       usage → 节点快照(auto 现算 + Entries,含 confidence 标注;superseded/refuted 条目不出现);
+      【来时路(2026-07-04 增,实战反馈"冷启动价值低"的机械解)】骨架(undigested)或
+      suspect/stale 节点的快照自动附该文件近 3 条提交(hash/日期/subject)——零 LLM 成本
+      的考古线索:空骨架至少给出「为什么长这样」的入口,suspect 还账者有素材写 what/why;
+      已消化的 fresh 节点不附(知识在场,考古退位给 history);单文件 git log 毫秒级,
+      与快照本就要做的单文件 parse 同量级;
       history → 快照 + journal 记录(近 3 条全量,按 at 降序,更早给条数提示),
       按节点 ID + lineage 集合联查(重构不断链);【同 ID 记录须 at ≥ 节点 Since】——
       防旧名被无关新函数复用后错继承前任的历史(lineage 命中的不受 Since 限制);
@@ -630,8 +635,12 @@ type Parser interface {
       实为不同则消解,记进 .knowledge/local/dismissed-debts.txt,现算时排除、不再复报)。
       【债种含 era-compress/summary-stale/dup-entries/review-overdue(2026-07-04 增,
       非代码知识超期未复核,见下方 §8.4 落地留痕)/dispute-open(2026-07-04 增,
-      矛盾待裁决,见下方 §12.4 落地留痕)。"语义矛盾服务端测不出"的定案不变(§12.7)
-      ——dispute-open 派的是"AI 已声明、尚未裁决"的账,识别仍归 AI。】
+      矛盾待裁决,见下方 §12.4 落地留痕)/suspect-reverify(2026-07-04 增,实战反馈
+      "发现不等于修复,欠账要有人还"——suspect 原先只在读到时提醒,冷区可以烂很久;
+      现进欠账队列,hint 给 confirm 重验/refute/补记账三条路;**超 20 个聚合为一条
+      mass 债**指向 kb_init reanchor_all,mass-suspect 逐条派账刷屏无意义)。
+      "语义矛盾服务端测不出"的定案不变(§12.7)——dispute-open 派的是"AI 已声明、
+      尚未裁决"的账,识别仍归 AI。】
 返回: 债务项 / ack
 ```
 

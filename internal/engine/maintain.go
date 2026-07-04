@@ -37,6 +37,34 @@ func debtID(kind, node string) string {
 func (e *Engine) computeDebtsLocked() []Debt {
 	dismissed, _ := e.Store.LoadDismissedDebts()
 	var debts []Debt
+
+	// ⑥ suspect 待重验(§12.2 偿还机制的队列化,2026-07-04:实战反馈"发现不等于修复,
+	// 欠账终究要有人还"——suspect 原先只在读到时提醒,不进欠账队列,冷区的 suspect
+	// 可以烂很久没人管)。超 20 个聚合为一条(mass-suspect 是全局性事件,逐条派账
+	// 刷屏无意义,批量出口是 kb_init reanchor_all,impl §6)。
+	var suspects []string
+	for id, ref := range e.rt.ix.Nodes() {
+		if ref.Node.Status == model.StatusSuspect {
+			suspects = append(suspects, id)
+		}
+	}
+	sort.Strings(suspects)
+	if len(suspects) > 20 {
+		debts = append(debts, Debt{
+			ID: debtID("suspect-mass", "."), Kind: "suspect-reverify", Node: ".",
+			Desc: fmt.Sprintf("%d 个节点处于 suspect(疑似全局性变更)", len(suspects)),
+			Hint: "人工确认变更为预期(如全库格式化/大重构)后用 kb_init reanchor_all=true 批量重锚;否则逐个 kb_recall 读原文 + kb_verify confirm/refute",
+		})
+	} else {
+		for _, id := range suspects {
+			debts = append(debts, Debt{
+				ID: debtID("suspect", id), Kind: "suspect-reverify", Node: id,
+				Desc: "节点 suspect:代码在知识写入后已变更且无对应变更记录",
+				Hint: "kb_recall 读原文核对:知识仍成立则 kb_verify confirm(整节点 ID,重验即重锚);不成立则 refute(附证据)/obsolete;若是你改的,先补 kb_record_change",
+			})
+		}
+	}
+
 	for id, ref := range e.rt.ix.Nodes() {
 		n := ref.Node
 		// ① 历史超预算 → 时代摘要债(§12.3:未折叠 >10 条或 >600 token)。

@@ -194,7 +194,7 @@ func (e *Engine) Status() (string, error) {
 			hot = hot[:10] // TOP10:对齐 M1.4 种子协议("消化 10 个热点")
 		}
 		if len(hot) > 0 && hot[0].heat > 1 { // 双因子全零(冷库无 git)时不值得占版面
-			b.WriteString("热点待消化(90 天改动 × 跨文件被调;kb_recall 读原文后 kb_remember 沉淀):\n")
+			b.WriteString("热点待消化(90 天改动 × 跨文件被调;读原文后 kb_remember 只存【代码上看不出来的】——契约/坑/为什么,复述结构是噪音):\n")
 			for _, h := range hot {
 				fmt.Fprintf(&b, "  - %s 热度 %d(改 %d 次 × 被调 %d)消化 %d/%d\n",
 					h.file, h.heat, h.chg, h.ctr, h.done, h.total)
@@ -605,6 +605,17 @@ func (e *Engine) recallNodeLocked(nodeID string, a RecallArgs, sid string) (stri
 	}
 	if !hasActiveEntries(n) && n.Status != model.StatusOrphaned {
 		b.WriteString("此节点未消化,仅有骨架,请读原文。\n")
+	}
+	// 来时路(2026-07-04,实战反馈"冷启动价值低"的机械解):骨架/可疑节点的 recall
+	// 自动附该文件近期提交——零 LLM 成本的考古线索,"为什么长这样"不再空手。
+	// 单文件 git log 毫秒级,与本函数已有的单文件 parse(reconcileOnRead)同量级,
+	// 不违 #21(那是针对全库扫描不进锁)。
+	if file, _ := model.SplitNodeID(nodeID); file != "" && !strings.HasSuffix(file, "/") &&
+		nodeID != model.ProjectNodeID && (!hasActiveEntries(n) || n.Status == model.StatusSuspect || auto.stale) {
+		if trail := gitTrail(e.Store.RepoRoot(), []string{file}); trail != "" {
+			b.WriteString("来时路(近期提交——「为什么长这样」的档案,深挖 git show/blame):\n")
+			b.WriteString(trail)
+		}
 	}
 
 	fmt.Fprintf(&b, "节点: %s(%s,%s)\n", nodeID, n.Level, n.Status)
