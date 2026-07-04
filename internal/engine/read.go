@@ -45,21 +45,9 @@ func (e *Engine) Status() (string, error) {
 		return "", err
 	}
 
-	// 解析失败文件:现扫(git 子进程 + 全库 parse)。#21:放在 rt.mu 之外做——
-	// 只读 Store/Reg 不碰 rt 状态,持锁跑 git 会阻塞所有并发请求数百毫秒。
-	parseFailed := 0
-	cfg, _ := e.Store.LoadConfig()
-	if files, err := listSourceFiles(e.Store.RepoRoot(), e.Reg, cfg); err == nil {
-		for _, rel := range files {
-			src, err := os.ReadFile(filepath.Join(e.Store.RepoRoot(), filepath.FromSlash(rel)))
-			if err != nil || parser.IsGenerated(src) {
-				continue
-			}
-			if _, err := e.Reg.ForFile(rel).Parse(rel, src); err != nil {
-				parseFailed++
-			}
-		}
-	}
+	// 解析失败文件:全库 parse 扫描,60s TTL 缓存(kb_status 最大单项成本,
+	// casino 实测数百毫秒)。#21:锁外做——只读 Store/Reg 不碰 rt 状态。
+	parseFailed := e.parseFailedCached()
 	// 热区频率因子同样锁外跑 git(knowledge.md §12.1);60s TTL 缓存——
 	// git log 在大仓库百毫秒级,频繁 kb_status 不该每次付。
 	gitCounts := e.gitCountsCached()
@@ -1021,7 +1009,9 @@ func (e *Engine) saveNodeShardLocked(ref *index.NodeRef) error {
 // ---- GET /inject(hook 注入端点,impl §7.1) ----
 
 // Inject 组装一个文件的注入文本(knowledge.md §9.2 预算规则,≤1500 token)。
-func (e *Engine) Inject(file, sid string) (string, error) {
+// tool 是触发 hook 的宿主工具名(Read/Edit/Write/…,可空):写事件在注入尾部追加
+// 记账提醒——"改完的当下"是记账遵守率的黄金时点(2026-07-04,纪律依赖的机械解)。
+func (e *Engine) Inject(file, sid, tool string) (string, error) {
 	if err := e.requireInit(); err != nil {
 		return "", err
 	}
@@ -1116,6 +1106,10 @@ func (e *Engine) Inject(file, sid string) (string, error) {
 			fmt.Fprintf(&b, "项目: %s\n", s)
 		}
 	}
+	// 写事件的记账提醒(改完的当下最有效;放预算裁剪之前的尾部,预算不裁尾部提醒?
+	// ——提醒必须存活,单独追加在裁剪之后)。
+	writeEvent := tool == "Edit" || tool == "Write" || tool == "MultiEdit" || tool == "NotebookEdit"
+
 	parts = append(parts, strings.TrimRight(b.String(), "\n"))
 	out := strings.Join(parts, "\n")
 
@@ -1132,6 +1126,10 @@ func (e *Engine) Inject(file, sid string) (string, error) {
 			kept = append(kept, l)
 		}
 		out = strings.Join(kept, "\n") + "\n……(超预算折叠,kb_recall 可下钻)"
+	}
+	// 记账提醒追加在预算裁剪之后:提醒必须存活,不参与折叠。
+	if writeEvent {
+		out += "\n✍ 你刚修改了本文件:该逻辑修改单元收尾时必须 kb_record_change(改了什么/为什么/否决了什么;一次重构=一条,nodes 列全)。"
 	}
 	return framed(out), nil
 }

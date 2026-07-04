@@ -51,6 +51,43 @@ iknowledge serve --repo /path/to/your/repo
 
 多仓库共存没问题:每个仓库端口独立(`18000 + hash(路径) % 2000`);一个进程可以同时服务多个仓库(`iknowledge serve --repo A --repo B`,每仓仍用自己的端口,客户端配置不用改)。
 
+<details>
+<summary><b>开机自启(可选)</b>——不想每次重启后手动 serve 的话</summary>
+
+macOS(launchd):存为 `~/Library/LaunchAgents/com.iknowledge.serve.plist` 后 `launchctl load` 它:
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>com.iknowledge.serve</string>
+  <key>ProgramArguments</key><array>
+    <string>/Users/你/go/bin/iknowledge</string>
+    <string>serve</string>
+    <string>--repo</string><string>/path/to/repoA</string>
+    <string>--repo</string><string>/path/to/repoB</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+</dict></plist>
+```
+
+Linux(systemd 用户单元):存为 `~/.config/systemd/user/iknowledge.service` 后 `systemctl --user enable --now iknowledge`:
+
+```ini
+[Unit]
+Description=iknowledge knowledge MCP
+
+[Service]
+ExecStart=%h/go/bin/iknowledge serve --repo /path/to/repoA --repo /path/to/repoB
+Restart=on-failure
+
+[Install]
+WantedBy=default.target
+```
+
+</details>
+
 ## 日常怎么用(简易使用)
 
 **装完基本不用管。** AI 在仓库里干活时:hook 把所触文件的知识自动喂给它;纪律提示词让它定位先 `kb_recall`、改完 `kb_record_change` 记账、读懂难点顺手 `kb_remember` 沉淀——**知识库靠真实工作自己长大**(首触即建,消化成本搭任务便车)。

@@ -122,6 +122,9 @@ func (e *Engine) Remember(a RememberArgs, sid, author string) (string, error) {
 		} else if warn != "" {
 			warnList = append(warnList, warn)
 		}
+		if w := echoWarn(in.Text, cur.sig); w != "" {
+			warnList = append(warnList, w)
+		}
 		// 机械查重:范围含 refuted/superseded/retired(impl §7.3 定案)。
 		norm := normalizeText(in.Text)
 		superseding := map[string]bool{}
@@ -290,7 +293,8 @@ type curAnchor struct {
 	hash     string
 	anchor   model.Anchor
 	parseErr error
-	missing  bool // 符号不在文件里
+	missing  bool   // 符号不在文件里
+	sig      string // 符号签名(复述检测用;文件/无锚节点为空)
 }
 
 func (e *Engine) currentAnchorLocked(ref *index.NodeRef) curAnchor {
@@ -319,13 +323,40 @@ func (e *Engine) currentAnchorLocked(ref *index.NodeRef) curAnchor {
 	}
 	for i := range syms {
 		if syms[i].Name == symbol {
-			return curAnchor{hash: syms[i].Hash, anchor: model.Anchor{
+			return curAnchor{hash: syms[i].Hash, sig: parser.Signature(syms[i]), anchor: model.Anchor{
 				File: file, Symbol: symbol,
 				Hash: syms[i].Hash, StructHash: syms[i].StructHash, Lines: syms[i].Lines,
 			}}
 		}
 	}
 	return curAnchor{missing: true, anchor: n.Anchor}
+}
+
+// echoWarn 复述检测(2026-07-04,实战反馈"inferred 摘要基本是代码复述"的机械子集):
+// 条目的 ASCII 词大量来自符号签名 = 签名回声,读原文即得,存了是噪音。
+// 只测机械信号警示不拒收——中文结构复述属语义判断,归 AI(与矛盾检测同定案,§12.7);
+// 种子/热点提示词的"只存代码上看不出来的"纪律负责语义层。
+func echoWarn(text, sig string) string {
+	if sig == "" {
+		return ""
+	}
+	sigSet := map[string]bool{}
+	for _, t := range index.Tokenize(sig) {
+		sigSet[t] = true
+	}
+	var ascii, hit int
+	for _, t := range index.Tokenize(text) {
+		if t[0] < 128 {
+			ascii++
+			if sigSet[t] {
+				hit++
+			}
+		}
+	}
+	if ascii >= 4 && hit*10 >= ascii*7 { // ≥70% 来自签名
+		return "疑似签名复述(条目 ASCII 词多来自符号签名)——代码上看得出来的不该存,建议改写为契约/坑/为什么"
+	}
+	return ""
 }
 
 // newSymbolPlan 是增量落锚的规划结果(不含副作用)。

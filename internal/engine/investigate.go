@@ -183,6 +183,13 @@ func (e *Engine) briefingLocked(job *scoutJob, selfMode bool) (string, []string)
 		head = "【侦查简报 " + job.ID + "】你就是侦察兵,直接执行本简报。"
 		tail = "收尾交卷(交卷即回程,主 AI 在等待中)。"
 	}
+	// 简报的降级门(与纪律段首句同哲学):受限子代理可能没有 kb_* 工具,
+	// 上面的工具指令对它是死指令——附只读腿 + 代沉淀/代交卷条款。
+	degrade := ""
+	if base := e.scoutBase(); base != "" {
+		degrade = fmt.Sprintf(`
+子代理若无 kb_* 工具(受限工具集):查库用只读腿 curl "http://%s/recall?q=<词>"(/map、/status 同理);蒸馏与 conclusion/locations/plan/risks 完整写进最终答复,由主 AI 代 kb_remember 与 kb_submit_findings。`, base)
+	}
 	return fmt.Sprintf(head+`
 
 问题: %s
@@ -193,7 +200,7 @@ func (e *Engine) briefingLocked(job *scoutJob, selfMode bool) (string, []string)
 1. 你是一次性侦察兵:脏读随便 grep/试错,你的上下文用完即焚,价值全靠蒸馏落库;
 2. 蒸馏义务:定位过程中悟到的流程/坑/关键词,满足沉淀阈值就 kb_remember(尤其把你用过的检索词回填进目标节点 keywords);进行中状态写 kb_task;
 3. 禁止调用 kb_investigate(防套娃)与 kb_record_change(侦察兵不改码,铁律二);
-4. 必须以 kb_submit_findings(job=%s, conclusion/locations/plan/risks)`+tail+`
+4. 必须以 kb_submit_findings(job=%s, conclusion/locations/plan/risks)`+tail+degrade+`
 (job TTL 30 分钟,过期作废)`, job.Question, scope, clues.String(), job.ID), clueFiles
 }
 

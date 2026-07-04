@@ -72,7 +72,8 @@ func gitChangeCounts(repo, since string) map[string]int {
 func gitTrail(repo string, files []string) string {
 	var b strings.Builder
 	for _, f := range files {
-		out, err := exec.Command("git", "-C", repo, "log", "-n", "3",
+		// --follow:文件改名后来时路不断链(单文件 follow 成本毫秒级)。
+		out, err := exec.Command("git", "-C", repo, "log", "-n", "3", "--follow",
 			"--date=short", "--pretty=format:%h %ad %s", "--", f).Output()
 		trimmed := strings.TrimSpace(string(out))
 		if err != nil || trimmed == "" {

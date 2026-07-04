@@ -475,7 +475,7 @@ func (s *Server) serveStatus(w http.ResponseWriter, r *http.Request) {
 // logReadOnly 只读腿的使用日志(与工具调用同一口径,月度 JSONL)。
 func (s *Server) logReadOnly(tool, sid string, meta engine.ReadMeta, err error, started time.Time) {
 	rec := engine.UsageRecord{
-		At: time.Now().UTC().Format(time.RFC3339), Session: sid, Tool: tool,
+		At: time.Now().UTC().Format(time.RFC3339), Session: sid, Tool: tool, Source: "http",
 		OK: err == nil, Hit: meta.Hit, HitStatus: meta.HitStatus, Stale: meta.Stale,
 		MS: time.Since(started).Milliseconds(),
 	}
@@ -518,7 +518,7 @@ func (s *Server) serveInject(w http.ResponseWriter, r *http.Request) {
 			file = filepath.ToSlash(rel)
 		}
 	}
-	text, err := s.E.Inject(file, sid)
+	text, err := s.E.Inject(file, sid, r.URL.Query().Get("tool"))
 	if err != nil {
 		if kbe, ok := errors.AsType[*engine.KBError](err); ok {
 			http.Error(w, kbe.Error(), http.StatusNotFound)

@@ -226,9 +226,12 @@ func (s *Store) LoadDismissedDebts() (map[string]bool, error) {
 
 // UsageRecord 是一次 tools/call 的日志行。
 type UsageRecord struct {
-	At        string `json:"at"`
-	Session   string `json:"session,omitempty"`
-	Tool      string `json:"tool"`
+	At      string `json:"at"`
+	Session string `json:"session,omitempty"`
+	Tool    string `json:"tool"`
+	// Source 调用来源:空=MCP 工具调用;"http"=子代理只读腿(统计口径区分,
+	// 数据裁决时能看出只读腿的实际使用量)。
+	Source string `json:"source,omitempty"`
 	OK        bool   `json:"ok"`
 	ErrCode   string `json:"errCode,omitempty"`
 	Hit       bool   `json:"hit,omitempty"`       // recall/map 是否命中

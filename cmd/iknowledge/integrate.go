@@ -110,6 +110,7 @@ func runSetup(args []string, out io.Writer) int {
 type hookInput struct {
 	SessionID string `json:"session_id"`
 	CWD       string `json:"cwd"`
+	ToolName  string `json:"tool_name"` // Read/Edit/Write/…——写事件触发记账提醒
 	ToolInput struct {
 		FilePath     string `json:"file_path"`
 		NotebookPath string `json:"notebook_path"`
@@ -157,8 +158,8 @@ func runHook(args []string, in io.Reader, out io.Writer) int {
 	}
 	// 本机回环,1s 足够;超时静默——宁可少注入一次,不能卡住宿主。
 	client := &http.Client{Timeout: time.Second}
-	req, err := http.NewRequest(http.MethodGet, fmt.Sprintf("http://127.0.0.1:%d/inject?file=%s&session=%s",
-		cfg.Port, url.QueryEscape(file), url.QueryEscape(hi.SessionID)), nil)
+	req, err := http.NewRequest(http.MethodGet, fmt.Sprintf("http://127.0.0.1:%d/inject?file=%s&session=%s&tool=%s",
+		cfg.Port, url.QueryEscape(file), url.QueryEscape(hi.SessionID), url.QueryEscape(hi.ToolName)), nil)
 	if err != nil {
 		return 0
 	}

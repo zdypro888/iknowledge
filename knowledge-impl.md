@@ -388,8 +388,19 @@ type Parser interface {
   (转录错数值被子代理纠正的真实案例)。现补三个纯 HTTP GET:
   `GET /recall?q=<查询>[&mode=][&limit=][&session=]`、`GET /map[?path=][&depth=]`、
   `GET /status`——输出与同名工具一致(text/plain),有 shell 即可 curl,零 MCP 配置;
-  同受 auth/origin 门,usage 照记(与工具同一口径)。**只读**:记账/沉淀仍归有 MCP 的
-  主 AI(author 推导与写纪律不被绕过);纪律段新增第 8 条指引任务书作者附 curl 只读腿。
+  同受 auth/origin 门,usage 照记(Source="http" 与 MCP 调用区分口径)。**只读**:
+  记账/沉淀仍归有 MCP 的主 AI(author 推导与写纪律不被绕过);纪律段新增第 8 条指引
+  任务书作者附 curl 只读腿;**侦查简报自带降级门**(与纪律段首句同哲学):简报里的
+  kb_* 指令对受限子代理是死指令——简报尾附只读腿 URL(服务端自知地址)+ 代沉淀/
+  代交卷条款。
+- **hook 写事件记账提醒(2026-07-04 增)**:hook 桥透传 tool_name(&tool= 参数),
+  Edit/Write/MultiEdit/NotebookEdit 触发的注入在尾部追加记账提醒(预算裁剪之后,
+  提醒必须存活)——"改完的当下"是记账遵守率的黄金时点,纪律依赖的又一机械解。
+- **复述检测(2026-07-04 增,警示不拒收)**:条目 ASCII 词 ≥70% 来自符号签名 =
+  签名回声(读原文即得,存了是噪音)→ 警示。只测机械子集;中文结构复述属语义判断
+  归 AI(与矛盾检测同定案 §12.7),种子/热点提示词的"只存代码上看不出来的"负责语义层。
+- **性能卫生(2026-07-04)**:kb_status 的 parseFailed 全库扫描与 git 热区计数均
+  60s TTL 缓存(锁外算,独立小锁);gitTrail 加 --follow(改名不断链)。
 - **M1.2 客户端兼容实测清单(定案:以下是假设不是事实,验收前逐项实测并把结果写回本节)**:
   Claude Code 与 Codex 各测三项——① HTTP 传输连通(Codex 若不支持 HTTP MCP,启用 fallback:
   stdio 模式作"单 agent 独占"变体,启动时同样取 §4 的 flock);② `Mcp-Session-Id` 回带

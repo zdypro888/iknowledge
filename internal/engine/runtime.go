@@ -2,6 +2,8 @@ package engine
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"sync"
@@ -9,6 +11,7 @@ import (
 
 	"github.com/zdypro888/iknowledge/internal/index"
 	"github.com/zdypro888/iknowledge/internal/model"
+	"github.com/zdypro888/iknowledge/internal/parser"
 	"github.com/zdypro888/iknowledge/internal/store"
 )
 
@@ -38,6 +41,39 @@ type runtime struct {
 	gitCountsMu sync.Mutex
 	gitCounts   map[string]int
 	gitCountsAt time.Time
+
+	// parseFailed 计数缓存(60s TTL;kb_status 的全库 parse 扫描是最大单项成本,
+	// casino 实测数百毫秒——与 gitCounts 同型,同样锁外算)。
+	pfMu          sync.Mutex
+	parseFailedN  int
+	parseFailedAt time.Time
+}
+
+// parseFailedCached 返回解析失败文件数(60s TTL)。不持 rt.mu 调用。
+func (e *Engine) parseFailedCached() int {
+	e.rt.pfMu.Lock()
+	if !e.rt.parseFailedAt.IsZero() && e.now().Sub(e.rt.parseFailedAt) < time.Minute {
+		defer e.rt.pfMu.Unlock()
+		return e.rt.parseFailedN
+	}
+	e.rt.pfMu.Unlock()
+	n := 0
+	cfg, _ := e.Store.LoadConfig()
+	if files, err := listSourceFiles(e.Store.RepoRoot(), e.Reg, cfg); err == nil {
+		for _, rel := range files {
+			src, err := os.ReadFile(filepath.Join(e.Store.RepoRoot(), filepath.FromSlash(rel)))
+			if err != nil || parser.IsGenerated(src) {
+				continue
+			}
+			if _, err := e.Reg.ForFile(rel).Parse(rel, src); err != nil {
+				n++
+			}
+		}
+	}
+	e.rt.pfMu.Lock()
+	e.rt.parseFailedN, e.rt.parseFailedAt = n, e.now()
+	e.rt.pfMu.Unlock()
+	return n
 }
 
 // gitCountsCached 返回近 90 天每文件改动计数(60s TTL)。不持 rt.mu 调用。

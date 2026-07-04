@@ -699,7 +699,7 @@ func TestInjectEndpointAssembly(t *testing.T) {
 	}, sid, "codex"); err != nil {
 		t.Fatal(err)
 	}
-	out, err := e.Inject("internal/auth/login.go", sid)
+	out, err := e.Inject("internal/auth/login.go", sid, "Read")
 	if err != nil {
 		t.Fatal(err)
 	}

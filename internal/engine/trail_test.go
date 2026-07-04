@@ -39,6 +39,10 @@ func TestInvestigateGitTrail(t *testing.T) {
 	if !strings.Contains(out, "来时路") || !strings.Contains(out, "引入 charge 扣款模块防重复扣费") {
 		t.Errorf("简报缺来时路/提交线索:\n%s", out)
 	}
+	// 简报降级门:受限子代理没有 kb_* 工具时的只读腿指引必须在场(死指令防线)。
+	if !strings.Contains(out, "只读腿") || !strings.Contains(out, "/recall?q=") {
+		t.Errorf("简报缺受限子代理降级条款:\n%s", out)
+	}
 
 	// 骨架节点的 recall 也自动附来时路(冷启动价值:零 LLM 成本的考古线索)。
 	view, meta, err := e.Recall(RecallArgs{Query: "pay/charge.go#Charge"}, "sid-tr")
