@@ -27,6 +27,8 @@ const usage = `iknowledge——AI 代码知识库(MCP 服务)
   iknowledge init   --repo <path> [--force] [--reanchor-all]   骨架秒建/对账(纯 AST,零 LLM)
   iknowledge serve  --repo <path> [--addr host:port]           启动 MCP 服务
   iknowledge status --repo <path> [--prompt]                   库状态;--prompt 打印纪律提示词
+  iknowledge setup  --repo <path>                              打印接入三件套(.mcp.json/纪律段/hook),只打印不代写
+  iknowledge hook   [--repo <path>]                            宿主 hook 桥(Claude Code PostToolUse):注入所触文件的知识
   iknowledge version                                           版本自报(排障:确认在跑哪个构建)
 `
 
@@ -46,6 +48,10 @@ func run(args []string) int {
 		return runServe(args[1:])
 	case "status":
 		return runStatus(args[1:])
+	case "setup":
+		return runSetup(args[1:], os.Stdout)
+	case "hook":
+		return runHook(args[1:], os.Stdin, os.Stdout)
 	case "version", "-v", "--version":
 		return runVersion()
 	case "-h", "--help", "help":
@@ -236,10 +242,10 @@ func runInit(args []string) int {
 	if cfg, err := s.LoadConfig(); err == nil && cfg != nil {
 		fmt.Printf(`
 接入:把下面片段粘贴进 %s/.mcp.json(iknowledge 不代写):
-{ "mcpServers": { "knowledge": { "type": "http",
-  "url": "http://127.0.0.1:%d/mcp/main?repo=%s" } } }
+%s
 然后运行:iknowledge serve --repo %s
-`, s.RepoRoot(), cfg.Port, url.QueryEscape(s.RepoRoot()), s.RepoRoot())
+完整接入三件套(含 CLAUDE.md 纪律段与 hook 自动注入):iknowledge setup --repo %s
+`, s.RepoRoot(), mcpJSONSnippet(s.RepoRoot(), cfg.Port), s.RepoRoot(), s.RepoRoot())
 	}
 	return 0
 }
