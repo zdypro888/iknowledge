@@ -1,0 +1,17 @@
+{
+  "task": "n1-5",
+  "kind": "N1",
+  "mode": "b",
+  "model": "claude-haiku-4-5-20251001,claude-sonnet-5",
+  "usage": {
+    "input_tokens": 1129,
+    "output_tokens": 1058,
+    "cache_creation_input_tokens": 16466,
+    "cache_read_input_tokens": 267673
+  },
+  "total_tokens": 286326,
+  "turns": 0,
+  "duration_seconds": 101,
+  "transcript": "",
+  "started_at": "2026-07-04T10:05:34Z"
+}

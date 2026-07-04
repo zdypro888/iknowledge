@@ -1,0 +1,45 @@
+# M1.4 固定任务清单(impl §11:验收前锁定,不许临场选;2026-07-04 定稿)
+# 目标仓库:aibridge(37 文件 / 7172 行,双 AI 互审框架)
+# 5×N1(在哪/有什么)+ 5×N2(怎么用/坑);answer 仅供人工判卷,不喂给模型。
+repo: /Users/zdypro/Developer/src/golang/aibridge
+tasks:
+  - id: n1-1
+    kind: N1
+    question: 代理在伪终端上接收桥接器指令和用户键盘输入的关键入口是哪个函数?我想在那里挂钩监控所有写入操作。
+    answer: internal/agent/agent.go:120-135 —— Agent.Write() 写 PTY;readLoop() 分发输出到终端模拟器与订阅者。
+  - id: n1-2
+    kind: N1
+    question: 两个 AI 代理各自完成一轮审查后,"干净/修复/有问题"这三种裁决是在哪里从屏幕输出解析出来的?
+    answer: internal/bridge/driver.go:293-312 —— parseVerdict()/verdictFromString(),正则取最后一个 AUDIT_RESULT 标记。
+  - id: n1-3
+    kind: N1
+    question: 我想新增一种收敛判定策略(比如"双方都说没有 bug 才停")。策略接口定义在哪?新策略在哪个工厂函数里注册?
+    answer: internal/bridge/strategy.go —— Strategy 接口(Observe/Converged/Name/NeedsAsk);NewStrategy() 工厂加 case。
+  - id: n1-4
+    kind: N1
+    question: 系统支持几种评审模式(比如交接文件式、工具调用式)?决定当前模式的配置字段与各模式的分支逻辑分别在哪?
+    answer: config.go ReviewMode 字段(≈行 71-77)三种 handoff/mcp/plain;分支逻辑在 bridge/prompts.go 与 driver.go。
+  - id: n1-5
+    kind: N1
+    question: 一轮审查结束时系统会向界面发布事件通知。全部事件类型的定义清单在哪个文件?我想加一个新事件。
+    answer: internal/bridge/events.go:9-21 —— EventKind 常量与 Event 结构体。
+  - id: n2-6
+    kind: N2
+    question: 代理经常卡在"thinking…"很久,完成检测就误判了。控制完成检测的超时和稳定阈值的配置项叫什么?调它们有什么坑?
+    answer: internal/config/config.go:40-57 Agent 结构体 —— Poll/StableFor/SettleFor/Timeout/BusyPattern;坑:长思考屏幕不动会被误判完成,慢模型要加大 StableFor。
+  - id: n2-7
+    kind: N2
+    question: 我想改交接模式下"代理 A 提示代理 B 下一步看什么"的提示词模板。模板从哪加载、内存里什么结构、改完怎么保存才不会丢?
+    answer: internal/promptlib/promptlib.go —— Load() 读 prompts.json,Library/Template(FirstTurn/NextTurn/AskGate);坑:要 SetActive() 并保存,否则下次运行回滚。
+  - id: n2-8
+    kind: N2
+    question: 用工具调用模式跑的时候,为什么要给两个代理分别写一份各自的 MCP 配置文件?这两份配置到底让代理连到哪、干什么?旧版本代理有什么兼容开关?
+    answer: internal/bridge/mcp.go:31-80 WriteMCPConfig —— .mcp.json 与 .codex/config.toml 让代理连回 /mcp/claude、/mcp/codex 提交 submit_review;旧 codex 需 experimental_use_rmcp_client(CodexRmcp() 控制,默认 true)。
+  - id: n2-9
+    kind: N2
+    question: 我想在两个代理启动前注入自定义逻辑(检查仓库状态/预热)。启动编排的入口在哪?编排层和核心循环层怎么分工?续跑参数注入有什么坑?
+    answer: internal/runner/runner.go —— New()/Start() 启动代理、建驱动、跑 bridge.Run();坑:applyResume() 对 claude/codex 注入的 flag 格式不对称,手改易错。
+  - id: n2-10
+    kind: N2
+    question: 交接模式下两个代理靠仓库里的交接文件传话。这套机制怎么保证交接文件不污染 git 状态?用的哪种 ignore 手段、有什么局限?
+    answer: internal/bridge/handoff.go:22-60 —— PrepareHandoff() 建 .aibridge/ 并 addLocalGitExclude() 写 .git/info/exclude;局限:挡不住 git add -f,clone/新机器不携带。
