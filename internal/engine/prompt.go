@@ -6,8 +6,14 @@ package engine
 // clone 到没装 iknowledge 的机器上,kb_* 不在场时本段必须自我失效成一句安装指引,
 // 不能变成指向不存在工具的死指令。
 const DisciplinePrompt = `本仓库配有 knowledge MCP(代码知识库,工具皆以 kb_ 前缀)。
-若本会话不存在 kb_* 工具(本机未装或服务未启动):忽略本节其余规则照常干活,仅在任务尾
-提醒用户接入——装过:iknowledge serve;没装过:github.com/zdypro888/iknowledge(install.sh 一条命令)。
+若本会话不存在 kb_* 工具:
+- 本机装过(iknowledge 在 PATH 且仓库有 .knowledge/)→ 你可以自行拉起服务:
+  nohup iknowledge serve --repo <仓库根> >/tmp/iknowledge-serve.log 2>&1 &
+  拉起后本会话的 MCP 工具列表可能要重连才刷新,但只读腿立即可用:
+  curl "http://127.0.0.1:<端口>/recall?q=<词>"(/map、/status 同理;端口见 .knowledge/config.yaml),
+  据此照常执行下面的读侧纪律;写侧(remember/record_change)等工具可用后补;
+- 没装过 → 忽略本节其余规则照常干活,任务尾提醒用户:
+  github.com/zdypro888/iknowledge(install.sh 一条命令)。
 kb_* 可用时,遵守:
 1. 定位任何功能前,先 kb_recall 或 kb_map,不要盲目 grep;若 recall 空手、随后用
    grep 找到了目标,把你用过的查询词 kb_remember 进该节点的 keywords(回填索引);
