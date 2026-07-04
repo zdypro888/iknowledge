@@ -77,8 +77,17 @@ type Entry struct {
 	Confidence Confidence `yaml:"confidence"`
 	// At 写入时间(全量实现补定):维护欠账"摘要落后于其下变更"的判定依据,
 	// 也是来源审计的一部分。旧分片缺此字段视为零值,判定时按保守处理。
-	At      time.Time `yaml:"at,omitempty"`
-	BasedOn []string  `yaml:"based_on,omitempty"` // 其他条目 ID("node-id#entry-id")
+	At time.Time `yaml:"at,omitempty"`
+	// ConfirmedAt 最后确认时间(knowledge.md §8.4 非代码知识的时间锚):
+	// kb_verify confirm 时刷新。零值回退 At。只对无代码锚的节点(project/dir)
+	// 有复核语义——有锚节点的失效检测走哈希,不走时间。
+	ConfirmedAt time.Time `yaml:"confirmed_at,omitempty"`
+	BasedOn     []string  `yaml:"based_on,omitempty"` // 其他条目 ID("node-id#entry-id")
+	// Disputes 矛盾声明(knowledge.md §12.4 待裁决机制):写入方声明本条与既有条目
+	// 冲突("node-id#entry-id")。语义判断归 AI,服务端只登记、呈现、派债——
+	// 双方都 Active 即"待裁决",一方退场(refute/obsolete/supersede)即自动解除。
+	// 只存正向(声明方):被指方跨节点时反向由 index 现算,避免一次写两个分片。
+	Disputes []string `yaml:"disputes,omitempty"`
 	// Author 来源可溯(knowledge.md §12.8 第 4 条):服务端从 clientInfo 推导,不接受 AI 自报。
 	Author    string `yaml:"author,omitempty"`
 	RefutedBy string `yaml:"refuted_by,omitempty"` // 勘误 change ID

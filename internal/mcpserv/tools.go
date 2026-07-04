@@ -92,6 +92,7 @@ var allTools = map[string]any{
 				"kind":     map[string]any{"type": "string", "enum": []string{"summary", "contract", "mutation", "pitfall", "usage"}, "description": "summary=一句话概览;contract=调用契约/前置条件;mutation=是否改入参/有无副作用;pitfall=坑/易错;usage=正确用法"},
 				"text":     str("知识文本(按层级有 token 预算)"),
 				"based_on": arr(str("依据条目引用 node-id#entry-id"), "结论依据来自其他知识条目(非原文)时必须声明;可信度封顶 inferred"),
+				"disputes": arr(str("矛盾条目引用 node-id#entry-id"), "本条与既有条目矛盾且你无法当场裁决(证据在代码外等)时声明,登记待裁决防静默共存;能自裁的直接 kb_verify refute"),
 			}, "kind", "text"), "知识条目"),
 			"keywords":   arr(str("检索关键词"), "整体替换语义(非追加),上限 12;recall 空手后回填你用过的检索词"),
 			"supersedes": arr(str("被取代的条目 ID"), "新条目取代旧条目(更新/合并);须恰好一条新条目"),

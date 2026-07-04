@@ -31,6 +31,7 @@ type Index struct {
 	lineage     map[string][]string        // 旧节点 ID → 现任节点 ID(拆分可多个,#8)
 	inverted    map[string]map[string]bool // token → 节点 ID 集合
 	basedOnRev  map[string][]string        // 归一化 "node#entry" → 依赖它的 "node#entry"
+	disputesRev map[string][]string        // 归一化 "node#entry" → 声明与它矛盾的 "node#entry"
 	flowsByNode map[string][]string        // 节点 ID → flow IDs(反向链接,现算不落盘)
 	journalBy   map[string][]ChangeRef     // 现任节点 ID → 变更引用
 	changes     []model.Change
@@ -46,6 +47,7 @@ func Build(shards map[string][]model.Node, changes []model.Change, flows []model
 		lineage:     map[string][]string{},
 		inverted:    map[string]map[string]bool{},
 		basedOnRev:  map[string][]string{},
+		disputesRev: map[string][]string{},
 		flowsByNode: map[string][]string{},
 		journalBy:   map[string][]ChangeRef{},
 		changes:     changes,
@@ -100,13 +102,16 @@ func Build(shards map[string][]model.Node, changes []model.Change, flows []model
 		}
 	}
 
-	// basedOn 反向图:引用永不改写,建图时归一化(impl §8)。
+	// basedOn / disputes 反向图:引用永不改写,建图时归一化(impl §8)。
 	for id, ref := range ix.nodes {
 		for i := range ref.Node.Entries {
 			e := &ref.Node.Entries[i]
 			from := id + "#" + e.ID
 			for _, dep := range e.BasedOn {
 				ix.basedOnRev[ix.ResolveEntryRef(dep)] = append(ix.basedOnRev[ix.ResolveEntryRef(dep)], from)
+			}
+			for _, d := range e.Disputes {
+				ix.disputesRev[ix.ResolveEntryRef(d)] = append(ix.disputesRev[ix.ResolveEntryRef(d)], from)
 			}
 		}
 	}
@@ -214,6 +219,31 @@ func (ix *Index) ResolveEntryRef(ref string) string {
 		eid = e.SupersededBy
 	}
 	return cur + "#" + eid
+}
+
+// DisputedBy 返回声明与该条目矛盾的条目引用(归一化;knowledge.md §12.4)。
+func (ix *Index) DisputedBy(entryRef string) []string {
+	out := ix.disputesRev[ix.ResolveEntryRef(entryRef)]
+	sort.Strings(out)
+	return out
+}
+
+// EntryByRef 按 "node-id#entry-id" 引用取条目(沿 lineage/supersedes 归一;查无 nil)。
+func (ix *Index) EntryByRef(ref string) *model.Entry {
+	nodeID, entryID := splitEntryRef(ix.ResolveEntryRef(ref))
+	if nodeID == "" {
+		return nil
+	}
+	nref := ix.nodes[nodeID]
+	if nref == nil {
+		return nil
+	}
+	for i := range nref.Node.Entries {
+		if nref.Node.Entries[i].ID == entryID {
+			return &nref.Node.Entries[i]
+		}
+	}
+	return nil
 }
 
 // Dependents 沿 basedOn 反向图取直接+间接依赖者(级联污染回收,knowledge.md §12.5)。

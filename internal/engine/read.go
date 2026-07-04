@@ -60,6 +60,8 @@ func (e *Engine) Status() (string, error) {
 			}
 		}
 	}
+	// 热区频率因子同样锁外跑 git(knowledge.md §12.1)。
+	gitCounts := gitChangeCounts(e.Store.RepoRoot(), "90.days")
 
 	e.rt.mu.Lock()
 	defer e.rt.mu.Unlock()
@@ -67,6 +69,8 @@ func (e *Engine) Status() (string, error) {
 	total, digested, suspect, orphaned, pending := 0, 0, 0, 0, 0
 	conflicts := 0
 	var orphanIDs []string
+	type fileDigest struct{ done, total int }
+	perFile := map[string]*fileDigest{} // 符号节点按文件聚合(热点消化比)
 	for _, cs := range e.rt.cache.Shards() {
 		if cs.Err != nil {
 			conflicts++
@@ -87,6 +91,18 @@ func (e *Engine) Status() (string, error) {
 			}
 			if n.PendingAnchor {
 				pending++
+			}
+			if n.Level == model.LevelFunction || n.Level == model.LevelDecl {
+				file, _ := model.SplitNodeID(n.ID)
+				fd := perFile[file]
+				if fd == nil {
+					fd = &fileDigest{}
+					perFile[file] = fd
+				}
+				fd.total++
+				if hasActiveEntries(n) {
+					fd.done++
+				}
 			}
 		}
 	}
@@ -144,6 +160,43 @@ func (e *Engine) Status() (string, error) {
 			recalls, pct(hits, recalls), undigestedHits, recalls-hits, remembers, changes, staleN)
 		if staleN > 0 && changes*10 < staleN*10 { // 展示记账遵守率信号
 			fmt.Fprintf(&b, "⚠ 记账遵守率信号:未记账变更事件 %d vs 记账 %d\n", staleN, changes)
+		}
+	}
+
+	// 热点待消化(knowledge.md §12.1:热度 = git 近期改动频率 × 跨文件被调中心度,
+	// +1 平滑——非 git 仓库/新文件退化为单因子仍可排序)。消化优先级的机械输出,
+	// 消化本身仍由 AI 会话做(kb_recall 读原文 → kb_remember 沉淀)。
+	if cg := e.ensureCallGraphLocked(); cg != nil && len(perFile) > 0 {
+		centrality := cg.fileCentrality()
+		type hotspot struct {
+			file        string
+			heat        int
+			chg, ctr    int
+			done, total int
+		}
+		var hot []hotspot
+		for file, fd := range perFile {
+			if fd.done >= fd.total {
+				continue // 全消化的文件不是"待消化"热点
+			}
+			chg, ctr := gitCounts[file], centrality[file]
+			hot = append(hot, hotspot{file, (1 + chg) * (1 + ctr), chg, ctr, fd.done, fd.total})
+		}
+		sort.Slice(hot, func(i, j int) bool {
+			if hot[i].heat != hot[j].heat {
+				return hot[i].heat > hot[j].heat
+			}
+			return hot[i].file < hot[j].file
+		})
+		if len(hot) > 5 {
+			hot = hot[:5]
+		}
+		if len(hot) > 0 && hot[0].heat > 1 { // 双因子全零(冷库无 git)时不值得占版面
+			b.WriteString("热点待消化(90 天改动 × 跨文件被调;kb_recall 读原文后 kb_remember 沉淀):\n")
+			for _, h := range hot {
+				fmt.Fprintf(&b, "  - %s 热度 %d(改 %d 次 × 被调 %d)消化 %d/%d\n",
+					h.file, h.heat, h.chg, h.ctr, h.done, h.total)
+			}
 		}
 	}
 
@@ -483,6 +536,14 @@ func (e *Engine) Recall(a RecallArgs, sid string) (string, ReadMeta, error) {
 			fmt.Fprintf(&b, "- %s %s\n", h.NodeID, nodeLine(ref.Node))
 			ids = append(ids, h.NodeID)
 		}
+		// 结构扩展一跳(检索三级递进第 2 级,knowledge.md §10.2):
+		// 沿调用边与流程引用带出关键词没匹配上、但结构相连的节点。
+		if nbs := e.structuralNeighborsLocked(ids, 5); len(nbs) > 0 {
+			b.WriteString("结构相邻(一跳,关键词未命中但与命中节点相连):\n")
+			for _, nb := range nbs {
+				fmt.Fprintf(&b, "- %s %s(%s)\n", nb.id, nodeLine(e.rt.ix.Node(nb.id).Node), nb.via)
+			}
+		}
 		b.WriteString("(用节点 ID 精确重查取快照/历史)")
 		b.WriteString(e.wipAttachment(ids))
 		return framed(b.String()), ReadMeta{Hit: true}, nil
@@ -549,10 +610,10 @@ func (e *Engine) recallNodeLocked(nodeID string, a RecallArgs, sid string) (stri
 		fmt.Fprintf(&b, "签名: %s\n", auto.signature)
 	}
 	if len(auto.calls) > 0 {
-		fmt.Fprintf(&b, "调用(同文件): %s\n", strings.Join(auto.calls, ", "))
+		fmt.Fprintf(&b, "调用: %s\n", strings.Join(auto.calls, ", "))
 	}
 	if len(auto.calledBy) > 0 {
-		fmt.Fprintf(&b, "被调用(同文件): %s\n", strings.Join(auto.calledBy, ", "))
+		fmt.Fprintf(&b, "被调用: %s\n", strings.Join(auto.calledBy, ", "))
 	}
 	if len(n.Keywords) > 0 {
 		fmt.Fprintf(&b, "keywords: %s\n", strings.Join(n.Keywords, ", "))
@@ -562,6 +623,7 @@ func (e *Engine) recallNodeLocked(nodeID string, a RecallArgs, sid string) (stri
 	}
 
 	// 条目(superseded/refuted/retired 不出现,impl §7.3)。
+	anchorless := n.Anchor.Hash == "" && !n.PendingAnchor
 	for i := range n.Entries {
 		en := &n.Entries[i]
 		if !en.Active() {
@@ -574,6 +636,32 @@ func (e *Engine) recallNodeLocked(nodeID string, a RecallArgs, sid string) (stri
 		b.WriteString(")\n")
 		if en.Confidence == model.ConfidenceSuspect {
 			b.WriteString("  ↳ 待重验:其依据已被勘误或锚已失配,重验前勿信(kb_verify)\n")
+		}
+		// 矛盾待裁决的双向呈现(§12.4:并存呈现防静默覆盖;一方退场自动解除)。
+		for _, d := range en.Disputes {
+			if t := e.rt.ix.EntryByRef(d); t != nil && t.Active() {
+				fmt.Fprintf(&b, "  ↳ ⚠ 与 %s 矛盾待裁决:两者必有一错,裁决前都别信(kb_verify refute 错误方/obsolete 过时方)\n", d)
+			}
+		}
+		for _, from := range e.rt.ix.DisputedBy(nodeID + "#" + en.ID) {
+			if t := e.rt.ix.EntryByRef(from); t != nil && t.Active() {
+				fmt.Fprintf(&b, "  ↳ ⚠ 被 %s 声明矛盾待裁决:两者必有一错,裁决前都别信\n", from)
+			}
+		}
+		// 非代码知识的时间锚标注(§8.4):无代码锚不会自动失效,超期要诚实提示。
+		if anchorless {
+			last := en.At
+			if en.ConfirmedAt.After(last) {
+				last = en.ConfirmedAt
+			}
+			if e.now().Sub(last) > reviewOverdueAfter {
+				if last.IsZero() {
+					b.WriteString("  ↳ 无确认时间记录(旧数据),可能过期:核实后 kb_verify confirm 建立时间锚\n")
+				} else {
+					fmt.Fprintf(&b, "  ↳ 上次确认 %s(超 %d 天),可能过期:核实后 kb_verify confirm 刷新\n",
+						last.Format("2006-01-02"), int(e.now().Sub(last).Hours()/24))
+				}
+			}
 		}
 	}
 
@@ -863,16 +951,12 @@ func (e *Engine) reconcileOnReadLocked(ref *index.NodeRef) autoInfo {
 	}
 	auto.curHash = cur.Hash
 	auto.signature = parser.Signature(*cur)
-	if calls, err := parser.SameFileCalls(file, src); err == nil {
-		auto.calls = calls[symbol]
-		for caller, callees := range calls {
-			for _, cee := range callees {
-				if cee == symbol {
-					auto.calledBy = append(auto.calledBy, caller)
-				}
-			}
-		}
-		sort.Strings(auto.calledBy)
+	// 调用关系走全仓调用图(impl §5 修订;auto 派生现算不落盘)。
+	// 展示上限 12(限额哲学):同文件裸名在前,跨文件完整 node ID 可直接再 recall。
+	if cg := e.ensureCallGraphLocked(); cg != nil {
+		nodeID := file + "#" + symbol
+		auto.calls = displayEdges(cg.callsOf(nodeID), file, 12)
+		auto.calledBy = displayEdges(cg.calledByOf(nodeID), file, 12)
 	}
 
 	// 读路径落盘尽力而为:失败不阻断读取(内存态已更新、返回信息正确),记警下次重试。

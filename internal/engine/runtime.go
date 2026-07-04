@@ -28,6 +28,10 @@ type runtime struct {
 
 	sessions map[string]*sessionLedger
 	job      *scoutJob // 同 repo 最多 1 个活跃 job(递归护栏)
+
+	// cg 是全仓调用图(auto 派生值,不落盘;文件指纹增量,见 callgraph.go)。
+	// 生命周期独立于 ix:reloadLocked 重建索引不清它,指纹自会对账。
+	cg *callGraph
 }
 
 // sessionLedger 是一个会话的读取台账(knowledge.md §9.3):
@@ -53,6 +57,9 @@ type scoutJob struct {
 	Scope    string
 	Started  time.Time
 	TTL      time.Duration
+	// done 自派备模式的交卷信号(缓冲 1):SubmitFindings 投递格式化 findings,
+	// 阻塞中的 Investigate 收货返回。委派模式下无人收货,缓冲写不阻塞。
+	done chan string
 }
 
 func (j *scoutJob) expired(now time.Time) bool {

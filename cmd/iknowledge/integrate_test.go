@@ -87,6 +87,46 @@ func TestHookBridge(t *testing.T) {
 	}
 }
 
+// TestHookBridgeAuth:serve --auth 时 hook 桥自动携带 token(闭环)。
+func TestHookBridgeAuth(t *testing.T) {
+	repo := setupGitRepo(t)
+	e, _ := initRepo(t, repo, engine.InitOptions{})
+	if _, err := e.Remember(engine.RememberArgs{
+		Node:    "internal/auth/login.go#Login",
+		Entries: []engine.RememberEntry{{Kind: "usage", Text: "pass 传明文,内部做校验"}},
+	}, "seed", "tester"); err != nil {
+		t.Fatal(err)
+	}
+	tok, err := e.Store.EnsureAuthToken()
+	if err != nil {
+		t.Fatal(err)
+	}
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	port := ln.Addr().(*net.TCPAddr).Port
+	if err := os.WriteFile(filepath.Join(repo, ".knowledge", "config.yaml"),
+		fmt.Appendf(nil, "schema: 1\nport: %d\n", port), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	msrv := mcpserv.New(e)
+	msrv.AuthToken = tok
+	srv := &http.Server{Handler: msrv.Handler()}
+	go srv.Serve(ln)
+	t.Cleanup(func() { srv.Close() })
+
+	stdin := fmt.Sprintf(`{"session_id":"x","cwd":%q,"tool_input":{"file_path":%q}}`,
+		repo, filepath.Join(repo, "internal", "auth", "login.go"))
+	var out bytes.Buffer
+	if code := runHook([]string{"--repo", repo}, strings.NewReader(stdin), &out); code != 0 {
+		t.Fatalf("hook 退出码 %d", code)
+	}
+	if !strings.Contains(out.String(), "pass 传明文") {
+		t.Errorf("鉴权下 hook 注入失败(应自动带 token):%s", out.String())
+	}
+}
+
 // TestHookServeDown:serve 未启动时 hook 必须静默退出 0(纪律第 0 条)。
 func TestHookServeDown(t *testing.T) {
 	repo := setupGitRepo(t)
@@ -107,6 +147,19 @@ func TestHookServeDown(t *testing.T) {
 		repo, filepath.Join(repo, "main.go"))
 	if code := runHook([]string{"--repo", repo}, strings.NewReader(stdin), &out); code != 0 || out.Len() != 0 {
 		t.Errorf("serve 未启动应静默退出 0,实得 code=%d out=%s", code, out.String())
+	}
+}
+
+// TestMaintainCLI:maintain 只读打印欠账清单(空库:无欠账;不加写者锁,serve 期可用)。
+func TestMaintainCLI(t *testing.T) {
+	repo := setupGitRepo(t)
+	initRepo(t, repo, engine.InitOptions{})
+	var out bytes.Buffer
+	if code := runMaintain([]string{"--repo", repo}, &out); code != 0 {
+		t.Fatalf("maintain 退出码 %d", code)
+	}
+	if !strings.Contains(out.String(), "无维护欠账") {
+		t.Errorf("空库应报无欠账,实得:%s", out.String())
 	}
 }
 

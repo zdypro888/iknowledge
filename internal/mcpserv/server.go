@@ -4,6 +4,7 @@ package mcpserv
 
 import (
 	"crypto/rand"
+	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -26,6 +27,9 @@ const Version = "0.2.0"
 // Server 是一个仓库的 MCP 服务。
 type Server struct {
 	E *engine.Engine
+	// AuthToken 非空即启用 Bearer 鉴权(impl §1 --auth,2026-07-04 自四期提前):
+	// 全部端点(含 /inject)要求 Authorization: Bearer <token>。Handler() 前设置。
+	AuthToken string
 
 	mu       sync.Mutex
 	sessions map[string]*session
@@ -68,7 +72,25 @@ func (s *Server) Handler() http.Handler {
 		http.Redirect(w, r, target, http.StatusPermanentRedirect)
 	})
 	mux.HandleFunc("/inject", s.serveInject)
-	return originGuard(mux)
+	return s.authGuard(originGuard(mux))
+}
+
+// authGuard Bearer 鉴权(AuthToken 非空时):常数时间比较防时序侧信道。
+// 401 带 WWW-Authenticate(RFC 6750);鉴权先于 Origin 校验(未认证请求最先挡)。
+func (s *Server) authGuard(next http.Handler) http.Handler {
+	if s.AuthToken == "" {
+		return next
+	}
+	want := []byte("Bearer " + s.AuthToken)
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got := []byte(r.Header.Get("Authorization"))
+		if len(got) != len(want) || subtle.ConstantTimeCompare(got, want) != 1 {
+			w.Header().Set("WWW-Authenticate", `Bearer realm="iknowledge"`)
+			http.Error(w, "unauthorized: serve 以 --auth 启动,需 Authorization: Bearer <.knowledge/local/token>", http.StatusUnauthorized)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 // originGuard 是 MCP 2025-06-18 传输安全要求(R2-E1):

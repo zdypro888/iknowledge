@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/zdypro888/iknowledge/internal/model"
 )
@@ -17,11 +18,15 @@ import (
 // Debt 是一条维护欠账。
 type Debt struct {
 	ID   string // 稳定推导:kind+node 的短哈希(同一成因两次 next 拿到同一 ID)
-	Kind string // era-compress | summary-stale | dup-entries
+	Kind string // era-compress | summary-stale | dup-entries | review-overdue
 	Node string
 	Desc string
 	Hint string
 }
+
+// reviewOverdueAfter 是非代码知识的复核周期(knowledge.md §8.4:无代码哈希锚,
+// 失效检测靠"时间 + 人工复核")。90 天是经验值,与 §12.3 阈值同哲学:待实测调参。
+const reviewOverdueAfter = 90 * 24 * time.Hour
 
 func debtID(kind, node string) string {
 	sum := sha256.Sum256([]byte(kind + "\x00" + node))
@@ -77,6 +82,54 @@ func (e *Engine) computeDebtsLocked() []Debt {
 				}
 			}
 		}
+		// ④ 非代码知识超期未复核(§8.4:无锚知识的时间锚)。零值时间按超期处理
+		//(旧分片缺字段,保守:报一次,confirm 后有了时间锚就不再复报)。
+		if n.Anchor.Hash == "" && !n.PendingAnchor {
+			overdue := 0
+			var oldest string
+			for i := range n.Entries {
+				en := &n.Entries[i]
+				if !en.Active() {
+					continue
+				}
+				last := en.At
+				if en.ConfirmedAt.After(last) {
+					last = en.ConfirmedAt
+				}
+				if e.now().Sub(last) > reviewOverdueAfter {
+					overdue++
+					if oldest == "" {
+						oldest = en.ID
+					}
+				}
+			}
+			if overdue > 0 {
+				debts = append(debts, Debt{
+					ID: debtID("review", id), Kind: "review-overdue", Node: id,
+					Desc: fmt.Sprintf("%d 条非代码知识超过 %d 天未复核(如 %s)", overdue, int(reviewOverdueAfter.Hours()/24), oldest),
+					Hint: "无代码锚的知识不会因代码变更自动失效,只能定期人工核实:仍成立则 kb_verify confirm(条目引用或整节点 ID)刷新确认时间;不再成立则 refute(附证据)/obsolete",
+				})
+			}
+		}
+		// ⑤ 矛盾待裁决(§12.4):双方均活跃的 disputes 声明。语义矛盾服务端测不出
+		//(§12.7 定案不变),这里只派"AI 已声明、尚未裁决"的账——成因(任一方退场)
+		// 消除即自动消失,与其余债种同型。
+		for i := range n.Entries {
+			en := &n.Entries[i]
+			if !en.Active() {
+				continue
+			}
+			for _, d := range en.Disputes {
+				if t := e.rt.ix.EntryByRef(d); t != nil && t.Active() {
+					from := id + "#" + en.ID
+					debts = append(debts, Debt{
+						ID: debtID("dispute:"+from+":"+d, id), Kind: "dispute-open", Node: id,
+						Desc: "条目 " + en.ID + " 与 " + d + " 矛盾待裁决",
+						Hint: "读双方文本与依据(原文优先):kb_verify refute 错误方(附证据)或 obsolete 过时方;证据在代码之外则升级给人;实非矛盾则 dismiss",
+					})
+				}
+			}
+		}
 		// ③ 疑似重复条目(bigram>0.8 的活跃对)。
 		var actives []*model.Entry
 		for i := range n.Entries {
@@ -107,6 +160,20 @@ func (e *Engine) computeDebtsLocked() []Debt {
 	}
 	sort.Slice(debts, func(i, j int) bool { return debts[i].ID < debts[j].ID })
 	return debts
+}
+
+// Debts 现算全部维护欠账(CLI `iknowledge maintain` 的只读视图;
+// MCP 侧取用/销账仍走 kb_maintain,knowledge.md §12.7)。
+func (e *Engine) Debts() ([]Debt, error) {
+	if err := e.requireInit(); err != nil {
+		return nil, err
+	}
+	if err := e.Sync(); err != nil {
+		return nil, err
+	}
+	e.rt.mu.Lock()
+	defer e.rt.mu.Unlock()
+	return e.computeDebtsLocked(), nil
 }
 
 // MaintainArgs 是 kb_maintain 入参。

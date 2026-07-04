@@ -23,6 +23,9 @@ type Engine struct {
 	Reg   *parser.Registry
 	// now 可注入以便测试;缺省 time.Now。
 	now func() time.Time
+	// scoutAddr 是 serve 实际监听地址(自派侦察兵回连用,SetScoutAddr 注入;
+	// 空则回退 config 端口)。启动期一次性写入,不加锁。
+	scoutAddr string
 	// rt 是 serve 期的内存态(缓存/索引/台账/作业),见 runtime.go。
 	rt runtime
 }

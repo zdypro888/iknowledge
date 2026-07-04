@@ -2,6 +2,7 @@ package engine
 
 import (
 	"bytes"
+	"fmt"
 	"os"
 	"os/exec"
 	"path"
@@ -45,6 +46,44 @@ func listSourceFiles(repo string, reg *parser.Registry, cfg *store.Config) ([]st
 	}
 	sort.Strings(out)
 	return out, nil
+}
+
+// gitChangeCounts 统计近 since 内每文件的提交触碰次数(热区排序的频率因子,
+// knowledge.md §12.1)。git 不可用/非仓库返回 nil——热度退化为纯中心度。
+// rename 只计新路径(近似:旧路径热度沉底,新路径从头计,可接受)。
+func gitChangeCounts(repo, since string) map[string]int {
+	cmd := exec.Command("git", "-C", repo, "log", "--since="+since, "--name-only", "--pretty=format:")
+	out, err := cmd.Output()
+	if err != nil {
+		return nil
+	}
+	counts := map[string]int{}
+	for line := range strings.SplitSeq(string(out), "\n") {
+		if line = strings.TrimSpace(line); line != "" {
+			counts[filepath.ToSlash(line)]++
+		}
+	}
+	return counts
+}
+
+// gitTrail 取文件的近期提交线索(knowledge.md §15 三期"git 历史挖掘初始来时路"的
+// 机械落地,2026-07-04):不做全量挖掘,只在侦查简报附上目标区域"为什么长这样"的
+// 档案入口——深挖(git show/blame)由侦察兵按需自取。非 git 仓库返回空。
+func gitTrail(repo string, files []string) string {
+	var b strings.Builder
+	for _, f := range files {
+		out, err := exec.Command("git", "-C", repo, "log", "-n", "3",
+			"--date=short", "--pretty=format:%h %ad %s", "--", f).Output()
+		trimmed := strings.TrimSpace(string(out))
+		if err != nil || trimmed == "" {
+			continue
+		}
+		fmt.Fprintf(&b, "  %s:\n", f)
+		for line := range strings.SplitSeq(trimmed, "\n") {
+			fmt.Fprintf(&b, "    %s\n", line)
+		}
+	}
+	return b.String()
 }
 
 // gitListFiles 用 -z 输出防路径含特殊字符;git 不可用/非仓库返回 ok=false。

@@ -19,7 +19,13 @@ import (
 )
 
 // mcpJSONSnippet 是 .mcp.json 接入片段(init/setup 共用)。
-func mcpJSONSnippet(root string, port int) string {
+// token 非空(serve --auth 已启用)时附 headers——.mcp.json 会含密钥,提醒勿提交。
+func mcpJSONSnippet(root string, port int, token string) string {
+	if token != "" {
+		return fmt.Sprintf(`{ "mcpServers": { "knowledge": { "type": "http",
+  "url": "http://127.0.0.1:%d/mcp/main?repo=%s",
+  "headers": { "Authorization": "Bearer %s" } } } }`, port, url.QueryEscape(root), token)
+	}
 	return fmt.Sprintf(`{ "mcpServers": { "knowledge": { "type": "http",
   "url": "http://127.0.0.1:%d/mcp/main?repo=%s" } } }`, port, url.QueryEscape(root))
 }
@@ -67,10 +73,16 @@ func runSetup(args []string, out io.Writer) int {
 		return 1
 	}
 	root := s.RepoRoot()
+	// serve --auth 已启用过(token 在位)则片段带 headers;.mcp.json 因此含密钥。
+	token, _ := s.LoadAuthToken()
+	authNote := ""
+	if token != "" {
+		authNote = "\n   ⚠ 已启用鉴权:.mcp.json 含 token,勿提交版本库(加进 .gitignore);serve 需带 --auth 启动。"
+	}
 	fmt.Fprintf(out, `接入三件套(iknowledge 只打印不代写,铁律二;贴完运行 iknowledge serve --repo %s):
 
 ① MCP 服务(必装)——贴进 %s/.mcp.json:
-%s
+%s`+authNote+`
 
 ② 纪律提示词(必装)——贴进 %s/CLAUDE.md(或 codex 等 agent 的指令文件):
 %s
@@ -89,7 +101,7 @@ func runSetup(args []string, out io.Writer) int {
 
 验证:iknowledge serve --repo %s 启动后,
   curl "http://127.0.0.1:%d/inject?file=<某个 .go 文件路径>"
-`, root, root, mcpJSONSnippet(root, cfg.Port), root, engine.DisciplinePrompt,
+`, root, root, mcpJSONSnippet(root, cfg.Port, token), root, engine.DisciplinePrompt,
 		root, hooksJSONSnippet(root), codexTOMLSnippet(root, cfg.Port), root, root, cfg.Port)
 	return 0
 }
@@ -145,8 +157,16 @@ func runHook(args []string, in io.Reader, out io.Writer) int {
 	}
 	// 本机回环,1s 足够;超时静默——宁可少注入一次,不能卡住宿主。
 	client := &http.Client{Timeout: time.Second}
-	resp, err := client.Get(fmt.Sprintf("http://127.0.0.1:%d/inject?file=%s&session=%s",
-		cfg.Port, url.QueryEscape(file), url.QueryEscape(hi.SessionID)))
+	req, err := http.NewRequest(http.MethodGet, fmt.Sprintf("http://127.0.0.1:%d/inject?file=%s&session=%s",
+		cfg.Port, url.QueryEscape(file), url.QueryEscape(hi.SessionID)), nil)
+	if err != nil {
+		return 0
+	}
+	// serve --auth 时携带令牌(token 文件在位即带;serve 未开鉴权则忽略该头,无害)。
+	if token, _ := s.LoadAuthToken(); token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	resp, err := client.Do(req)
 	if err != nil {
 		return 0
 	}

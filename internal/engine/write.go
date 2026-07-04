@@ -19,6 +19,9 @@ type RememberEntry struct {
 	Kind    string   `json:"kind"`
 	Text    string   `json:"text"`
 	BasedOn []string `json:"based_on,omitempty"`
+	// Disputes 矛盾声明(knowledge.md §12.4):本条与既有条目冲突且写入方无法自裁
+	// (证据在代码之外等)时登记待裁决,防静默共存;能自裁的直接 kb_verify refute,不用它。
+	Disputes []string `json:"disputes,omitempty"`
 }
 
 // RememberArgs 是 kb_remember 入参。
@@ -159,10 +162,31 @@ func (e *Engine) Remember(a RememberArgs, sid, author string) (string, error) {
 					"格式 node-id#entry-id;用 kb_recall 核对")
 			}
 		}
+		// disputes:被指条目必须存在且活跃(§12.4;指一条已退场的条目无裁决意义),
+		// 引用归一化后落盘(正向单侧存储,反向 index 现算)。
+		var disputes []string
+		for _, d := range in.Disputes {
+			resolved := e.rt.ix.ResolveEntryRef(d)
+			target := e.rt.ix.EntryByRef(resolved)
+			if target == nil {
+				return "", kbErr("NODE_NOT_FOUND", "disputes 引用 "+d+" 不存在",
+					"格式 node-id#entry-id;用 kb_recall 核对")
+			}
+			if !target.Active() {
+				return "", kbErr("INVALID_ARGUMENT", "disputes 引用 "+d+" 已退场(被取代/驳倒/退休),无需裁决",
+					"直接写入新知识即可;若要翻案走带证据的 kb_remember")
+			}
+			disputes = append(disputes, resolved)
+		}
+		if len(disputes) > 0 {
+			warnList = append(warnList,
+				"矛盾已登记待裁决:双方并存呈现,尽快裁决——读双方依据后 kb_verify refute 错误方(附证据)或 obsolete 过时方;若证据在代码之外,升级给人")
+		}
 		newEntries = append(newEntries, model.Entry{
 			ID: model.NewEntryID(), Kind: in.Kind, Text: in.Text,
 			Confidence: model.ConfidenceInferred,
 			BasedOn:    in.BasedOn,
+			Disputes:   disputes,
 			Author:     author,
 			At:         e.now().UTC(),
 		})

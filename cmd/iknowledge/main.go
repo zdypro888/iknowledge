@@ -6,6 +6,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/url"
@@ -25,8 +26,10 @@ const usage = `iknowledge——AI 代码知识库(MCP 服务)
 
 用法:
   iknowledge init   --repo <path> [--force] [--reanchor-all]   骨架秒建/对账(纯 AST,零 LLM)
-  iknowledge serve  --repo <path> [--addr host:port]           启动 MCP 服务
+  iknowledge serve  --repo <path> [--repo <path2> …] [--auth]  启动 MCP 服务;--repo 可重复(单进程多仓库);--auth 启用 token 鉴权
+                    [--addr host:port]                         (仅单仓库)覆盖监听地址
   iknowledge status --repo <path> [--prompt]                   库状态;--prompt 打印纪律提示词
+  iknowledge maintain --repo <path>                            打印维护欠账清单(只读;取用/销账走 MCP kb_maintain)
   iknowledge setup  --repo <path>                              打印接入三件套(.mcp.json/纪律段/hook),只打印不代写
   iknowledge hook   [--repo <path>]                            宿主 hook 桥(Claude Code PostToolUse):注入所触文件的知识
   iknowledge version                                           版本自报(排障:确认在跑哪个构建)
@@ -48,6 +51,8 @@ func run(args []string) int {
 		return runServe(args[1:])
 	case "status":
 		return runStatus(args[1:])
+	case "maintain":
+		return runMaintain(args[1:], os.Stdout)
 	case "setup":
 		return runSetup(args[1:], os.Stdout)
 	case "hook":
@@ -65,72 +70,135 @@ func run(args []string) int {
 
 func runServe(args []string) int {
 	fs := flag.NewFlagSet("serve", flag.ContinueOnError)
-	repo := fs.String("repo", ".", "仓库路径")
-	addr := fs.String("addr", "", "监听地址(缺省 127.0.0.1:<config 端口>)")
+	var repos []string
+	fs.Func("repo", "仓库路径(可重复:单进程服务多个仓库,impl §1 多 repo 修订)", func(v string) error {
+		repos = append(repos, v)
+		return nil
+	})
+	addr := fs.String("addr", "", "监听地址(缺省 127.0.0.1:<config 端口>;仅单仓库可用)")
+	auth := fs.Bool("auth", false, "启用 Bearer 鉴权(每仓 token 生成于各自 .knowledge/local/token,0600;共享多用户机器用)")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
-	s, err := store.Open(*repo)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "错误:", err)
-		return 1
+	if len(repos) == 0 {
+		repos = []string{"."}
 	}
-	if !s.Initialized() {
-		fmt.Fprintln(os.Stderr, "错误: 库未初始化,先跑 iknowledge init --repo "+s.RepoRoot())
-		return 1
+	if *addr != "" && len(repos) > 1 {
+		fmt.Fprintln(os.Stderr, "错误: --addr 与多 --repo 互斥(多仓库各用自己 config 的端口,客户端配置才不用改)")
+		return 2
 	}
-	// 写者互斥(impl §4):serve 启动时取 flock 并持有;第二个 serve/并行 CLI init 被挡。
-	release, err := s.AcquireWriterLock()
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "错误:", err)
-		return 1
-	}
-	defer release()
 
-	listen := *addr
-	if listen == "" {
-		cfg, err := s.EnsureConfig()
+	// 多 repo 单守护(impl §1 修订,原四期):一进程多监听——每仓保留自己的端口与
+	// 写者锁,既有客户端配置(.mcp.json/hook 按仓库端口发现)零改动;消掉的只是
+	// "每仓一个进程"的管理负担。
+	type unit struct {
+		s      *store.Store
+		hs     *http.Server
+		ln     net.Listener
+		listen string
+	}
+	var units []unit
+	cleanup := func() {
+		for _, u := range units {
+			if u.ln != nil {
+				u.ln.Close()
+			}
+		}
+	}
+	seen := map[string]bool{}
+	for _, repo := range repos {
+		s, err := store.Open(repo)
 		if err != nil {
 			fmt.Fprintln(os.Stderr, "错误:", err)
+			cleanup()
 			return 1
 		}
-		listen = fmt.Sprintf("127.0.0.1:%d", cfg.Port)
-	}
-	e := engine.New(s)
-	if err := e.EnsureRuntime(); err != nil {
-		fmt.Fprintln(os.Stderr, "错误:", err)
-		return 1
-	}
-	srv := mcpserv.New(e)
-	// 端口被占(哈希撞车):启动即报错并提示改 config,不静默换端口(impl §1)。
-	ln, err := net.Listen("tcp", listen)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "错误: 监听 %s 失败(%v)——端口被占时改 .knowledge/config.yaml 的 port 或用 --addr\n", listen, err)
-		return 1
-	}
-	// 无鉴权服务的信任模型是"仅回环"(impl §1);监听非回环时 Origin 校验挡不住
-	// 直连的非浏览器客户端,必须显式警示而不是默默裸奔。
-	if host, _, err := net.SplitHostPort(listen); err == nil {
-		ip := net.ParseIP(host)
-		if host != "localhost" && (ip == nil || !ip.IsLoopback()) {
-			fmt.Fprintln(os.Stderr, "警告: 监听非回环地址——服务无鉴权,Origin 校验不构成认证,任何能连通该端口的主机都可读写知识库;仅限可信隔离网络使用。")
+		if seen[s.RepoRoot()] {
+			continue // 同仓库重复传参:幂等去重
 		}
+		seen[s.RepoRoot()] = true
+		if !s.Initialized() {
+			fmt.Fprintln(os.Stderr, "错误: 库未初始化,先跑 iknowledge init --repo "+s.RepoRoot())
+			cleanup()
+			return 1
+		}
+		// 写者互斥(impl §4):serve 启动时取 flock 并持有;第二个 serve/并行 CLI init 被挡。
+		release, err := s.AcquireWriterLock()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "错误(%s): %v\n", s.RepoRoot(), err)
+			cleanup()
+			return 1
+		}
+		defer release()
+
+		listen := *addr
+		if listen == "" {
+			cfg, err := s.EnsureConfig()
+			if err != nil {
+				fmt.Fprintln(os.Stderr, "错误:", err)
+				cleanup()
+				return 1
+			}
+			listen = fmt.Sprintf("127.0.0.1:%d", cfg.Port)
+		}
+		e := engine.New(s)
+		if err := e.EnsureRuntime(); err != nil {
+			fmt.Fprintf(os.Stderr, "错误(%s): %v\n", s.RepoRoot(), err)
+			cleanup()
+			return 1
+		}
+		srv := mcpserv.New(e)
+		if *auth {
+			tok, err := s.EnsureAuthToken()
+			if err != nil {
+				fmt.Fprintln(os.Stderr, "错误:", err)
+				cleanup()
+				return 1
+			}
+			srv.AuthToken = tok
+			fmt.Printf("鉴权已启用(%s):token 在 .knowledge/local/token(0600);重跑 iknowledge setup 取带 headers 的接入片段。\n", s.RepoRoot())
+		}
+		// 端口被占(哈希撞车):启动即报错并提示改 config,不静默换端口(impl §1)。
+		ln, err := net.Listen("tcp", listen)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "错误: 监听 %s 失败(%v)——端口被占时改 %s/.knowledge/config.yaml 的 port 或用 --addr\n", listen, err, s.RepoRoot())
+			cleanup()
+			return 1
+		}
+		e.SetScoutAddr(listen) // 自派侦察兵回连实际监听地址(--addr 覆盖时 config 端口不可信)
+		// 无鉴权服务的信任模型是"仅回环"(impl §1);监听非回环时 Origin 校验挡不住
+		// 直连的非浏览器客户端,必须显式警示而不是默默裸奔。
+		if host, _, err := net.SplitHostPort(listen); err == nil {
+			ip := net.ParseIP(host)
+			if host != "localhost" && (ip == nil || !ip.IsLoopback()) {
+				if *auth {
+					fmt.Fprintln(os.Stderr, "警告: 监听非回环地址——token 鉴权已启用,但明文 HTTP 仍可被网络窃听(含 token 本身);仅限可信隔离网络使用。")
+				} else {
+					fmt.Fprintln(os.Stderr, "警告: 监听非回环地址——服务无鉴权,Origin 校验不构成认证,任何能连通该端口的主机都可读写知识库;仅限可信隔离网络使用(或加 --auth)。")
+				}
+			}
+		}
+		fmt.Printf("knowledge MCP 已启动:http://%s/mcp/main?repo=%s\nhook 注入端点:http://%s/inject?file=<path>\n",
+			listen, url.QueryEscape(s.RepoRoot()), listen)
+		// ReadHeaderTimeout:防半开连接无限占用(R2-D3);业务无流式/长轮询,10s 富余。
+		units = append(units, unit{s: s, ln: ln, listen: listen,
+			hs: &http.Server{Handler: srv.Handler(), ReadHeaderTimeout: 10 * time.Second}})
 	}
-	fmt.Printf("knowledge MCP 已启动:http://%s/mcp/main?repo=%s\nhook 注入端点:http://%s/inject?file=<path>\n",
-		listen, url.QueryEscape(s.RepoRoot()), listen)
-	// ReadHeaderTimeout:防半开连接无限占用(R2-D3);业务无流式/长轮询,10s 富余。
-	hs := &http.Server{Handler: srv.Handler(), ReadHeaderTimeout: 10 * time.Second}
+
 	// SIGINT/SIGTERM 优雅停机:等在途工具调用落完盘再退(记账是多步文件写,
 	// 硬杀有原子写兜底不会损坏,但会截断正在进行的记账链)。stop() 后信号恢复
 	// 默认处置:停机卡住时再来一次 Ctrl+C/SIGTERM 即强杀。
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	errCh := make(chan error, 1)
-	go func() { errCh <- hs.Serve(ln) }()
+	errCh := make(chan error, len(units))
+	for _, u := range units {
+		go func() { errCh <- u.hs.Serve(u.ln) }()
+	}
 	select {
 	case err := <-errCh:
 		if err != nil && !errors.Is(err, http.ErrServerClosed) {
 			fmt.Fprintln(os.Stderr, "错误:", err)
+			cleanup()
 			return 1
 		}
 	case <-ctx.Done():
@@ -138,9 +206,11 @@ func runServe(args []string) int {
 		fmt.Println("收到退出信号,优雅停机中(等待在途请求,上限 10s)…")
 		sctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
-		if err := hs.Shutdown(sctx); err != nil {
-			fmt.Fprintln(os.Stderr, "错误: 优雅停机未在时限内完成:", err)
-			return 1
+		for _, u := range units {
+			if err := u.hs.Shutdown(sctx); err != nil {
+				fmt.Fprintln(os.Stderr, "错误: 优雅停机未在时限内完成:", err)
+				return 1
+			}
 		}
 	}
 	return 0
@@ -203,6 +273,35 @@ func runStatus(args []string) int {
 	return 0
 }
 
+// runMaintain 打印维护欠账清单(knowledge.md §12.7 的 CLI 侧只读落地):
+// 会话外看清欠了什么账;清账动作仍由 AI 会话经 kb_maintain 完成(需要语言能力)。
+func runMaintain(args []string, w io.Writer) int {
+	fs := flag.NewFlagSet("maintain", flag.ContinueOnError)
+	repo := fs.String("repo", ".", "仓库路径")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	s, err := store.Open(*repo)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "错误:", err)
+		return 1
+	}
+	debts, err := engine.New(s).Debts()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "错误:", err)
+		return 1
+	}
+	if len(debts) == 0 {
+		fmt.Fprintln(w, "无维护欠账。")
+		return 0
+	}
+	fmt.Fprintf(w, "维护欠账 %d 条(清账走 MCP:kb_maintain next → 处理 → complete/dismiss):\n", len(debts))
+	for _, d := range debts {
+		fmt.Fprintf(w, "- %s [%s] %s\n  %s\n", d.ID, d.Kind, d.Node, d.Desc)
+	}
+	return 0
+}
+
 func runInit(args []string) int {
 	fs := flag.NewFlagSet("init", flag.ContinueOnError)
 	repo := fs.String("repo", ".", "仓库路径")
@@ -240,12 +339,13 @@ func runInit(args []string) int {
 	// agent 接入片段(impl §1 修订:init 只打印,由用户/主 AI 自行粘贴——
 	// 工具不写 .knowledge/ 之外的任何文件,铁律二)。
 	if cfg, err := s.LoadConfig(); err == nil && cfg != nil {
+		token, _ := s.LoadAuthToken()
 		fmt.Printf(`
 接入:把下面片段粘贴进 %s/.mcp.json(iknowledge 不代写):
 %s
 然后运行:iknowledge serve --repo %s
 完整接入三件套(含 CLAUDE.md 纪律段与 hook 自动注入):iknowledge setup --repo %s
-`, s.RepoRoot(), mcpJSONSnippet(s.RepoRoot(), cfg.Port), s.RepoRoot(), s.RepoRoot())
+`, s.RepoRoot(), mcpJSONSnippet(s.RepoRoot(), cfg.Port, token), s.RepoRoot(), s.RepoRoot())
 	}
 	return 0
 }

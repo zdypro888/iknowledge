@@ -15,6 +15,17 @@ type Config struct {
 	Port    int      `yaml:"port"`
 	Include []string `yaml:"include,omitempty"` // 非空时仅索引匹配路径(path.Match 语法,正斜杠相对路径)
 	Exclude []string `yaml:"exclude,omitempty"` // 追加排除(在 vendor/testdata/.knowledge/生成代码之上)
+
+	// 侦查模式(impl §7.5,轮 22 定案委派为主、自派为备;2026-07-04 备模式实装):
+	// Scout 空/"delegate" = 委派(kb_investigate 秒回简报,宿主子代理执行);
+	// "self" = 自派(服务端 PTY 驱动 ScoutCommand,阻塞等交卷,面向无子代理宿主)。
+	Scout string `yaml:"scout,omitempty"`
+	// ScoutCommand 自派命令模板,{mcp} 占位 MCP 配置文件路径;缺省
+	// `claude --mcp-config {mcp} --strict-mcp-config --allowedTools "mcp__knowledge__*"`。
+	ScoutCommand string `yaml:"scout_command,omitempty"`
+	// ScoutTimeoutSec 自派交卷等待上限秒数,缺省 300(job TTL 30 分钟另计:
+	// 超时后迟到交卷仍落库,kb_status 可见——迟到不白费)。
+	ScoutTimeoutSec int `yaml:"scout_timeout_seconds,omitempty"`
 }
 
 // DerivePort 端口分配定案(impl §1):18000 + fnv32a(repo 绝对路径) % 2000。

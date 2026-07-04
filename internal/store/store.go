@@ -212,15 +212,10 @@ func atomicWrite(path string, data []byte) error {
 		os.Remove(tmpName)
 		return fmt.Errorf("store: rename: %w", err)
 	}
-	// POSIX:rename 产生的目录项更新要持久,需 fsync 父目录(一期平台 macOS/Linux 均支持)。
-	d, err := os.Open(dir)
-	if err != nil {
-		return fmt.Errorf("store: 开目录做 fsync: %w", err)
-	}
-	syncErr := d.Sync()
-	d.Close()
-	if syncErr != nil {
-		return fmt.Errorf("store: fsync 目录: %w", syncErr)
+	// rename 产生的目录项更新要持久化——平台差异见 fsyncdir_*.go
+	//(unix:fsync 父目录;windows:NTFS 日志兜底,句柄语义拿不到,留痕降级)。
+	if err := fsyncDir(dir); err != nil {
+		return fmt.Errorf("store: fsync 目录: %w", err)
 	}
 	return nil
 }

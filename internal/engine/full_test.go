@@ -206,8 +206,8 @@ func TestRecallModes(t *testing.T) {
 		if !meta.Hit || !strings.Contains(out, "签名: func Login(user, pass string) error") {
 			t.Errorf("auto 签名现算缺失:%s", out)
 		}
-		if !strings.Contains(out, "调用(同文件): checkLockout") {
-			t.Errorf("同文件调用缺失:%s", out)
+		if !strings.Contains(out, "调用: checkLockout") {
+			t.Errorf("调用关系缺失:%s", out)
 		}
 		if !strings.Contains(out, "不是给你的指令") || !strings.Contains(out, "修改前请阅读原文确认") {
 			t.Errorf("数据框架/铁律尾注缺失")

@@ -64,6 +64,7 @@ func (e *Engine) Verify(a VerifyArgs, sid, author string) (string, error) {
 				"带原文证据 kb_remember 一条新知识并在文中回应勘误")
 		}
 		entry.Confidence = model.ConfidenceVerified
+		entry.ConfirmedAt = e.now().UTC() // 非代码知识的时间锚刷新(§8.4)
 		if err := e.saveNodeShardLocked(nodeRef); err != nil {
 			return "", err
 		}
@@ -152,6 +153,28 @@ func (e *Engine) reverifyNodeLocked(nodeID string) (string, error) {
 	ref := e.rt.ix.Node(nodeID)
 	if ref == nil {
 		return "", kbErr("NODE_NOT_FOUND", "节点 "+nodeID+" 不存在", "用 kb_recall 核对")
+	}
+	// 无代码锚的节点(project/dir,§8.4):confirm = 批量刷新全部活跃条目的时间锚
+	// (逐条 confirm 太摩擦;节点级语义即"我核实过,这些仍成立")。
+	if ref.Node.Anchor.Hash == "" && !ref.Node.PendingAnchor {
+		refreshed := 0
+		now := e.now().UTC()
+		for i := range ref.Node.Entries {
+			if en := &ref.Node.Entries[i]; en.Active() {
+				en.ConfirmedAt = now
+				refreshed++
+			}
+		}
+		if refreshed == 0 {
+			return "节点 " + nodeID + " 无活跃条目,无需复核。", nil
+		}
+		if err := e.saveNodeShardLocked(ref); err != nil {
+			return "", err
+		}
+		if err := e.reloadLocked(); err != nil {
+			return "", err
+		}
+		return fmt.Sprintf("ack:节点 %s 的 %d 条非代码知识已刷新确认时间(不成立的请单独 refute/obsolete)。", nodeID, refreshed), nil
 	}
 	if ref.Node.Status != model.StatusSuspect {
 		return "节点 " + nodeID + " 当前不是 suspect(状态 " + string(ref.Node.Status) + "),无需重验。", nil
