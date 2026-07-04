@@ -154,7 +154,7 @@ func (e *Engine) Remember(a RememberArgs, sid, author string) (string, error) {
 			}
 			if old.Active() && BigramJaccard(old.Text, in.Text) > 0.8 {
 				warnList = append(warnList,
-					"疑似与 "+old.ID+" 重复(相似度>0.8),建议用 supersedes 合并")
+					"疑似与 "+old.ID+" 相似(>0.8)——三种结局:同一结论→supersedes 合并;互相矛盾→本条 disputes 声明待裁决;确证旧条错误→kb_verify refute 它")
 			}
 		}
 		// basedOn:引用可解析 + 可信度封顶 inferred(knowledge.md §8.3)。

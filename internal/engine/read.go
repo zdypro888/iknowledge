@@ -182,7 +182,7 @@ func (e *Engine) Status() (string, error) {
 			hot = hot[:10] // TOP10:对齐 M1.4 种子协议("消化 10 个热点")
 		}
 		if len(hot) > 0 && hot[0].heat > 1 { // 双因子全零(冷库无 git)时不值得占版面
-			b.WriteString("热点待消化(90 天改动 × 跨文件被调;读原文后 kb_remember 只存【代码上看不出来的】——契约/坑/为什么,复述结构是噪音):\n")
+			b.WriteString("热点待消化(90 天改动 × 跨文件被调;读原文后 kb_remember 只存【代码上看不出来的】——契约/坑/为什么;热点改动频繁,优先沉淀跨改动仍成立的契约/不变量,实现细节易腐):\n")
 			for _, h := range hot {
 				fmt.Fprintf(&b, "  - %s 热度 %d(改 %d 次 × 被调 %d)消化 %d/%d\n",
 					h.file, h.heat, h.chg, h.ctr, h.done, h.total)
@@ -1051,6 +1051,18 @@ func (e *Engine) Inject(file, sid, tool string) (string, error) {
 	// 任务态。
 	if w := e.wipAttachment(nodeIDs); w != "" {
 		parts = append(parts, strings.TrimSpace(w))
+	}
+
+	// 就地欠账提示(2026-07-04,实战反馈"债在积累没人清"):AI 正在动这个文件,
+	// 理解新鲜、人在现场——顺手清账成本最低的时点。只报本文件的债,不刷全库。
+	debtCount := 0
+	for _, d := range e.computeDebtsLocked() {
+		if f, _ := model.SplitNodeID(d.Node); f == file {
+			debtCount++
+		}
+	}
+	if debtCount > 0 {
+		parts = append(parts, fmt.Sprintf("⚙ 本文件有 %d 条维护欠账(kb_maintain next scope=%s 顺手清一条)", debtCount, file))
 	}
 
 	// 本文件节点全量(快照 + 负知识全量)。
