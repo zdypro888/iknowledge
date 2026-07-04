@@ -25,7 +25,7 @@ AI 通过三类动作与它交互:**查**(kb_map / kb_recall 定位与回忆)、
 
 ## 状态
 
-设计定稿,实现进行中(第一期 M1.1)。
+第一期已全量交付:13 个 MCP 工具 + `/mcp/main`、`/mcp/scout` 双端点 + `GET /inject`,经多轮对抗审查与第三方全仓审计修复(最近一轮 2026-07-04),Claude Code 真实客户端连接已实测通过。遗留:Codex 客户端实测、M1.4 的 10 任务 A/B 验收协议。
 
 - [`knowledge.md`](knowledge.md) — 概念设计全案(20 轮设计讨论的收敛:五个维度、自愈机制、经济学、安全、四篇推演)
 - [`knowledge-impl.md`](knowledge-impl.md) — 第一期工程方案(包结构、数据模型、存储、MCP API 全量规范、里程碑)
