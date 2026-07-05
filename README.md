@@ -112,7 +112,7 @@ You never manage the server: the stdio bridge auto-starts the background serve o
 | Kind | Tool | One-liner |
 |---|---|---|
 | Query | `kb_map` | Pyramid navigation: what lives where, coverage |
-| Query | `kb_recall` | Knowledge / history / call relations by keyword or node; hits auto-expand one hop along the call graph & flows; skeleton/suspect nodes get the commit trail attached |
+| Query | `kb_recall` | Knowledge / history / call relations and interface↔implementation (method-set matching) by keyword or node; hits auto-expand one hop along the call graph, flows & implementations; skeleton/suspect nodes get the commit trail attached |
 | Write | `kb_remember` | Distill experience (usage/pitfall/contract/summary…); supports declaring contradictions (disputes) for adjudication |
 | Write | `kb_record_change` | The change ledger: what / why / what was rejected (one logical change = one record) |
 | Write | `kb_verify` | confirm (upgrade confidence) / refute (with evidence; cascades to derived knowledge) / obsolete (graceful retirement) |

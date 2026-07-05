@@ -12,18 +12,27 @@ import (
 // 引用在这里只提取不归位——跨文件/跨包解析需要包符号表与 go.mod 模块路径,
 // 属 engine 层职责;parser 保持单文件视角(插件接口语言无关)。
 type FileCalls struct {
-	Package string              // package 声明名
-	Imports map[string]string   // 本地限定名 → import 路径(别名已应用;dot/blank 不入)
-	Decls   []string            // 本文件符号规范名(与 Parse 同序同名,~n 消歧一致)
-	Calls   map[string][]CallRef // 调用方规范名 → 出边引用(同方去重,按出现序)
+	Package    string               // package 声明名
+	Imports    map[string]string    // 本地限定名 → import 路径(别名已应用;dot/blank 不入)
+	Decls      []string             // 本文件符号规范名(与 Parse 同序同名,~n 消歧一致)
+	Calls      map[string][]CallRef // 调用方规范名 → 出边引用(同方去重,按出现序)
+	Interfaces []IfaceDecl          // 接口声明(接口→实现的方法集匹配用,2026-07-04 增)
+}
+
+// IfaceDecl 是一个接口声明的提取结果(方法名集 + 内嵌引用,归位在 engine)。
+type IfaceDecl struct {
+	Name    string    // 接口类型名(与 Decls 中的规范名一致)
+	Methods []string  // 显式方法名(签名不参与——AST 近似,同名不同签名可能过匹配,靠 ≥2 方法阈值兜)
+	Embeds  []CallRef // 内嵌接口引用(Qual=""同包 / 限定名跨包);仓外内嵌无从展开,整个接口跳过匹配
 }
 
 // CallRef 是一条未归位的调用引用。
 //
 // 静态近似的边界(有类型检查才能做的都不做,留痕):
-//   - 接口/函数值的动态分发不解析;
+//   - 接口分发经方法集匹配近似解析(engine 层,2026-07-04 codegraph 启发;
+//     函数值/闭包的分发仍不解析);
 //   - 链式选择器(a.b.C())不解析;
-//   - 非接收者局部变量上的方法调用只带基名,归位靠包内唯一基名启发。
+//   - 非接收者局部变量上的方法调用只带基名,归位靠包内唯一基名启发 + 接口分发兜底。
 type CallRef struct {
 	Qual string // 选择器限定名;"" 表示同包直呼或接收者自调
 	Name string // 目标基名;接收者自调为 "Type.Method" 形式
@@ -98,6 +107,9 @@ func (Golang) FileCalls(path string, src []byte) (*FileCalls, error) {
 				case *ast.TypeSpec:
 					refs = append(refs, declRef{})
 					names = append(names, s.Name.Name)
+					if it, ok := s.Type.(*ast.InterfaceType); ok {
+						fc.Interfaces = append(fc.Interfaces, ifaceDecl(s.Name.Name, it))
+					}
 				case *ast.ValueSpec:
 					for i, id := range s.Names {
 						dr := declRef{}
@@ -174,6 +186,37 @@ func (fc *FileCalls) addCalls(caller string, root ast.Node, recvIdent, recvBase 
 		}
 		return true
 	})
+}
+
+// ifaceDecl 提取接口的显式方法名与内嵌引用(接口→实现匹配的原料)。
+// 泛型接口的类型参数、内嵌的类型并集/约束元素(~T、A|B)不解析——那是约束不是
+// 方法集,出现即整个接口跳过匹配(Embeds 记一个无法归位的哨兵,engine 会丢弃)。
+func ifaceDecl(name string, it *ast.InterfaceType) IfaceDecl {
+	d := IfaceDecl{Name: name}
+	if it.Methods == nil {
+		return d
+	}
+	for _, f := range it.Methods.List {
+		if len(f.Names) > 0 { // 显式方法
+			for _, id := range f.Names {
+				d.Methods = append(d.Methods, id.Name)
+			}
+			continue
+		}
+		switch t := f.Type.(type) { // 内嵌
+		case *ast.Ident:
+			d.Embeds = append(d.Embeds, CallRef{Name: t.Name})
+		case *ast.SelectorExpr:
+			if x, ok := t.X.(*ast.Ident); ok {
+				d.Embeds = append(d.Embeds, CallRef{Qual: x.Name, Name: t.Sel.Name})
+			} else {
+				d.Embeds = append(d.Embeds, CallRef{Name: "!unresolvable"})
+			}
+		default: // 约束元素(~T、A|B 等):非方法集语义,标哨兵令 engine 丢弃
+			d.Embeds = append(d.Embeds, CallRef{Name: "!unresolvable"})
+		}
+	}
+	return d
 }
 
 // recvIdentName 取方法接收者的标识符名与类型基名("(s *Store)" → "s","Store")。

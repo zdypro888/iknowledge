@@ -147,6 +147,54 @@ var a struct{ b interface{ C() } }
 	}
 }
 
+func TestInterfaceExtraction(t *testing.T) {
+	src := `package a
+
+import "io"
+
+type Plain interface {
+	One(x int)
+	Two() error
+}
+
+type WithEmbed interface {
+	Plain
+	io.Reader
+	Three()
+}
+
+type Constrained interface {
+	~int | ~string
+}
+
+type NotIface struct{}
+`
+	fc, err := Golang{}.FileCalls("a.go", []byte(src))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(fc.Interfaces) != 3 {
+		t.Fatalf("接口数 = %d, want 3:%+v", len(fc.Interfaces), fc.Interfaces)
+	}
+	byName := map[string]IfaceDecl{}
+	for _, d := range fc.Interfaces {
+		byName[d.Name] = d
+	}
+	if p := byName["Plain"]; !reflect.DeepEqual(p.Methods, []string{"One", "Two"}) || len(p.Embeds) != 0 {
+		t.Errorf("Plain = %+v", p)
+	}
+	we := byName["WithEmbed"]
+	if !reflect.DeepEqual(we.Methods, []string{"Three"}) ||
+		!reflect.DeepEqual(we.Embeds, []CallRef{{Name: "Plain"}, {Qual: "io", Name: "Reader"}}) {
+		t.Errorf("WithEmbed = %+v", we)
+	}
+	// 约束元素 → 哨兵(engine 弃)。
+	c := byName["Constrained"]
+	if len(c.Embeds) == 0 || c.Embeds[0].Name != "!unresolvable" {
+		t.Errorf("约束接口应标哨兵:%+v", c)
+	}
+}
+
 func TestFileCallsDeclsMatchParse(t *testing.T) {
 	// 规范名一致性是 node ID 拼接的前提:两条提取路径必须产出同一名单。
 	src := `package a

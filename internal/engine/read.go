@@ -616,6 +616,12 @@ func (e *Engine) recallNodeLocked(nodeID string, a RecallArgs, sid string) (stri
 	if len(auto.calledBy) > 0 {
 		fmt.Fprintf(&b, "被调用: %s\n", strings.Join(auto.calledBy, ", "))
 	}
+	if len(auto.impls) > 0 {
+		fmt.Fprintf(&b, "实现者(方法集匹配): %s\n", strings.Join(auto.impls, ", "))
+	}
+	if len(auto.ifaces) > 0 {
+		fmt.Fprintf(&b, "实现接口: %s\n", strings.Join(auto.ifaces, ", "))
+	}
 	if len(n.Keywords) > 0 {
 		fmt.Fprintf(&b, "keywords: %s\n", strings.Join(n.Keywords, ", "))
 	}
@@ -896,6 +902,8 @@ type autoInfo struct {
 	signature string
 	calls     []string
 	calledBy  []string
+	impls     []string // 接口节点:实现者(方法集匹配)
+	ifaces    []string // 类型节点:所实现的仓内接口
 	stale     bool
 }
 
@@ -958,6 +966,9 @@ func (e *Engine) reconcileOnReadLocked(ref *index.NodeRef) autoInfo {
 		nodeID := file + "#" + symbol
 		auto.calls = displayEdges(cg.callsOf(nodeID), file, 12)
 		auto.calledBy = displayEdges(cg.calledByOf(nodeID), file, 12)
+		// 接口↔实现(方法集匹配,codegraph 启发):接口节点列实现者,类型节点列所实现接口。
+		auto.impls = displayEdges(cg.implementationsOf(nodeID), file, 12)
+		auto.ifaces = displayEdges(cg.interfacesOf(nodeID), file, 12)
 	}
 
 	// 读路径落盘尽力而为:失败不阻断读取(内存态已更新、返回信息正确),记警下次重试。

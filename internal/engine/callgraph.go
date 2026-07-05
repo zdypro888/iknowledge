@@ -33,6 +33,10 @@ type callGraph struct {
 	files   map[string]*fileCallsEntry // rel → 提取结果 + 指纹
 	edges   map[string][]string        // node ID → 被它调用的 node ID(升序)
 	reverse map[string][]string        // node ID → 调用它的 node ID(升序)
+
+	// 接口→实现关系(方法集匹配,2026-07-04):双向,均为 node ID 升序。
+	implsOf  map[string][]string // 接口类型节点 → 实现类型节点
+	ifacesOf map[string][]string // 类型节点 → 它实现的仓内接口节点
 }
 
 type fileCallsEntry struct {
@@ -128,8 +132,7 @@ func (cg *callGraph) refreshModule(repo string) bool {
 // resolve 由提取结果连边(纯内存)。
 func (cg *callGraph) resolve() {
 	// 包符号表:目录 → 符号名 → 声明它的文件集(build tag 双版本会多于一个)。
-	type declSites map[string][]string // 名 → []fileRel
-	pkgDecls := map[string]declSites{}
+	pkgDecls := map[string]map[string][]string{} // dir → 名 → []fileRel
 	// 方法基名启发表:目录 → 基名 → 规范名集合(去重后唯一才可用)。
 	pkgMethodBase := map[string]map[string][]string{}
 	for rel, entry := range cg.files {
@@ -139,7 +142,7 @@ func (cg *callGraph) resolve() {
 		dir := path.Dir(rel)
 		decls := pkgDecls[dir]
 		if decls == nil {
-			decls = declSites{}
+			decls = map[string][]string{}
 			pkgDecls[dir] = decls
 		}
 		mb := pkgMethodBase[dir]
@@ -174,6 +177,13 @@ func (cg *callGraph) resolve() {
 		return "" // 跨文件歧义(build tag 双版本等):宁缺毋错
 	}
 
+	// 接口→实现(2026-07-04,codegraph 启发的方法集匹配;AST 近似,无类型检查):
+	// 接口注册 → 仓内内嵌展开 → 全仓匹配。宁缺毋错三闸:含不可归位内嵌(仓外/约束
+	// 元素)整个接口弃;≥2 方法才严格匹配,单方法接口仅唯一实现者才认;同包同名
+	// 接口多文件声明(build tag)弃。已知低估留痕:结构体内嵌带来的方法提升 AST
+	// 看不见,漏配不误配。
+	ifaceMethodTargets := cg.resolveInterfaces(pkgDecls, lookup)
+
 	edges := map[string][]string{}
 	reverse := map[string][]string{}
 	addEdge := func(from, to string) {
@@ -202,9 +212,15 @@ func (cg *callGraph) resolve() {
 						}
 						continue // import 命中但库外/未归位:丢弃,不落启发
 					}
-					// 非 import 限定名:局部变量方法调用,同包唯一基名启发。
+					// 非 import 限定名:局部变量方法调用。① 同包唯一基名启发;
+					// ② 接口分发兜底(codegraph 启发):该方法名属于仓内接口的
+					// 方法集 → 连到全部实现(扇出 ≤5,过则视为过度歧义丢弃)。
 					if cands := pkgMethodBase[dir][ref.Name]; len(cands) == 1 {
 						addEdge(from, lookup(dir, cands[0], rel))
+					} else if ts := ifaceMethodTargets[ref.Name]; len(ts) >= 1 && len(ts) <= 5 {
+						for _, t := range ts {
+							addEdge(from, t)
+						}
 					}
 				}
 			}
@@ -217,6 +233,180 @@ func (cg *callGraph) resolve() {
 	}
 	cg.edges, cg.reverse = edges, reverse
 }
+
+// resolveInterfaces 建接口→实现关系,返回"接口方法名 → 实现方法节点"分发表。
+// 输入沿用 resolve 的包符号表与归位闭包;结果写 cg.implsOf/ifacesOf。
+func (cg *callGraph) resolveInterfaces(
+	pkgDecls map[string]map[string][]string,
+	lookup func(dir, name, callerRel string) string,
+) map[string][]string {
+	type iface struct {
+		dir, name, nodeID string
+		methods           map[string]bool
+		embeds            []parser.CallRef
+		imports           map[string]string
+		dead              bool
+	}
+
+	// ① 注册:同包同名多文件声明(build tag)→ 弃。
+	byKey := map[string]*iface{} // dir + "\x00" + name
+	for rel, entry := range cg.files {
+		if entry.fc == nil {
+			continue
+		}
+		dir := path.Dir(rel)
+		for _, d := range entry.fc.Interfaces {
+			key := dir + "\x00" + d.Name
+			if prev, ok := byKey[key]; ok {
+				prev.dead = true
+				continue
+			}
+			it := &iface{dir: dir, name: d.Name, nodeID: rel + "#" + d.Name,
+				methods: map[string]bool{}, embeds: d.Embeds, imports: entry.fc.Imports}
+			for _, m := range d.Methods {
+				it.methods[m] = true
+			}
+			byKey[key] = it
+		}
+	}
+
+	// ② 内嵌展开(不动点,深度上限 5):仓内内嵌并入方法集;不可归位(仓外/
+	// 约束元素/找不到)→ 整个接口弃。
+	for range 5 {
+		progressed := false
+		for _, it := range byKey {
+			if it.dead || len(it.embeds) == 0 {
+				continue
+			}
+			var rest []parser.CallRef
+			for _, em := range it.embeds {
+				tdir := ""
+				switch {
+				case em.Name == "!unresolvable":
+					it.dead = true
+				case em.Qual == "":
+					tdir = it.dir
+				default:
+					if imp, ok := it.imports[em.Qual]; ok {
+						tdir = cg.moduleDir(imp)
+					}
+				}
+				if it.dead {
+					break
+				}
+				target := byKey[tdir+"\x00"+em.Name]
+				switch {
+				case tdir == "" || target == nil || target.dead:
+					it.dead = true
+				case len(target.embeds) > 0:
+					rest = append(rest, em) // 目标自身未展开完,下一轮再并
+				default:
+					for m := range target.methods {
+						it.methods[m] = true
+					}
+					progressed = true
+				}
+			}
+			if !it.dead {
+				if len(rest) < len(it.embeds) {
+					progressed = true
+				}
+				it.embeds = rest
+			}
+		}
+		if !progressed {
+			break
+		}
+	}
+
+	// ③ 类型方法集(dir → 类型名 → 方法基名集;来源是 "T.M" 形态的声明)。
+	typeMethods := map[string]map[string]map[string]bool{}
+	for dir, decls := range pkgDecls {
+		for name := range decls {
+			t, m, ok := strings.Cut(name, ".")
+			if !ok || t == "" || m == "" {
+				continue
+			}
+			tm := typeMethods[dir]
+			if tm == nil {
+				tm = map[string]map[string]bool{}
+				typeMethods[dir] = tm
+			}
+			if tm[t] == nil {
+				tm[t] = map[string]bool{}
+			}
+			tm[t][m] = true
+		}
+	}
+
+	// ④ 全仓匹配 + 分发表。
+	implsOf := map[string][]string{}
+	ifacesOf := map[string][]string{}
+	targets := map[string]map[string]bool{} // 方法名 → 实现方法节点集
+	for _, it := range byKey {
+		if it.dead || len(it.embeds) > 0 || len(it.methods) == 0 {
+			continue
+		}
+		var impls []string           // 实现类型节点
+		var implDirTypes [][2]string // (dir, typeName) 供方法节点归位
+		for dir, tm := range typeMethods {
+			for t, ms := range tm {
+				if dir == it.dir && t == it.name {
+					continue // 接口自身
+				}
+				ok := true
+				for m := range it.methods {
+					if !ms[m] {
+						ok = false
+						break
+					}
+				}
+				if !ok {
+					continue
+				}
+				if tn := lookup(dir, t, ""); tn != "" {
+					impls = append(impls, tn)
+					implDirTypes = append(implDirTypes, [2]string{dir, t})
+				}
+			}
+		}
+		// 宁缺闸:≥2 方法严格匹配全收;单方法接口仅唯一实现者才认。
+		if len(impls) == 0 || (len(it.methods) == 1 && len(impls) != 1) {
+			continue
+		}
+		implsOf[it.nodeID] = append(implsOf[it.nodeID], impls...)
+		for i, tn := range impls {
+			ifacesOf[tn] = append(ifacesOf[tn], it.nodeID)
+			for m := range it.methods {
+				if mn := lookup(implDirTypes[i][0], implDirTypes[i][1]+"."+m, ""); mn != "" {
+					if targets[m] == nil {
+						targets[m] = map[string]bool{}
+					}
+					targets[m][mn] = true
+				}
+			}
+		}
+	}
+	for _, m := range []map[string][]string{implsOf, ifacesOf} {
+		for k := range m {
+			sort.Strings(m[k])
+			m[k] = slices.Compact(m[k])
+		}
+	}
+	out := map[string][]string{}
+	for m, set := range targets {
+		for t := range set {
+			out[m] = append(out[m], t)
+		}
+		sort.Strings(out[m])
+	}
+	cg.implsOf, cg.ifacesOf = implsOf, ifacesOf
+	return out
+}
+
+// implementationsOf / interfacesOf 返回接口↔实现关系(node ID 升序;无则 nil)。
+func (cg *callGraph) implementationsOf(nodeID string) []string { return cg.implsOf[nodeID] }
+func (cg *callGraph) interfacesOf(nodeID string) []string      { return cg.ifacesOf[nodeID] }
 
 // moduleDir 把 import 路径映射到仓库内目录;库外返回 ""。
 func (cg *callGraph) moduleDir(imp string) string {
@@ -294,6 +484,12 @@ func (e *Engine) structuralNeighborsLocked(hitIDs []string, limit int) []neighbo
 			}
 			for _, from := range cg.calledByOf(hid) {
 				add(from, "调用 "+hid)
+			}
+			for _, t := range cg.implementationsOf(hid) {
+				add(t, "实现 "+hid)
+			}
+			for _, i := range cg.interfacesOf(hid) {
+				add(i, hid+" 所实现的接口")
 			}
 		}
 		for _, fid := range e.rt.ix.FlowsOf(hid) {

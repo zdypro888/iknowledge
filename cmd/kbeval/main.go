@@ -90,6 +90,7 @@ type result struct {
 	Model      string   `json:"model,omitempty"`
 	Usage      usageSum `json:"usage"`
 	Total      int      `json:"total_tokens"`
+	CostUSD    float64  `json:"cost_usd,omitempty"` // claude_code.cost.usage(遥测末次导出)
 	Turns      int      `json:"turns"`
 	DurationS  int      `json:"duration_seconds"`
 	Transcript string   `json:"transcript"`
@@ -445,6 +446,7 @@ func driveSession(repo, mcpCfg, prompt, model string, timeout time.Duration) (*r
 	clean := stripANSI(buf.bytes())
 	res.Model, res.Usage, res.Turns = tallyTelemetry(clean)
 	res.Total = res.Usage.total()
+	res.CostUSD = tallyCost(clean)
 	// 转录若真落盘了就记路径(补充审计;计量不依赖它)。
 	if now, err := listSet(tdir); err == nil {
 		for f := range now {
@@ -586,6 +588,29 @@ func tallyTelemetry(clean []byte) (model string, u usageSum, turns int) {
 	}
 	return model, u, strings.Count(s, "claude_code.api_request")
 }
+
+// tallyCost 解析 claude_code.cost.usage(USD,累计计数器,末次导出跨模型求和;
+// codegraph benchmark 有美元维度,对比更立体——顺手捡的采集项)。
+func tallyCost(clean []byte) float64 {
+	s := string(clean)
+	idx := strings.LastIndex(s, `"claude_code.cost.usage"`)
+	if idx < 0 {
+		return 0
+	}
+	block := s[idx:]
+	if end := strings.Index(block[1:], "descriptor"); end > 0 {
+		block = block[:end+1]
+	}
+	total := 0.0
+	for _, m := range costValueRe.FindAllStringSubmatch(block, -1) {
+		var v float64
+		fmt.Sscanf(m[1], "%f", &v)
+		total += v
+	}
+	return total
+}
+
+var costValueRe = regexp.MustCompile(`value:\s*([0-9]+(?:\.[0-9]+)?)`)
 
 func atoiSafe(s string) int {
 	n := 0
