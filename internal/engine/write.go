@@ -327,7 +327,7 @@ func (e *Engine) currentAnchorLocked(ref *index.NodeRef) curAnchor {
 		return curAnchor{parseErr: err, anchor: n.Anchor}
 	}
 	if symbol == "" {
-		fh := parser.FileHash(syms)
+		fh := parser.HashFileFor(p, syms, src)
 		a := n.Anchor
 		a.Hash = fh
 		return curAnchor{hash: fh, anchor: a}
@@ -444,7 +444,7 @@ func (e *Engine) planNewSymbolLocked(query string) (*newSymbolPlan, error) {
 	if cs := e.rt.cache.Shards()[plan.shardRel]; cs == nil || cs.Shard == nil {
 		plan.fileNode = &model.Node{
 			ID: file, Level: model.LevelFile,
-			Anchor: model.Anchor{File: file, Hash: parser.FileHash(syms)},
+			Anchor: model.Anchor{File: file, Hash: parser.HashFileFor(p, syms, src)},
 			Status: model.StatusUndigested, Since: e.now().UTC(),
 		}
 	}

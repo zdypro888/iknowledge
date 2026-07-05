@@ -16,6 +16,12 @@ type Config struct {
 	Include []string `yaml:"include,omitempty"` // 非空时仅索引匹配路径(path.Match 语法,正斜杠相对路径)
 	Exclude []string `yaml:"exclude,omitempty"` // 追加排除(在 vendor/testdata/.knowledge/生成代码之上)
 
+	// Extensions 通用文件级覆盖白名单(2026-07-04 多语言 T0,缺省关):
+	// 列出的扩展名(如 [".proto", ".sql"])以文件粒度入库——账本/经验/hook/
+	// 腐烂检测(内容哈希)全可用,无符号粒度与调用图;已有专职解析器的扩展名
+	// (.go/.py)忽略。改动本字段需重启 serve(Registry 启动期构建)。
+	Extensions []string `yaml:"extensions,omitempty"`
+
 	// 侦查模式(impl §7.5,轮 22 定案委派为主、自派为备;2026-07-04 备模式实装):
 	// Scout 空/"delegate" = 委派(kb_investigate 秒回简报,宿主子代理执行);
 	// "self" = 自派(服务端 PTY 驱动 ScoutCommand,阻塞等交卷,面向无子代理宿主)。

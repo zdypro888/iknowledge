@@ -329,6 +329,24 @@ type Parser interface {
     实现;casino 15.6k 节点首建 245ms/增量 71ms。
   - 近似边界(留痕):函数值/闭包的动态分发、链式选择器(`a.b.C()`)不解析;缺省 import
     限定名按路径末段近似(不一致只漏边不错边);
+- **多语言(2026-07-04 修订:原"四期 tree-sitter"拆两档提前,tree-sitter 维持不做)**:
+  核心引擎语言无关的设计承诺兑现——加语言零核心改动,全部成本在插件面。
+  **T0 通用文件级**:config.yaml `extensions` 白名单(缺省关)→ 任意扩展名以文件
+  粒度入库;`FileHasher` 可选能力接口承载内容哈希(无 AST 的插件必须自定义文件哈希,
+  否则空符号级联出常量哈希腐烂检测失明);账本/经验/hook/腐烂检测全可用,放弃符号
+  粒度/格式化免疫(重排即 suspect,批量出口 reanchor_all)/调用图(热区退化纯 git 频率,
+  +1 平滑早已内置);已被专职插件占用的扩展名忽略;改 extensions 需重启 serve。
+  **T1 自托管解析器范式(首例 Python)**:让语言用自己的工具链解析自己——python3
+  内置 ast 模块经嵌入助手脚本(stdin 源码 → stdout JSON)提取符号与双哈希,Go 侧
+  零新依赖;python3 不在 PATH 则不注册(.py 不索引,可 extensions 降级文件级)。
+  语义对齐:符号=顶层 def/class+类方法(Class.method 文法);Hash=ast.dump(格式/
+  缩进/# 注释免疫——# 注释不在 AST,弱于 Go 的 doc 参与,留痕;docstring 在 AST 内,
+  变更失配);StructHash=自身名占位化(改名迁移全语言通用,已实测 Python 改名
+  StructHash 迁移知识随符号走);class 符号哈希剥方法体(方法不连坐 class)。
+  成本留痕:每文件一次 python3 子进程(~30-50ms),纯 Python 大仓 init 分钟级,
+  增量路径无感;Python 调用图不提供(import 归位规则等真实使用信号)。
+  **T2 tree-sitter 维持不做**(破零重依赖铁律 + cgo 三平台复杂化;codegraph 已把
+  纯结构图做到 20+ 语言,我们的护城河在经验/账本层,不与之卷地图)。
   - auto 派生值语义不变(§3:不落盘,现算):serve 期驻内存,按文件 mtime+size 指纹增量
     重提取,任一文件变才重连边。实测 casino 886 文件首建 263ms、无变更增量 21ms、1.7 万边;
   - `kb_recall` 快照的调用关系升级为全仓(同文件裸名、跨文件完整 node ID 可直接再 recall,

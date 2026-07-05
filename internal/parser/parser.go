@@ -29,15 +29,35 @@ type Parser interface {
 	Parse(path string, src []byte) ([]Symbol, error)
 }
 
+// FileHasher 是插件的可选能力:自定义文件级锚定哈希(2026-07-04 多语言修订)。
+// 缺省(不实现)用 FileHash(syms)=符号哈希级联——依赖真 AST 的格式化免疫;
+// 无符号提取的插件(Generic)必须实现它,否则空符号级联出常量哈希,腐烂检测失明。
+type FileHasher interface {
+	HashFile(src []byte) string
+}
+
+// HashFileFor 统一出口:插件自定义优先,否则符号级联(engine 各锚定点共用)。
+func HashFileFor(p Parser, syms []Symbol, src []byte) string {
+	if fh, ok := p.(FileHasher); ok {
+		return fh.HashFile(src)
+	}
+	return FileHash(syms)
+}
+
 // Registry 按扩展名分发解析器。
 type Registry struct {
 	byExt map[string]Parser
 }
 
-// NewRegistry 返回注册了全部内置解析器(第一期仅 Go)的注册表。
+// NewRegistry 返回注册了全部内置解析器的注册表:Go(go/ast)恒在;
+// Python(自托管助手,2026-07-04 多语言 T1)按本机 python3 可用性注册——
+// 不可用则 .py 不索引(可经 config extensions 白名单降级为文件级覆盖)。
 func NewRegistry() *Registry {
 	r := &Registry{byExt: map[string]Parser{}}
 	r.Register(Golang{})
+	if PythonAvailable() {
+		r.Register(Python{})
+	}
 	return r
 }
 

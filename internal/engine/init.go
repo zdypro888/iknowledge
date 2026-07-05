@@ -30,9 +30,30 @@ type Engine struct {
 	rt runtime
 }
 
-// New 建引擎。
+// New 建引擎。多语言注册(2026-07-04):专职解析器(Go/Python)先注册,
+// config.yaml 的 extensions 白名单再挂通用文件级插件(已占用的扩展名忽略,
+// 专职插件永远优先);config 读取尽力而为——没有 config 时纯 Go 行为不变。
 func New(s *store.Store) *Engine {
-	return &Engine{Store: s, Reg: parser.NewRegistry(), now: time.Now}
+	reg := parser.NewRegistry()
+	if cfg, err := s.LoadConfig(); err == nil && cfg != nil && len(cfg.Extensions) > 0 {
+		var free []string
+		for _, ext := range cfg.Extensions {
+			ext = strings.TrimSpace(ext)
+			if ext == "" {
+				continue
+			}
+			if !strings.HasPrefix(ext, ".") {
+				ext = "." + ext
+			}
+			if reg.ForFile("x"+ext) == nil {
+				free = append(free, ext)
+			}
+		}
+		if len(free) > 0 {
+			reg.Register(parser.NewGeneric(free))
+		}
+	}
+	return &Engine{Store: s, Reg: reg, now: time.Now}
 }
 
 // InitOptions 对应 kb_init / CLI init 的入参(impl §7.3)。
@@ -85,6 +106,9 @@ type reconcile struct {
 	// 新世界:本次扫描。
 	files     []string
 	symsByRel map[string][]parser.Symbol
+	// fileHashByRel 解析期缓存的文件级锚定哈希(HashFileFor:插件自定义优先,
+	// 缺省符号级联;src 不驻留,故在解析现场算)。
+	fileHashByRel map[string]string
 	newByID   map[string]symRef
 	newStruct map[string][]string // StructHash → 未被 ID 命中的新符号 ID 列表
 
@@ -133,7 +157,8 @@ func (e *Engine) initLocked(opts InitOptions) (*InitReport, error) {
 		oldShards: map[string]*loadedShard{},
 		oldByID:   map[string]*model.Node{},
 		oldStruct: map[string]int{},
-		symsByRel: map[string][]parser.Symbol{},
+		symsByRel:     map[string][]parser.Symbol{},
+		fileHashByRel: map[string]string{},
 		newByID:   map[string]symRef{},
 		newStruct: map[string][]string{},
 		out:       map[string][]model.Node{},
@@ -201,6 +226,7 @@ func (rc *reconcile) scanSources(cfg *store.Config) error {
 		}
 		rc.files = append(rc.files, rel)
 		rc.symsByRel[rel] = syms
+		rc.fileHashByRel[rel] = parser.HashFileFor(p, syms, src)
 		for _, sym := range syms {
 			rc.newByID[model.SymbolNodeID(rel, sym.Name)] = symRef{rel: rel, sym: sym}
 		}
@@ -306,7 +332,7 @@ func (rc *reconcile) buildFileNodes(rel string, opts InitOptions) []model.Node {
 	syms := rc.symsByRel[rel]
 	nodes := make([]model.Node, 0, len(syms)+1)
 
-	fileAnchor := model.Anchor{File: rel, Hash: parser.FileHash(syms)}
+	fileAnchor := model.Anchor{File: rel, Hash: rc.fileHashByRel[rel]}
 	nodes = append(nodes, rc.reconcileNode(model.FileNodeID(rel), model.LevelFile, fileAnchor, opts))
 
 	for _, sym := range syms {

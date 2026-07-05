@@ -933,7 +933,7 @@ func (e *Engine) reconcileOnReadLocked(ref *index.NodeRef) autoInfo {
 	auto.curHash = n.Anchor.Hash
 	var cur *parser.Symbol
 	if symbol == "" {
-		fh := parser.FileHash(syms)
+		fh := parser.HashFileFor(p, syms, src)
 		auto.curHash = fh
 		// #42(R2-A3 补齐文件节点分支):已 suspect 且仍失配同样要报 stale,
 		// 否则第二次读取横幅消失,AI 以为没问题。
