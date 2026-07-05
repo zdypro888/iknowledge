@@ -2,10 +2,12 @@ package parser
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"os/exec"
 	"sync"
+	"time"
 )
 
 // Python 解析器(2026-07-04 多语言 T1,自托管范式):让语言用**自己的工具链**
@@ -31,14 +33,18 @@ func (Python) Language() string { return "python" }
 func (Python) Extensions() []string { return []string{".py"} }
 
 // pythonExe 探测一次(python3 优先,windows 常为 python;探测含真实执行防
-// Microsoft Store 假 stub)。空串 = 不可用。
+// Microsoft Store 假 stub)。空串 = 不可用。5s 超时护栏:坏 python(网络盘
+// stdlib、劫持的 sitecustomize)挂死时不许拖垮 serve 启动——纯 Go 仓库不陪葬。
 var pythonExe = sync.OnceValue(func() string {
 	for _, name := range []string{"python3", "python"} {
 		p, err := exec.LookPath(name)
 		if err != nil {
 			continue
 		}
-		if out, err := exec.Command(p, "-c", "import ast,json,hashlib;print(1)").Output(); err == nil && bytes.HasPrefix(bytes.TrimSpace(out), []byte("1")) {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		out, err := exec.CommandContext(ctx, p, "-c", "import ast,json,hashlib;print(1)").Output()
+		cancel()
+		if err == nil && bytes.HasPrefix(bytes.TrimSpace(out), []byte("1")) {
 			return p
 		}
 	}
@@ -66,11 +72,17 @@ func (Python) Parse(path string, src []byte) ([]Symbol, error) {
 	if exe == "" {
 		return nil, fmt.Errorf("python3 不可用(未注册时不应到达)")
 	}
-	cmd := exec.Command(exe, "-c", pyHelper)
+	// 20s 超时:单文件解析挂死不许阻塞整库(engine 多数调用点持锁)。
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, exe, "-c", pyHelper)
 	cmd.Stdin = bytes.NewReader(src)
 	var out, errBuf bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &out, &errBuf
 	if err := cmd.Run(); err != nil {
+		if ctx.Err() != nil {
+			return nil, fmt.Errorf("python 解析超时(20s 护栏)")
+		}
 		// SyntaxError 等 → 解析失败三态(init 跳过计数/remember 拒收/记账照收)。
 		return nil, fmt.Errorf("python 解析失败:%s", firstLineOf(errBuf.String()))
 	}

@@ -345,6 +345,15 @@ type Parser interface {
   StructHash 迁移知识随符号走);class 符号哈希剥方法体(方法不连坐 class)。
   成本留痕:每文件一次 python3 子进程(~30-50ms),纯 Python 大仓 init 分钟级,
   增量路径无感;Python 调用图不提供(import 归位规则等真实使用信号)。
+  **Go 稳定性加固(2026-07-05,多语言不许拖累 Go 体验)**:①子进程双超时护栏——
+  探测 5s(坏 python 挂死不许卡 serve 启动,纯 Go 仓不陪葬)、单文件解析 20s(engine
+  多数调用点持锁,挂死即整库不可用);②kb_status 的 parseFailed 扫描加逐文件指纹缓存
+  (mtime+size→结果,没变的文件绝不重解析——否则混合仓 200 个 .py 每次 TTL 过期重扫
+  ≈8s);③探测成本核过账:engine 构造仅在 serve 启动(一次,长驻)与 init/status/
+  maintain 一次性命令,30-50ms 是噪音,**不做懒加载注册**(注册表并发锁 + Generic/
+  Python 优先级语义分叉,复杂度本身才是稳定性风险);④Go 哈希路径零变化实证:Golang
+  插件不实现 FileHasher,HashFileFor 回退原 FileHash,存量库幂等对账 migrated=0
+  suspected=0(aibridge 实测)。
   **T2 tree-sitter 维持不做**(破零重依赖铁律 + cgo 三平台复杂化;codegraph 已把
   纯结构图做到 20+ 语言,我们的护城河在经验/账本层,不与之卷地图)。
   - auto 派生值语义不变(§3:不落盘,现算):serve 期驻内存,按文件 mtime+size 指纹增量

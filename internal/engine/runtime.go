@@ -44,34 +44,67 @@ type runtime struct {
 
 	// parseFailed 计数缓存(60s TTL;kb_status 的全库 parse 扫描是最大单项成本,
 	// casino 实测数百毫秒——与 gitCounts 同型,同样锁外算)。
+	// pfFiles 逐文件指纹缓存(多语言加固:Python 等子进程解析器每文件 ~40ms,
+	// 混合仓 200 个 .py 的全量重扫 ≈8s——没变的文件绝不重解析,稳态成本归零)。
 	pfMu          sync.Mutex
 	parseFailedN  int
 	parseFailedAt time.Time
+	pfFiles       map[string]pfEntry
 }
 
-// parseFailedCached 返回解析失败文件数(60s TTL)。不持 rt.mu 调用。
+// pfEntry 是单文件的解析结果指纹。
+type pfEntry struct {
+	mtimeNS int64
+	size    int64
+	failed  bool
+}
+
+// parseFailedCached 返回解析失败文件数(60s TTL + 逐文件指纹增量:指纹没变的
+// 文件复用上次结果,不重读不重解析——子进程解析器(Python)在稳态零成本)。
+// 不持 rt.mu 调用。
 func (e *Engine) parseFailedCached() int {
 	e.rt.pfMu.Lock()
 	if !e.rt.parseFailedAt.IsZero() && e.now().Sub(e.rt.parseFailedAt) < time.Minute {
 		defer e.rt.pfMu.Unlock()
 		return e.rt.parseFailedN
 	}
+	prev := e.rt.pfFiles
 	e.rt.pfMu.Unlock()
+	if prev == nil {
+		prev = map[string]pfEntry{}
+	}
+
 	n := 0
+	next := map[string]pfEntry{}
 	cfg, _ := e.Store.LoadConfig()
 	if files, err := listSourceFiles(e.Store.RepoRoot(), e.Reg, cfg); err == nil {
 		for _, rel := range files {
-			src, err := os.ReadFile(filepath.Join(e.Store.RepoRoot(), filepath.FromSlash(rel)))
+			abs := filepath.Join(e.Store.RepoRoot(), filepath.FromSlash(rel))
+			st, err := os.Stat(abs)
+			if err != nil {
+				continue
+			}
+			if pe, ok := prev[rel]; ok && pe.mtimeNS == st.ModTime().UnixNano() && pe.size == st.Size() {
+				next[rel] = pe
+				if pe.failed {
+					n++
+				}
+				continue
+			}
+			src, err := os.ReadFile(abs)
 			if err != nil || parser.IsGenerated(src) {
 				continue
 			}
-			if _, err := e.Reg.ForFile(rel).Parse(rel, src); err != nil {
+			_, perr := e.Reg.ForFile(rel).Parse(rel, src)
+			pe := pfEntry{mtimeNS: st.ModTime().UnixNano(), size: st.Size(), failed: perr != nil}
+			next[rel] = pe
+			if pe.failed {
 				n++
 			}
 		}
 	}
 	e.rt.pfMu.Lock()
-	e.rt.parseFailedN, e.rt.parseFailedAt = n, e.now()
+	e.rt.parseFailedN, e.rt.parseFailedAt, e.rt.pfFiles = n, e.now(), next
 	e.rt.pfMu.Unlock()
 	return n
 }
