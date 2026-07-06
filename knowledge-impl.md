@@ -614,7 +614,8 @@ type Parser interface {
       节点为 orphaned → KB_ERR:NODE_ORPHANED 拒收(符号已消失,无锚可落;经验知识必须
       锚在存在的代码上——若符号搬去了新位置,直接对新节点 remember;认领走 kb_adopt,二期);
       stmt 级引用 → 拒收并提示改挂函数级 pitfall(一期不产出 stmt 节点,见 §3);
-      单条 ≤ 预算(knowledge.md §4.3);【token 估算法定案】估算 token =
+      单条 ≤ 预算(knowledge.md §4.3;file 层软预算 600、硬上限 1000,超过软预算只警示);
+      【token 估算法定案】估算 token =
       CJK rune 数 + 其余文本按空白/标点分词数 × 1.3(系数上线前对照真实 tokenizer 标定一次;
       BUDGET_EXCEEDED 返回"估算值/上限/估算规则",让 AI 可预测地精炼——规则不透明的拒收
       是不可自纠的);

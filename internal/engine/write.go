@@ -119,11 +119,15 @@ func (e *Engine) Remember(a RememberArgs, sid, author string) (string, error) {
 			return "", kbErr("INVALID_ARGUMENT", "非法 kind "+in.Kind,
 				"kind ∈ summary|contract|mutation|pitfall|usage")
 		}
-		if est := EstimateTokens(in.Text); est > budget {
+		if est := EstimateTokens(in.Text); est > budget.hard {
 			return "", kbErr("BUDGET_EXCEEDED",
 				fmt.Sprintf("条目估算 %d token,超过 %s 层上限 %d(估算规则:CJK 字数 + 其余词数×1.3)",
-					est, n.Level, budget),
+					est, n.Level, budget.hard),
 				"按估算规则精炼,或拆分/上移层级")
+		} else if budget.soft > 0 && est > budget.soft {
+			warnList = append(warnList,
+				fmt.Sprintf("条目估算 %d token,超过 %s 层软预算 %d;已接受但建议精炼或拆分,硬上限 %d",
+					est, n.Level, budget.soft, budget.hard))
 		}
 		if reject, warn := LintImperative(in.Text); reject != "" {
 			return "", kbErr("IMPERATIVE_CONTENT", reject, "改写为事实陈述(knowledge.md §12.8)")

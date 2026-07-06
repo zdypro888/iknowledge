@@ -38,21 +38,26 @@ func EstimateTokens(text string) int {
 	return cjk + int(float64(words)*1.3+0.5)
 }
 
+type tokenBudget struct {
+	soft int // 超过只警示;0 表示无软预算
+	hard int // 超过拒收
+}
+
 // budgetFor 各层 token 预算(knowledge.md §4.3;decl 与 function 同层同预算)。
-func budgetFor(level string) int {
+func budgetFor(level string) tokenBudget {
 	switch level {
 	case model.LevelProject:
-		return 300
+		return tokenBudget{hard: 300}
 	case model.LevelDir:
-		return 150
+		return tokenBudget{hard: 150}
 	case model.LevelFile:
-		return 200
+		return tokenBudget{soft: 600, hard: 1000}
 	case model.LevelFunction, model.LevelDecl:
-		return 250
+		return tokenBudget{hard: 250}
 	case model.LevelStmt:
-		return 50
+		return tokenBudget{hard: 50}
 	default:
-		return 250
+		return tokenBudget{hard: 250}
 	}
 }
 

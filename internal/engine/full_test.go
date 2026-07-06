@@ -86,6 +86,27 @@ func TestRememberFullMatrix(t *testing.T) {
 		kbCode(t, err, "BUDGET_EXCEEDED")
 	})
 
+	t.Run("file层软预算警示硬上限放行", func(t *testing.T) {
+		out, err := e.Remember(RememberArgs{
+			Node:    "internal/auth/login.go",
+			Entries: []RememberEntry{{Kind: "summary", Text: strings.Repeat("长", 700)}},
+		}, sid, "claude-code")
+		if err != nil {
+			t.Fatalf("file 层软预算内应接受: %v", err)
+		}
+		if !strings.Contains(out, "软预算 600") || !strings.Contains(out, "硬上限 1000") {
+			t.Fatalf("file 层超过软预算应警示:\n%s", out)
+		}
+	})
+
+	t.Run("file层硬上限拒收", func(t *testing.T) {
+		_, err := e.Remember(RememberArgs{
+			Node:    "internal/auth/login.go",
+			Entries: []RememberEntry{{Kind: "summary", Text: strings.Repeat("长", 1001)}},
+		}, sid, "claude-code")
+		kbCode(t, err, "BUDGET_EXCEEDED")
+	})
+
 	t.Run("lint拦库外动作指令", func(t *testing.T) {
 		_, err := e.Remember(RememberArgs{
 			Node:    "internal/auth/login.go#Login",
