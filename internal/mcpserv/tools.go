@@ -124,11 +124,11 @@ var allTools = map[string]any{
 	},
 	"kb_verify": map[string]any{
 		"name":        "kb_verify",
-		"description": "复核知识:confirm(读原文确认,inferred→verified;entry 传纯节点 ID + confirm 则做节点级重验、清 suspect)/ refute(驳倒,必须附原文证据,触发级联污染回收+疫苗义务)/ obsolete(没错但不再适用,体面退休)。",
+		"description": "复核知识:confirm(升级 inferred/suspect→verified 必须附 evidence 验证依据并留痕;verified 复确认只刷时间锚;entry 传纯节点 ID + confirm 则做节点级重验、清 suspect)/ refute(驳倒,必须附原文证据,触发级联污染回收+疫苗义务)/ obsolete(没错但不再适用,体面退休)。",
 		"inputSchema": obj(map[string]any{
 			"entry":    str("条目引用 node-id#entry-id;或纯节点 ID(配 confirm 做节点级重验重锚)"),
 			"verdict":  map[string]any{"type": "string", "enum": []string{"confirm", "refute", "obsolete"}},
-			"evidence": str("refute 必填:原文证据(引用具体代码行)"),
+			"evidence": str("refute 必填:原文证据(引用具体代码行);confirm 升级必填:验证依据(测试命令+结果/复现步骤/原文代码行——只是读过没发现问题不算验证)"),
 			"reason":   str("obsolete 必填:退休原因(功能下线/约定废止)"),
 		}, "entry", "verdict"),
 	},
@@ -195,9 +195,9 @@ var allTools = map[string]any{
 	},
 	"kb_maintain": map[string]any{
 		"name":        "kb_maintain",
-		"description": "维护欠账:next 取一条(时代摘要压缩/文件摘要落后/疑似重复/待重验 suspect/矛盾待裁决/非代码知识超期复核/置信度滞后即有 inferred 知识却已被测试验证过);complete 销账(era 债携带 era_summary 落库,负知识必须逐条保留在摘要里)。任务尾顺手偿还 ≤2 条。",
+		"description": "维护欠账:next 取一条(时代摘要压缩/文件摘要落后/疑似重复/待重验 suspect/矛盾待裁决/非代码知识超期复核/置信度滞后即有 inferred 知识却已被测试验证过);complete 销账(era 债携带 era_summary 落库,负知识必须逐条保留在摘要里);patrol 取跨节点矛盾巡检简报(同关键词簇并读,机器聚类你裁决,refute/disputes 即留痕无需交卷)。任务尾顺手偿还 ≤2 条。",
 		"inputSchema": obj(map[string]any{
-			"action":      map[string]any{"type": "string", "enum": []string{"next", "complete", "dismiss"}, "description": "next 取一条;complete 销账;dismiss 消解假阳性(如 dup-entries 判定实为不同)"},
+			"action":      map[string]any{"type": "string", "enum": []string{"next", "complete", "dismiss", "patrol"}, "description": "next 取一条;complete 销账;dismiss 消解假阳性(如 dup-entries 判定实为不同);patrol 跨节点矛盾巡检简报"},
 			"id":          str("complete/dismiss 必填:欠账 ID"),
 			"scope":       str("next 可选:路径前缀,只取本任务相关的债"),
 			"era_summary": str("era-compress 债完成时提交的时代摘要文本"),

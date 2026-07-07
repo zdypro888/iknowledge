@@ -63,15 +63,57 @@ func (e *Engine) Verify(a VerifyArgs, sid, author string) (string, error) {
 				"条目已被勘误,confirm 翻案须走新条目",
 				"带原文证据 kb_remember 一条新知识并在文中回应勘误")
 		}
-		entry.Confidence = model.ConfidenceVerified
-		entry.ConfirmedAt = e.now().UTC() // 非代码知识的时间锚刷新(§8.4)
+		now := e.now().UTC()
+		// derived 恒真(机器从 AST 推导):改成 verified 反而丢来源信息,只刷时间锚。
+		if old == model.ConfidenceDerived {
+			entry.ConfirmedAt = now
+			if err := e.saveNodeShardLocked(nodeRef); err != nil {
+				return "", err
+			}
+			if err := e.reloadLocked(); err != nil {
+				return "", err
+			}
+			return "ack:derived 恒真无需背书,已刷新确认时间(置信不变)", nil
+		}
+		// 升级(inferred/suspect→verified)是验证声明,与 refute 同规格:强制依据
+		// + journal 留痕(2026-07-05 三人成虎堵漏:写的 AI 没验证、confirm 的 AI
+		// 也没验证,库里却挂着 verified,后来者会无条件信它——verified 的定义是
+		// "有验证依据",没有依据的升级不成立)。
+		if old != model.ConfidenceVerified {
+			if strings.TrimSpace(a.Evidence) == "" {
+				return "", kbErr("EVIDENCE_REQUIRED",
+					"confirm 升级("+string(old)+"→verified)必须附验证依据(测试命令+结果/复现步骤/原文代码行)",
+					"附 evidence 后重试;只是读过原文没发现问题不构成验证——那仍是 inferred")
+			}
+			chID := e.freshChangeIDLocked()
+			change := model.Change{
+				ID: chID, Nodes: []string{nodeID}, At: now,
+				What:   "确认:条目 " + entryID + " 升级 verified(" + firstLine(entry.Text) + ")",
+				Why:    "验证依据:" + a.Evidence,
+				Author: author,
+			}
+			if err := e.Store.AppendChange(change); err != nil {
+				return "", err
+			}
+			entry.Confidence = model.ConfidenceVerified
+			entry.ConfirmedAt = now
+			if err := e.saveNodeShardLocked(nodeRef); err != nil {
+				return "", err
+			}
+			if err := e.reloadLocked(); err != nil {
+				return "", err
+			}
+			return fmt.Sprintf("newConfidence: verified(原 %s,确认记录 %s)", old, chID), nil
+		}
+		// verified→verified:复确认,纯时间锚刷新(§8.4),不要求新证据。
+		entry.ConfirmedAt = now
 		if err := e.saveNodeShardLocked(nodeRef); err != nil {
 			return "", err
 		}
 		if err := e.reloadLocked(); err != nil {
 			return "", err
 		}
-		return fmt.Sprintf("newConfidence: verified(原 %s)", old), nil
+		return "ack:verified 复确认,时间锚已刷新", nil
 
 	case "refute":
 		// 勘误必须附原文证据,服务端无证据不接受(knowledge.md §12.5)。

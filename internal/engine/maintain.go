@@ -348,6 +348,10 @@ func (e *Engine) Maintain(a MaintainArgs, sid, author string) (string, error) {
 			return "", err
 		}
 		return "ack:欠账 " + a.ID + " 已消解,后续不再复报(误判可删 .knowledge/local/dismissed-debts.txt 对应行)。", nil
+
+	case "patrol":
+		// 跨节点矛盾巡检(2026-07-05):纯只读简报,不开 job 不记状态(patrol.go)。
+		return e.patrolBriefLocked(a.Scope), nil
 	}
-	return "", kbErr("INVALID_ARGUMENT", "非法 action "+a.Action, "action ∈ next|complete|dismiss")
+	return "", kbErr("INVALID_ARGUMENT", "非法 action "+a.Action, "action ∈ next|complete|dismiss|patrol")
 }

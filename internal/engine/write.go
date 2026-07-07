@@ -740,7 +740,7 @@ func (e *Engine) RecordChange(a ChangeArgs, sid, author string) (string, error) 
 		for _, id := range resolved {
 			if ref := e.rt.ix.Node(id); ref != nil && ref.Node.Status == model.StatusFresh {
 				if n := countInferred(ref.Node); n > 0 {
-					fmt.Fprintf(&b, "\n顺手确认:节点 %s 有 %d 条 inferred 知识,本次改动已带验证——对其中仍准确描述当前代码的条目 kb_verify confirm 升 verified(测试验证的是代码,知识文本要你亲自确认)", id, n)
+					fmt.Fprintf(&b, "\n顺手确认:节点 %s 有 %d 条 inferred 知识,本次改动已带验证——对其中仍准确描述当前代码的条目 kb_verify confirm 升 verified(附 evidence=本次验证依据;测试验证的是代码,知识文本要你亲自确认)", id, n)
 					break
 				}
 			}

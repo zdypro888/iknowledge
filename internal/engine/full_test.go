@@ -460,7 +460,11 @@ func TestVerifyRefuteCascade(t *testing.T) {
 	t.Run("confirm升级", func(t *testing.T) {
 		out, _, _ := e.Recall(RecallArgs{Query: "a.go#checkLockout"}, sid)
 		depID := extractEntryID(t, out, "无需自己做重试")
-		res, err := e.Verify(VerifyArgs{Entry: "a.go#checkLockout#" + depID, Verdict: "confirm"}, sid, "claude-code")
+		// 无证据升级必须被拒(三人成虎堵漏)。
+		_, err := e.Verify(VerifyArgs{Entry: "a.go#checkLockout#" + depID, Verdict: "confirm"}, sid, "claude-code")
+		kbCode(t, err, "EVIDENCE_REQUIRED")
+		res, err := e.Verify(VerifyArgs{Entry: "a.go#checkLockout#" + depID, Verdict: "confirm",
+			Evidence: "读 Login 原文确认重试循环存在,go test -run TestLoginRetry 绿"}, sid, "claude-code")
 		if err != nil {
 			t.Fatal(err)
 		}

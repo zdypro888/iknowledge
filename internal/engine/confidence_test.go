@@ -64,7 +64,8 @@ func TestConfidenceBridge(t *testing.T) {
 		t.Fatal(err)
 	}
 	eid := extractEntryID(t, view, "返回值调用方依赖")
-	if _, err := e.Verify(VerifyArgs{Entry: "a/a.go#F#" + eid, Verdict: "confirm"}, sid, "claude-code"); err != nil {
+	if _, err := e.Verify(VerifyArgs{Entry: "a/a.go#F#" + eid, Verdict: "confirm",
+		Evidence: "go test -run TestF 通过,断言覆盖该返回值语义"}, sid, "claude-code"); err != nil {
 		t.Fatal(err)
 	}
 	debts, _ = e.Debts()

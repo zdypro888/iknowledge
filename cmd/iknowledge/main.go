@@ -281,6 +281,8 @@ func runStatus(args []string) int {
 func runMaintain(args []string, w io.Writer) int {
 	fs := flag.NewFlagSet("maintain", flag.ContinueOnError)
 	repo := fs.String("repo", ".", "仓库路径")
+	patrol := fs.Bool("patrol", false, "打印跨节点矛盾巡检简报(只读;裁决仍由 AI 会话经 kb_verify/kb_remember 完成)")
+	scope := fs.String("scope", "", "巡检范围(路径前缀,仅 -patrol 用)")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -288,6 +290,15 @@ func runMaintain(args []string, w io.Writer) int {
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "错误:", err)
 		return 1
+	}
+	if *patrol {
+		brief, err := engine.New(s).PatrolBrief(*scope)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "错误:", err)
+			return 1
+		}
+		fmt.Fprintln(w, brief)
+		return 0
 	}
 	debts, err := engine.New(s).Debts()
 	if err != nil {

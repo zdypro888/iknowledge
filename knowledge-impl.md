@@ -664,13 +664,21 @@ type Parser interface {
 #### kb_verify(二期)
 ```
 入参: { "entry": "node-id#entry-id", "verdict": "confirm"|"refute"|"obsolete",
-        "evidence": "原文引用/测试名(refute 必填)", "reason": "obsolete 时必填" }
+        "evidence": "原文引用/测试名(refute 必填;confirm 升级必填,2026-07-05)",
+        "reason": "obsolete 时必填" }
 校验: refute 必须附 evidence,无证据拒收(knowledge.md §12.5);
+      confirm 升级(inferred/suspect→verified)同样必须附 evidence 并写确认记录进
+      journal(2026-07-05 三人成虎堵漏:写的 AI 没验证、confirm 的 AI 也没验证,
+      库里却挂 verified,后来者无条件信它——verified 的定义是"有验证依据",无据
+      升级不成立;"读过原文没发现问题"不构成验证,那仍是 inferred)。
+      例外不要证据:verified 复确认(纯时间锚刷新,§8.4)、derived(恒真,只刷
+      时间锚不改置信——降成 verified 反而丢来源信息)、节点级 confirm(重验重锚/
+      无锚节点批量刷新,语义是"锚仍成立"而非"文本已验证")。
       obsolete 是"没错但不再适用"的体面退休(功能下线/约定废止),须附 reason;
       entry 引用沿 supersedes 链解析(引用旧 ID 自动落到现任条目)。
-效果: confirm → inferred 升 verified;refute → 该条 refuted(保留),
-      勘误进 journal,沿 based_on 级联降级衍生条目为 suspect,
-      并提示在原节点补一条"疫苗" pitfall;
+效果: confirm → 升 verified + 确认记录进 journal(升级留痕与勘误对称);
+      refute → 该条 refuted(保留),勘误进 journal,沿 based_on 级联降级
+      衍生条目为 suspect,并提示在原节点补一条"疫苗" pitfall;
       obsolete → 条目归档退出注入,不触发级联(它没错,衍生结论未必失效)。
 返回: { newConfidence, cascaded: [受牵连条目] }
 ```
@@ -699,8 +707,8 @@ type Parser interface {
 
 #### kb_maintain(三期;轮 24 全量交付落地)
 ```
-入参: { "action": "next"|"complete", "id": "债务项 ID(complete 必填)",
-        "scope": "路径前缀(可选,next 时只取本任务相关的债)",
+入参: { "action": "next"|"complete"|"dismiss"|"patrol", "id": "债务项 ID(complete 必填)",
+        "scope": "路径前缀(可选,next/patrol 时限定范围)",
         "era_summary": "era-compress 债完成时提交的时代摘要文本(负知识逐条保留)" }
 行为: 【欠账队列是现算派生值,不落盘(定案)】——欠账由成因现场推导
       (摘要落后=file summary 的 Entry.At 早于其下变更 / 历史超预算 >10 条或
@@ -725,7 +733,15 @@ type Parser interface {
       带 verified 时的黄金时点,存量走本债种)。
       "语义矛盾服务端测不出"的定案不变(§12.7)——dispute-open 派的是"AI 已声明、
       尚未裁决"的账,识别仍归 AI。】
-返回: 债务项 / ack
+      patrol(2026-07-05 增,跨节点冲突盲区补位)→ 返回跨节点矛盾巡检简报:
+      按节点级 Keywords 聚簇(同关键词跨 ≥2 个有活跃知识的节点;同节点集去重、
+      条目多者优先),纯只读、不开 job 不记状态——裁决动作(refute/disputes)本身
+      就是留痕,无交卷义务。预算封顶(5 簇/30 条/节点 3 条)溢出明示。定位:同节点
+      冲突已有写入查重+disputes+dup-entries 债三层;措辞不同或分居两节点的语义冲突
+      机器判不了(零重依赖下无 embedding),机器只负责把"最可能同主题"的知识聚到
+      一张纸上跨节点并读,裁判是读简报的 AI。CLI 侧 `iknowledge maintain -patrol
+      [-scope 前缀]` 同源只读输出。
+返回: 债务项 / ack / 巡检简报
 ```
 
 **落后摘要的诚实标注(轮 24 补,承载 knowledge.md §12.7 末条)**:kb_recall/kb_map/GET /inject
