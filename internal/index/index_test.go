@@ -173,3 +173,37 @@ func TestFlowsReverseLink(t *testing.T) {
 		t.Errorf("FlowsOf = %v", flows)
 	}
 }
+
+// R29 批次5:trigram 近似匹配——精确 token 不命中时,词形相近的能浮出。
+func TestSearchTrigramFallback(t *testing.T) {
+	ix := fixtureIndex(t)
+	// "authentication" 与 "Authenticate" 共享大量 trigram(auth, uth, hen, ...),
+	// 精确 token 不命中(authenticate ≠ authenticate——大小写经 Tokenize 归一后相同?),
+	// 但即便精确也 miss,trigram 回退让它浮出。
+	hits := ix.Search("authentication", 10)
+	if len(hits) == 0 {
+		t.Fatal("trigram 回退应让 authentication 命中 Authenticate,却零结果")
+	}
+	found := false
+	for _, h := range hits {
+		if h.NodeID == "internal/auth/login.go#Authenticate" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("authentication 应近似命中 Authenticate,got %+v", hits)
+	}
+}
+
+// trigrams 对中文不生效(防切坏 UTF-8)。
+func TestTrigramsSkipNonASCII(t *testing.T) {
+	if g := trigrams("登录"); g != nil {
+		t.Errorf("中文不应走 trigram,got %v", g)
+	}
+	if g := trigrams("abc"); len(g) != 1 || g[0] != "abc" {
+		t.Errorf("abc 的 trigram 应只有 abc,got %v", g)
+	}
+	if g := trigrams("loginLockout"); len(g) == 0 {
+		t.Error("loginLockout 应产生 trigram")
+	}
+}

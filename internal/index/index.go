@@ -30,6 +30,7 @@ type Index struct {
 	nodes       map[string]*NodeRef
 	lineage     map[string][]string        // 旧节点 ID → 现任节点 ID(拆分可多个,#8)
 	inverted    map[string]map[string]bool // token → 节点 ID 集合
+	trigram     map[string]map[string]bool // 三字母组 → 节点 ID 集合(R29 批次5:近似命中回退)
 	fileNodes   map[string][]string        // 文件路径 → 该文件的所有节点 ID(R29 批次3:文件域查询免扫全表)
 	basedOnRev  map[string][]string        // 归一化 "node#entry" → 依赖它的 "node#entry"
 	disputesRev map[string][]string        // 归一化 "node#entry" → 声明与它矛盾的 "node#entry"
@@ -47,6 +48,7 @@ func Build(shards map[string][]model.Node, changes []model.Change, flows []model
 		nodes:       map[string]*NodeRef{},
 		lineage:     map[string][]string{},
 		inverted:    map[string]map[string]bool{},
+		trigram:     map[string]map[string]bool{},
 		fileNodes:   map[string][]string{},
 		basedOnRev:  map[string][]string{},
 		disputesRev: map[string][]string{},
@@ -79,6 +81,7 @@ func Build(shards map[string][]model.Node, changes []model.Change, flows []model
 	}
 
 	// 倒排:节点 ID 分段 + 符号标识符拆词 + keywords + 活跃条目文本(impl §8)。
+	// R29 批次5:同时建 trigram 索引(三字母组),供精确 token 命中不足时近似回退。
 	for id, ref := range ix.nodes {
 		n := ref.Node
 		add := func(tokens []string) {
@@ -89,6 +92,17 @@ func Build(shards map[string][]model.Node, changes []model.Change, flows []model
 					ix.inverted[tok] = set
 				}
 				set[id] = true
+				// trigram:对长度≥3 的 token 取所有三字母组(小写归一)。
+				if len(tok) >= 3 {
+					for _, tg := range trigrams(tok) {
+						ts := ix.trigram[tg]
+						if ts == nil {
+							ts = map[string]bool{}
+							ix.trigram[tg] = ts
+						}
+						ts[id] = true
+					}
+				}
 			}
 		}
 		file, symbol := model.SplitNodeID(id)
@@ -327,15 +341,32 @@ type Hit struct {
 }
 
 // Search 关键词倒排检索(impl §8 排序:命中 token 数降序 → 层级 → ID 字典序,前 10)。
+// R29 批次5:精确 token 命中 < 3 时,回退 trigram 近似匹配(auth↔authentication、
+// loginLockout↔login lockout)。trigram 分数与精确分加权合并。
 func (ix *Index) Search(query string, limit int) []Hit {
 	if limit <= 0 {
 		limit = 10
 	}
 	tokens := Tokenize(query)
 	scores := map[string]int{}
+	exactHits := 0
 	for _, tok := range tokens {
 		for id := range ix.inverted[tok] {
-			scores[id]++
+			scores[id] += 2 // 精确命中权重 2
+			exactHits++
+		}
+	}
+	// 精确命中不足 → trigram 回退。
+	if exactHits < 3 {
+		for _, tok := range tokens {
+			if len(tok) < 3 {
+				continue
+			}
+			for _, tg := range trigrams(tok) {
+				for id := range ix.trigram[tg] {
+					scores[id]++ // trigram 权重 1
+				}
+			}
 		}
 	}
 	hits := make([]Hit, 0, len(scores))
@@ -356,6 +387,27 @@ func (ix *Index) Search(query string, limit int) []Hit {
 		hits = hits[:limit]
 	}
 	return hits
+}
+
+// trigrams 取小写归一化的所有三字母组(loginLockout → [log, ogi, gin, ...])。
+// 仅对纯 ASCII 字母数字 token 生效——中文等多字节字符的"trigram"会切坏 UTF-8 且语义不通。
+// 长度 < 3 返回 nil。
+func trigrams(s string) []string {
+	if len(s) < 3 {
+		return nil
+	}
+	s = strings.ToLower(s)
+	// 非 ASCII 直接跳过(中文等不走 trigram 机制)。
+	for i := 0; i < len(s); i++ {
+		if s[i] >= 0x80 {
+			return nil
+		}
+	}
+	out := make([]string, 0, len(s)-2)
+	for i := 0; i+3 <= len(s); i++ {
+		out = append(out, s[i:i+3])
+	}
+	return out
 }
 
 func levelRank(level string) int {
