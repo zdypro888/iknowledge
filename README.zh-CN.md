@@ -154,3 +154,7 @@ curl -fsSL https://raw.githubusercontent.com/zdypro888/iknowledge/main/uninstall
 
 - [`knowledge.md`](knowledge.md) — 概念设计全案(20 轮设计讨论的收敛:五个维度、自愈机制、经济学、安全、四篇推演)
 - [`knowledge-impl.md`](knowledge-impl.md) — 第一期工程方案(包结构、数据模型、存储、MCP API 全量规范、里程碑)
+
+## 许可证
+
+[MIT](LICENSE)——商用与非商用、修改、再分发均自由。唯一依赖 `gopkg.in/yaml.v3`(同为 MIT/Apache-2.0)。

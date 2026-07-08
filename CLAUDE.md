@@ -51,3 +51,5 @@ go test -race ./...
 ⑦**工程化/健壮性**:atomicWrite symlink 防线注释;fsyncdir build tag !unix→windows(+unknown 报错版);Python helper -S + 清环境变量;mergeUnknown/cloneNode 深度限(防恶意嵌套栈溢出);只读端点 limit 钳制;session 后台回收 goroutine + cap 10000。
 
 全轮零重依赖守住(go.mod 仍只 yaml.v3)、工具不碰源码、包依赖方向不变。新增 ~1500 行 Go(含测试),总测试 149→175+。
+
+**轮 29-续(2026-07-08,功能扩展——多语言覆盖 + 健康度 + 许可证定案)**:用户命题"还需要什么功能",做了三件——①**Rust(.rs)/Java(.java)解析器**:纯 Go 轻量词法(同 TS 范式,零运行时依赖),多语言符号级覆盖 Go/Python/JS-TS/Rust/Java 五语言;②**kb_status 知识健康度仪表盘**:置信度分布/平均年龄/suspect 积压/近 30 天活动,零新存储运行时聚合;③**许可证定案 MIT**(LICENSE + 双语 README 声明),消除发布前唯一待办。留痕:README 双语 FAQ 五语言声明、CLAUDE.md 待办①许可证划掉。

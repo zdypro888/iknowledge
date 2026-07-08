@@ -156,3 +156,7 @@ Phase 1 fully delivered and continuously hardened: 13 MCP tools + the `/mcp/main
 
 - [`knowledge.md`](knowledge.md) — the concept design (the convergence of 20 design rounds: five dimensions, self-healing, economics, security, four thought-experiments) *(Chinese)*
 - [`knowledge-impl.md`](knowledge-impl.md) — the phase-1 engineering spec (package layout, data model, storage, full MCP API spec, milestones) *(Chinese)*
+
+## License
+
+[MIT](LICENSE) — free for commercial and non-commercial use, modification, and redistribution. The only dependency is `gopkg.in/yaml.v3` (also MIT/APACHE-2.0).
