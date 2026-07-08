@@ -188,6 +188,10 @@ func atomicWrite(path string, data []byte) error {
 	if err != nil {
 		return fmt.Errorf("store: 建临时文件: %w", err)
 	}
+	// R29-E7.1 安全注释:os.CreateTemp 用 O_EXCL 防覆盖,但会跟随已存在的 symlink。
+	// 防线是 EnsureLayout 创建 .knowledge/ 的 0755 权限——同机其他用户无可写权限,
+	// 无法在 .knowledge/tree/ 内植入恶意 symlink。若将来放松目录权限(如共享组 0775),
+	// 必须改用 O_NOFOLLOW 打开临时文件,否则有 symlink 攻击面。
 	tmpName := tmp.Name()
 	if _, err := tmp.Write(data); err != nil {
 		tmp.Close()

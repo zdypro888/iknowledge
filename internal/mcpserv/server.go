@@ -48,7 +48,26 @@ const sessionTTL = 24 * time.Hour
 
 // New 建服务。
 func New(e *engine.Engine) *Server {
-	return &Server{E: e, sessions: map[string]*session{}}
+	s := &Server{E: e, sessions: map[string]*session{}}
+	// R29-E7.6:后台 goroutine 每 10min 回收过期 session(handleInitialize 原先只
+	// 机会性回收——大量 initialize 但不再发请求的场景会积累过期会话)。cap 10000
+	// 防恶意刷 initialize 耗内存(超限返 503)。
+	go s.reapSessions()
+	return s
+}
+
+func (s *Server) reapSessions() {
+	t := time.NewTicker(10 * time.Minute)
+	defer t.Stop()
+	for range t.C {
+		s.mu.Lock()
+		for id, sess := range s.sessions {
+			if time.Since(sess.lastSeen) > sessionTTL {
+				delete(s.sessions, id)
+			}
+		}
+		s.mu.Unlock()
+	}
 }
 
 // Handler 返回完整路由(impl §7.1):
@@ -220,7 +239,7 @@ func (s *Server) handleInitialize(w http.ResponseWriter, req rpcRequest) {
 			Name string `json:"name"`
 		} `json:"clientInfo"`
 	}
-	_ = json.Unmarshal(req.Params, &p)
+	_ = json.Unmarshal(req.Params, &p) // R29-E7.8:畸形 initialize 仍成功(author=unknown),不阻断握手
 	author := strings.TrimSpace(p.ClientInfo.Name)
 	if author == "" {
 		author = "unknown"
@@ -237,6 +256,12 @@ func (s *Server) handleInitialize(w http.ResponseWriter, req rpcRequest) {
 		if time.Since(sess.lastSeen) > sessionTTL {
 			delete(s.sessions, id)
 		}
+	}
+	// R29-E7.6:cap 10000 防 initialize 风暴耗内存(后台 goroutine 也定期回收)。
+	if len(s.sessions) >= 10000 {
+		s.mu.Unlock()
+		writeRPCError(w, req.ID, -32603, "too many sessions, retry later")
+		return
 	}
 	s.sessions[sid] = &session{author: author, lastSeen: time.Now()}
 	s.mu.Unlock()
@@ -460,6 +485,9 @@ func (s *Server) serveRecall(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	limit, _ := strconv.Atoi(q.Get("limit"))
+	if limit <= 0 || limit > 200 {
+		limit = 200 // R29-E7.5:钳制,防 ?limit=999999999 拖累
+	}
 	started := time.Now()
 	out, meta, err := s.E.Recall(engine.RecallArgs{
 		Query: q.Get("q"), Mode: q.Get("mode"), Limit: limit, Before: q.Get("before"),

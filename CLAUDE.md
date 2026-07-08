@@ -33,3 +33,21 @@ go test -race ./...
 **轮 27(2026-07-04~05)**:①**边界定案**(用户定调:知识库对应代码,不是记忆库)——知识判据"代码变了它会失效吗?"+ 三不进(通用编程知识/会话偏好/任务待办),纪律段+机械警示(TODO 拦截)+无锚提醒三层落地;②**codegraph 对照借鉴**(只捡便宜不搬架构):接口→实现边(方法集匹配 AST 近似,宁缺三闸;修 calledBy 已知盲区,casino 15.6k 节点首建 245ms/增量 71ms)+ kbeval 成本维度(cost.usage USD);明确**不借**:SQLite/watcher/tree-sitter(护城河在经验/账本层);③**多语言两档**(核心零改动,全部成本在插件面):T0 通用文件级(config `extensions` 白名单缺省关,FileHasher 能力接口)+ T1 Python 自托管解析器(python3 ast 助手脚本,不可用则不注册;改名 StructHash 迁移实测通过);④**Go 稳定性加固**(用户关切"不能加功能反而难用"):python 子进程双超时护栏(探测 5s/解析 20s,坏 python 不许卡 serve)、parseFailed 逐文件指纹缓存(没变的文件绝不重解析)、探测成本核账后**不做懒加载**(复杂度本身是风险)、Go 哈希路径零变化实证(存量库幂等 migrated=0 suspected=0)。
 
 **轮 28(2026-07-07,用户命题"冲突测得到吗/库本身错了呢")**:自查定位——同节点冲突已有三层(写入 bigram 查重逼三选一、disputes 矛盾单、dup-entries 债),错误知识五件套(五级置信/refute 证据强制/based_on 级联/疫苗/腐烂+时间锚)成立;审出真窟窿 **confirm 免证据升级**(写的 AI 没验证、confirm 的 AI 也没验证,库里却挂 verified——三人成虎)。落地两件:①**confirm 证据对称**(inferred/suspect→verified 强制 evidence + journal 确认记录,与 refute 同规格;verified 复确认/derived/节点级重锚豁免;置信桥提示与 MCP schema 同步);②**kb_maintain patrol 跨节点矛盾巡检**(关键词簇聚类跨 ≥2 节点活跃知识,同节点集去重、预算封顶 5 簇/30 条溢出明示,纯只读不开 job,refute/disputes 即留痕;CLI `maintain -patrol [-scope]` 同源;补冲突检测的跨节点盲区——机器聚类,AI 裁决)。留痕:knowledge.md §12.4/§12.5、impl §7.3(kb_verify/kb_maintain)、双语 README。
+
+**轮 29(2026-07-08,全面优化——安全/并发/性能/功能七批次)**:用户命题"找优化点并全做,做到完美"。七批落地,每批三关(build/vet/-race)全绿才进下一批:
+
+①**安全债清盘**:P0 命令注入修复(scout_command 经 sh -c 是供应链 RCE 向量,改零依赖切词+元字符拒绝+KEY=VAL 前缀);rand 错误不再吞(session/job ID 是凭证,低熵源 fail closed);常数时间比较修(len 预检泄露 token 长度,否定 ConstantTimeCompare);HTTP 超时硬化(ReadTimeout/IdleTimeout/MaxHeaderBytes);非 loopback 绑定强制 --allow-insecure-bind(把"一条 flag 之差网络裸奔"变不可能);错误码语义(kbInvalid NODE_NOT_FOUND→INVALID_PARAMS)。
+
+②**RWMutex 完整改造**(核心面并发化):rt.mu Mutex→RWMutex,读路径(Recall/Map/Inject/Status)改 RLock,多会话读不再串行。三项读时写外移使读路径变纯读:reconcileOnReadLocked 状态对账搬进 reconcileAllLocked(reloadLocked 末尾);ensureCallGraphLocked 走 cgMu 独立锁;sessionLedger 走 sessionMu 独立锁。死锁修复(staleAlert 去重入 RLock)。并发压测(10 goroutine×60 读 + 读写混合)-race 全过。
+
+③**性能优化**:git trail 60s 缓存(读锁内稳态零子进程);Map 覆盖率 O(D×N)→单遍预计算 O(N);config + 源文件列表 60s TTL 共享(LoadConfig 错误不再吞,进 kb_status);file→nodes 索引(Inject 文件域查询免扫全表)。
+
+④**新功能四项**:导出/导入(iknowledge export/import,.kbundle tar.gz,跨仓 --remap 路径重映射);kb_revert(撤销全错的 record_change/verify,model.Change.Reverts 追加式不变量);kb_session(本会话读写统计,查 usage log 零存储);注入排序(verified+近期确认活过 token 预算)+ 跨节点去重(cross-dup debt,补 dup-entries 同节点盲区)。工具数 13→15。
+
+⑤**trigram 模糊搜索**:index 建三字母组索引,精确 token 命中<3 时回退(authentication↔Authenticate 近似命中)。仅 ASCII token(中文不切)。
+
+⑥**JS/TS 解析器**(多语言 T1):纯 Go 轻量词法(零运行时依赖,Node.js 不自带 AST 解析库),.ts/.tsx/.js/.jsx/.mjs/.cjs/.mts/.cts。近似解析(宁缺不要错),格式/注释免疫哈希 + 改名免疫 StructHash。恒注册(纯 Go 无需探测)。
+
+⑦**工程化/健壮性**:atomicWrite symlink 防线注释;fsyncdir build tag !unix→windows(+unknown 报错版);Python helper -S + 清环境变量;mergeUnknown/cloneNode 深度限(防恶意嵌套栈溢出);只读端点 limit 钳制;session 后台回收 goroutine + cap 10000。
+
+全轮零重依赖守住(go.mod 仍只 yaml.v3)、工具不碰源码、包依赖方向不变。新增 ~1500 行 Go(含测试),总测试 149→175+。

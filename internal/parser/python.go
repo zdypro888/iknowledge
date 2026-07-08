@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
 	"os/exec"
 	"sync"
 	"time"
@@ -75,8 +76,12 @@ func (Python) Parse(path string, src []byte) ([]Symbol, error) {
 	// 20s 超时:单文件解析挂死不许阻塞整库(engine 多数调用点持锁)。
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, exe, "-c", pyHelper)
+	cmd := exec.CommandContext(ctx, exe, "-S", "-c", pyHelper) // -S: no site(减 codec-import 面)
 	cmd.Stdin = bytes.NewReader(src)
+	// R29-E7.3:清 PYTHONPATH/PYTHONSTARTUP,减 codec 注册表注入面(ast.parse 会触发
+	// 源编码声明 # -*- coding: ... -*- 的 codec 查找)。ast.parse 不执行源码,但编码
+	// 查找经 import 机制,清环境变量收紧面。保留最小 PATH(python3 本体在已知路径)。
+	cmd.Env = []string{"PATH=" + os.Getenv("PATH")}
 	var out, errBuf bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &out, &errBuf
 	if err := cmd.Run(); err != nil {

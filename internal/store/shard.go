@@ -91,8 +91,16 @@ func (s *Store) SaveShard(path string, sh *Shard, raw *yaml.Node) error {
 //   - 其他情形一律以 dst 为准。
 //
 // 已知字段集由 model 结构体的 yaml tag 反射派生(schema.go),模型加字段自动跟进。
+// mergeUnknown 把 src 的未知字段合进 dst(已知字段由引擎管,不在此)。
+// R29-E7.4:depth 限制(上限 100)防恶意/损坏 shard 的极端嵌套导致栈溢出。
+const maxMergeDepth = 100
+
 func mergeUnknown(dst, src *yaml.Node, sc *mergeSchema) {
-	if dst == nil || src == nil || dst.Kind != src.Kind {
+	mergeUnknownDepth(dst, src, sc, 0)
+}
+
+func mergeUnknownDepth(dst, src *yaml.Node, sc *mergeSchema, depth int) {
+	if depth > maxMergeDepth || dst == nil || src == nil || dst.Kind != src.Kind {
 		return
 	}
 	switch dst.Kind {
@@ -104,13 +112,13 @@ func mergeUnknown(dst, src *yaml.Node, sc *mergeSchema) {
 		for i := 0; i+1 < len(src.Content); i += 2 {
 			k, v := src.Content[i], src.Content[i+1]
 			if dv, ok := dstKeys[k.Value]; ok {
-				mergeUnknown(dv, v, sc.child(k.Value))
+				mergeUnknownDepth(dv, v, sc.child(k.Value), depth+1)
 				continue
 			}
 			if sc != nil && sc.known[k.Value] {
 				continue // 已知字段被引擎清零,尊重删除
 			}
-			dst.Content = append(dst.Content, cloneNode(k), cloneNode(v))
+			dst.Content = append(dst.Content, cloneNodeDepth(k, 0), cloneNodeDepth(v, 0))
 		}
 	case yaml.SequenceNode:
 		srcByID := map[string]*yaml.Node{}
@@ -125,7 +133,7 @@ func mergeUnknown(dst, src *yaml.Node, sc *mergeSchema) {
 		for _, item := range dst.Content {
 			if id := mapScalar(item, "id"); id != "" {
 				if sv, ok := srcByID[id]; ok {
-					mergeUnknown(item, sv, sc) // sequence 的 schema 即元素 schema
+					mergeUnknownDepth(item, sv, sc, depth+1) // sequence 的 schema 即元素 schema
 				}
 			}
 		}
@@ -145,14 +153,17 @@ func mapScalar(n *yaml.Node, key string) string {
 	return ""
 }
 
-func cloneNode(n *yaml.Node) *yaml.Node {
-	if n == nil {
+// cloneNode 深拷贝 yaml 节点(R29-E7.4:depth 限制防极端嵌套栈溢出)。
+func cloneNode(n *yaml.Node) *yaml.Node { return cloneNodeDepth(n, 0) }
+
+func cloneNodeDepth(n *yaml.Node, depth int) *yaml.Node {
+	if n == nil || depth > maxMergeDepth {
 		return nil
 	}
 	c := *n
 	c.Content = make([]*yaml.Node, len(n.Content))
 	for i, child := range n.Content {
-		c.Content[i] = cloneNode(child)
+		c.Content[i] = cloneNodeDepth(child, depth+1)
 	}
 	return &c
 }
