@@ -60,6 +60,8 @@ func NewRegistry() *Registry {
 		r.Register(Python{})
 	}
 	r.Register(TypeScript{}) // 纯 Go 词法,无需运行时探测
+	r.Register(Rust{})
+	r.Register(Java{})
 	return r
 }
 

@@ -61,6 +61,12 @@ func (e *Engine) Status() (string, error) {
 	total, digested, suspect, orphaned, pending := 0, 0, 0, 0, 0
 	conflicts := 0
 	var orphanIDs []string
+	// R29-续:知识健康度统计(零新存储,运行时聚合)。
+	confCounts := map[string]int{}    // Confidence → 活跃条目数
+	var entryAges []time.Duration      // 活跃条目的年龄(距 At/ConfirmedAt 最近)
+	oldestSuspect := 0 * time.Second   // 最久的 suspect 节点年龄(积压可见度)
+	oldestSuspectID := ""
+	suspectCount := 0
 	type fileDigest struct{ done, total int }
 	perFile := map[string]*fileDigest{} // 符号节点按文件聚合(热点消化比)
 	for _, cs := range e.rt.cache.Shards() {
@@ -77,9 +83,32 @@ func (e *Engine) Status() (string, error) {
 			switch n.Status {
 			case model.StatusSuspect:
 				suspect++
+				suspectCount++
+				if n.Since.After(time.Time{}) {
+					age := e.now().Sub(n.Since)
+					if age > oldestSuspect {
+						oldestSuspect = age
+						oldestSuspectID = n.ID
+					}
+				}
 			case model.StatusOrphaned:
 				orphaned++
 				orphanIDs = append(orphanIDs, n.ID)
+			}
+			// R29-续:健康度——活跃条目的置信度分布 + 年龄。
+			for i := range n.Entries {
+				en := &n.Entries[i]
+				if !en.Active() {
+					continue
+				}
+				confCounts[string(en.Confidence)]++
+				last := en.At
+				if en.ConfirmedAt.After(last) {
+					last = en.ConfirmedAt
+				}
+				if !last.IsZero() {
+					entryAges = append(entryAges, e.now().Sub(last))
+				}
 			}
 			if n.PendingAnchor {
 				pending++
@@ -213,6 +242,67 @@ func (e *Engine) Status() (string, error) {
 	if cerr := e.configError(); cerr != nil {
 		fmt.Fprintf(&b, "⚠ config.yaml 解析失败(用空配置运行,includes/excludes/extensions 可能失效):%v\n", cerr)
 	}
+	// R29-续:知识健康度仪表盘(零新存储,运行时聚合已有数据)。
+	b.WriteString("─── 知识健康度 ───\n")
+	// 置信度分布。
+	totalEntries := 0
+	for _, c := range confCounts {
+		totalEntries += c
+	}
+	if totalEntries > 0 {
+		order := []string{string(model.ConfidenceVerified), string(model.ConfidenceInferred),
+			string(model.ConfidenceSuspect), string(model.ConfidenceDerived)}
+		var parts []string
+		for _, c := range order {
+			if n := confCounts[c]; n > 0 {
+				parts = append(parts, fmt.Sprintf("%s %d%%", c, int(pct(n, totalEntries))))
+			}
+		}
+		fmt.Fprintf(&b, "置信度分布: %s\n", strings.Join(parts, " | "))
+	}
+	// 平均年龄。
+	if len(entryAges) > 0 {
+		var sum time.Duration
+		var newest time.Duration
+		for i, a := range entryAges {
+			sum += a
+			if i == 0 || a < newest {
+				newest = a
+			}
+		}
+		avg := sum / time.Duration(len(entryAges))
+		fmt.Fprintf(&b, "知识平均年龄: %s(最近确认: %s 前)\n", daysOf(avg), daysOf(newest))
+	}
+	// suspect 积压。
+	if suspectCount > 0 {
+		line := fmt.Sprintf("积压未清: %d 条 suspect", suspectCount)
+		if oldestSuspect > 0 && oldestSuspectID != "" {
+			line += fmt.Sprintf("(最久 %s:%s)", daysOf(oldestSuspect), oldestSuspectID)
+		}
+		line += " — kb_maintain next 清一条\n"
+		b.WriteString(line)
+	}
+	// 近 30 天活动(从 journal 聚合)。
+	recent30 := e.now().AddDate(0, 0, -30)
+	changes, verifies, refutes := 0, 0, 0
+	for _, c := range e.rt.ix.Changes() {
+		if c.At.After(recent30) {
+			changes++
+			if c.Overturns != "" {
+				refutes++
+			}
+			if c.Verified != "" {
+				verifies++
+			}
+		}
+	}
+	if changes > 0 {
+		fmt.Fprintf(&b, "近 30 天活动: %d 次变更记录", changes)
+		if verifies > 0 || refutes > 0 {
+			fmt.Fprintf(&b, "(验证 %d、推翻 %d)", verifies, refutes)
+		}
+		b.WriteString("\n")
+	}
 	return strings.TrimRight(b.String(), "\n"), nil
 }
 
@@ -221,6 +311,17 @@ func pct(a, b int) float64 {
 		return 0
 	}
 	return float64(a) * 100 / float64(b)
+}
+
+// daysOf 把 Duration 格式化为人类可读的年龄(R29-续 健康度仪表盘用)。
+func daysOf(d time.Duration) string {
+	if d < time.Hour {
+		return fmt.Sprintf("%dm", int(d.Minutes()))
+	}
+	if d < 24*time.Hour {
+		return fmt.Sprintf("%dh", int(d.Hours()))
+	}
+	return fmt.Sprintf("%dd", int(d.Hours()/24))
 }
 
 func hasActiveEntries(n *model.Node) bool {
