@@ -221,6 +221,33 @@ func (e *Engine) Status() (string, error) {
 			}
 		}
 	}
+	// 轮30-C 雷区 TOP5:按 landmine 分排序(反复改/推翻过的节点)——与热点(常改)语义不同:
+	// 热点=该消化,雷区=该警惕(新方案易重蹈覆辙)。
+	type mine struct {
+		nodeID string
+		score  int
+	}
+	var mines []mine
+	for _, ref := range e.rt.ix.Nodes() {
+		if s := e.rt.ix.LandmineScore(ref.Node.ID); s >= 3 {
+			mines = append(mines, mine{ref.Node.ID, s})
+		}
+	}
+	sort.Slice(mines, func(i, j int) bool {
+		if mines[i].score != mines[j].score {
+			return mines[i].score > mines[j].score
+		}
+		return mines[i].nodeID < mines[j].nodeID
+	})
+	if len(mines) > 5 {
+		mines = mines[:5]
+	}
+	if len(mines) > 0 {
+		b.WriteString("雷区 TOP5(反复改/推翻过,新方案动手前必读否决理由):\n")
+		for _, m := range mines {
+			fmt.Fprintf(&b, "  - %s 分 %d\n", m.nodeID, m.score)
+		}
+	}
 
 	// 活跃任务态。
 	if len(e.rt.wips) > 0 {
@@ -1375,6 +1402,14 @@ func (e *Engine) Inject(file, sid, tool string) (string, error) {
 	}
 	if debtCount > 0 {
 		parts = append(parts, fmt.Sprintf("⚙ 本文件有 %d 条维护欠账(kb_maintain next scope=%s 顺手清一条)", debtCount, file))
+	}
+	// 轮30-C 雷区警告:本文件节点累计 landmine 分 ≥3 → 强警告(反复改/推翻过的地雷区)。
+	landmineTotal := 0
+	for _, id := range nodeIDs {
+		landmineTotal += e.rt.ix.LandmineScore(id)
+	}
+	if landmineTotal >= 3 {
+		parts = append(parts, fmt.Sprintf("⚠ 雷区(分 %d):此文件历史反复改/推翻过,你的新方案动手前必读 kb_recall mode=history 的否决理由,否则极可能重蹈覆辙", landmineTotal))
 	}
 
 	// 本文件节点全量(快照 + 负知识全量)。

@@ -53,3 +53,13 @@ go test -race ./...
 全轮零重依赖守住(go.mod 仍只 yaml.v3)、工具不碰源码、包依赖方向不变。新增 ~1500 行 Go(含测试),总测试 149→175+。
 
 **轮 29-续(2026-07-08,功能扩展——多语言覆盖 + 健康度 + 许可证定案)**:用户命题"还需要什么功能",做了三件——①**Rust(.rs)/Java(.java)解析器**:纯 Go 轻量词法(同 TS 范式,零运行时依赖),多语言符号级覆盖 Go/Python/JS-TS/Rust/Java 五语言;②**kb_status 知识健康度仪表盘**:置信度分布/平均年龄/suspect 积压/近 30 天活动,零新存储运行时聚合;③**许可证定案 MIT**(LICENSE + 双语 README 声明),消除发布前唯一待办。留痕:README 双语 FAQ 五语言声明、CLAUDE.md 待办①许可证划掉。
+
+**轮 30(2026-07-08,定位升级——从"记忆"到"防重复犯错 + 协作定位")**:用户命题"不只是 memory,要避免重复犯错,要能配合 AI 定位问题/代码"。审出三个真实盲区,全用已有数据重新聚合(零新存储/零新依赖),三个机制落地:
+
+①**写入时方案防撞(轮30-A)**:kb_remember 提新方案时,自动比对历史 rejected(bigram>0.8 命中)。分级:带 disputes(已主动声明矛盾)→温和提醒;没带→强警告(含 change ID/被否方案原文/理由)。不阻断写入(知识导航源码拍板)。解决"换个 AI 会话又提曾被否决的方案"。
+
+②**kb_diagnose 症状→位置反向定位(轮30-B)**:AI 输入症状/报错,系统返回最可能位置 + 相关 pitfall + 排障流程 + 历史否决方案。与 kb_recall(位置→内容)相反。复用 ix.Search(已索引 pitfall 文本)+ keywordOverlap(Flow.Troubleshoot)+ ix.History(rejected 上下文)。pitfall 优先排序 + 放松 fresh 限制(diagnose 该看 suspect 地雷)。工具数 16。
+
+③**雷区标记 + Inject 强警告 + kb_status 雷区 TOP5(轮30-C)**:index.Build 预计算 landmine 分(变更频次 + 推翻×2 + refute 数)。Inject 对 landmine≥3 的文件强警告"动手前必读否决理由"。kb_status 加雷区 TOP5(与热点 TOP5 语义不同:热点=常改该消化,雷区=易错该警惕)。
+
+回归:防撞(相似强警告/disputes 软化/不相似不误报)+ diagnose(pitfall 命中/rejected 上下文/无命中引导)+ 雷区(Inject 警告/Status TOP5/无信号不误报)共 9 测试通过。build/vet/-race 全套绿。零新依赖(go.mod 仍只 yaml.v3)。

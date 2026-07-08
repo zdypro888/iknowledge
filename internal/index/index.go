@@ -36,6 +36,7 @@ type Index struct {
 	disputesRev map[string][]string        // 归一化 "node#entry" → 声明与它矛盾的 "node#entry"
 	flowsByNode map[string][]string        // 节点 ID → flow IDs(反向链接,现算不落盘)
 	journalBy   map[string][]ChangeRef     // 现任节点 ID → 变更引用
+	landmine    map[string]int             // 轮30-C:节点 ID → 雷区分(变更频次 + 推翻次数×2 + refute 数)
 	changes     []model.Change
 	flows       []model.Flow
 }
@@ -54,6 +55,7 @@ func Build(shards map[string][]model.Node, changes []model.Change, flows []model
 		disputesRev: map[string][]string{},
 		flowsByNode: map[string][]string{},
 		journalBy:   map[string][]ChangeRef{},
+		landmine:    map[string]int{},
 		changes:     changes,
 		flows:       flows,
 	}
@@ -153,13 +155,29 @@ func Build(shards map[string][]model.Node, changes []model.Change, flows []model
 	// 拆分(一个旧 ID → 多个现任)时,该记录挂进【全部】继承者的历史(#8:
 	// 否则 last-write-wins 只落到随机一个,另一个 N3 断档)。
 	for ci := range changes {
-		for _, nid := range changes[ci].Nodes {
+		c := &changes[ci]
+		// 轮30-C 雷区分:每次 record_change +1,推翻(overturns/reverts)额外 +2。
+		overturnBonus := 0
+		if c.Overturns != "" || c.Reverts != "" {
+			overturnBonus = 2
+		}
+		for _, nid := range c.Nodes {
 			if _, ok := ix.nodes[nid]; ok {
 				ix.journalBy[nid] = append(ix.journalBy[nid], ChangeRef{Idx: ci})
+				ix.landmine[nid] += 1 + overturnBonus
 				continue
 			}
 			for _, cur := range ix.lineage[nid] {
 				ix.journalBy[cur] = append(ix.journalBy[cur], ChangeRef{Idx: ci, ViaLineage: true})
+				ix.landmine[cur] += 1 + overturnBonus
+			}
+		}
+	}
+	// entry-level refute(refuted 条目)也算地雷信号:+1 per refuted entry。
+	for id, ref := range ix.nodes {
+		for i := range ref.Node.Entries {
+			if ref.Node.Entries[i].RefutedBy != "" {
+				ix.landmine[id]++
 			}
 		}
 	}
@@ -173,6 +191,10 @@ func (ix *Index) Node(id string) *NodeRef { return ix.nodes[id] }
 
 // FileNodes 返回某文件的所有节点 ID(R29 批次3:文件域查询免扫全表)。
 func (ix *Index) FileNodes(file string) []string { return ix.fileNodes[file] }
+
+// LandmineScore 返回节点的雷区分(轮30-C):变更频次 + 推翻×2 + refute 数。
+// 0 = 无地雷信号;≥3 = 雷区(反复改过/推翻过,AI 进该区要警告)。
+func (ix *Index) LandmineScore(nodeID string) int { return ix.landmine[nodeID] }
 
 // Nodes 返回全部节点表(只读用)。
 func (ix *Index) Nodes() map[string]*NodeRef { return ix.nodes }
