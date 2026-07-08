@@ -172,6 +172,24 @@ func (e *Engine) Remember(a RememberArgs, sid, author string) (string, error) {
 					"疑似与 "+old.ID+" 相似(>0.8)——三种结局:同一结论→supersedes 合并;互相矛盾→本条 disputes 声明待裁决;确证旧条错误→kb_verify refute 它")
 			}
 		}
+		// 轮30-A 方案防撞:新方案 vs 历史 rejected(bigram>0.8 命中)。
+		// 分级:带了 disputes(已主动声明矛盾关系)→ 温和提醒;没带 → 强警告。
+		// 不阻断写入(知识导航源码拍板,系统提醒 AI+人判断)。
+		hasDisputes := len(in.Disputes) > 0
+		for _, c := range e.rt.ix.Changes() {
+			for _, rj := range c.Rejected {
+				if BigramJaccard(rj.Option, in.Text) > 0.8 {
+					if hasDisputes {
+						warnList = append(warnList,
+							"注意:此方案与历史否决方案相似(change "+c.ID[:min(12, len(c.ID))]+" 否决过「"+shortText(rj.Option, 40)+"」,理由:"+shortText(rj.Reason, 40)+")。你已声明 disputes,请确保确实不同")
+					} else {
+						warnList = append(warnList,
+							"⚠ 此方案曾被否决!change "+c.ID[:min(12, len(c.ID))]+" 否决过「"+shortText(rj.Option, 40)+"」,理由:"+shortText(rj.Reason, 40)+"。若确信这次不同:用 disputes 字段声明与历史的关系,或带 based_on 原文证据")
+					}
+					break // 一个 change 只报一次
+				}
+			}
+		}
 		// basedOn:引用可解析 + 可信度封顶 inferred(knowledge.md §8.3)。
 		for _, dep := range in.BasedOn {
 			resolved := e.rt.ix.ResolveEntryRef(dep)
@@ -907,6 +925,15 @@ func (e *Engine) rewriteShardsLocked(dirty map[string]bool, removeSet map[string
 		}
 	}
 	return nil
+}
+
+// shortText 截断文本到 maxRunes 个 rune(防切坏 UTF-8),超长加省略号。轮30-A 防撞提醒用。
+func shortText(s string, maxRunes int) string {
+	r := []rune(s)
+	if len(r) <= maxRunes {
+		return s
+	}
+	return string(r[:maxRunes]) + "…"
 }
 
 func demote(c model.Confidence) model.Confidence {
