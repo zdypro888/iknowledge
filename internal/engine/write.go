@@ -774,6 +774,41 @@ func (e *Engine) RecordChange(a ChangeArgs, sid, author string) (string, error) 
 	if remind := e.settleReminder(sid); len(remind) > 0 {
 		fmt.Fprintf(&b, "\n沉淀提醒:本会话多次读取但未沉淀的节点:%s", strings.Join(remind, "、"))
 	}
+	// 轮31 批次2 变更影响面分析:对本次改动的主节点,用 callgraph 查谁调它,
+	// 标注带活跃知识的调用方(它们的契约/pitfall 可能被本次改动破坏)。
+	// 这是"智能协作"的关键:AI 改一个函数,系统立刻告诉它波及面 + 哪里要复核。
+	if cg := e.ensureCallGraphLocked(); cg != nil {
+		impactShown := 0
+		for _, id := range resolved {
+			if impactShown >= 3 {
+				break // 限额:最多报 3 个节点的影响面(防长清单刷屏)
+			}
+			callers := cg.calledByOf(id)
+			if len(callers) == 0 {
+				continue
+			}
+			// 区分:有活跃知识的调用方(可能受影响,需复核)vs 无知识的(仅列出计数)。
+			var withKnowledge, bare []string
+			for _, caller := range callers {
+				if ref := e.rt.ix.Node(caller); ref != nil && hasActiveEntries(ref.Node) {
+					withKnowledge = append(withKnowledge, caller)
+				} else {
+					bare = append(bare, caller)
+				}
+			}
+			if len(withKnowledge) == 0 {
+				continue // 调用方都没知识,不值得报(纯机械依赖,callgraph 已在 recall 展示)
+			}
+			fmt.Fprintf(&b, "\n变更影响:你改了 %s,它被 %d 处调用", id, len(callers))
+			if len(withKnowledge) > 0 {
+				fmt.Fprintf(&b, ",其中 %d 处带知识(契约/坑可能被破坏,建议复核):\n", len(withKnowledge))
+				for _, c := range withKnowledge {
+					fmt.Fprintf(&b, "  ⚠ %s —— kb_recall %s 看它的契约是否仍成立\n", c, c)
+				}
+			}
+			impactShown++
+		}
+	}
 	for _, w := range warns {
 		b.WriteString("\n⚠ ")
 		b.WriteString(w)
