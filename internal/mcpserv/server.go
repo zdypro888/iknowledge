@@ -378,6 +378,14 @@ func (s *Server) dispatch(name string, args json.RawMessage, sid string) (string
 		text, m, err := s.E.Recall(engine.RecallArgs{Query: a.Query, Mode: a.Mode, Limit: a.Limit, Before: a.Before}, sid)
 		return text, m, err
 
+	case "kb_diagnose":
+		var a engine.DiagnoseArgs
+		if err := un(&a); err != nil {
+			return "", meta, kbInvalid(err)
+		}
+		text, m, err := s.E.Diagnose(a, sid)
+		return text, m, err
+
 	case "kb_remember":
 		var a engine.RememberArgs
 		if err := un(&a); err != nil {

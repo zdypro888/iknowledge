@@ -6,7 +6,7 @@ package mcpserv
 // scoutTools 是 /mcp/scout/<job> 端点可见的工具(无 investigate 防套娃、
 // 无 record_change——侦察兵不改码,铁律二)。
 var scoutTools = map[string]bool{
-	"kb_map": true, "kb_recall": true, "kb_remember": true,
+	"kb_map": true, "kb_recall": true, "kb_diagnose": true, "kb_remember": true,
 	"kb_task": true, "kb_flow": true, "kb_submit_findings": true,
 }
 
@@ -31,7 +31,7 @@ func toolDefs(role string) []any {
 }
 
 var toolOrder = []string{
-	"kb_init", "kb_status", "kb_map", "kb_recall", "kb_remember", "kb_record_change",
+	"kb_init", "kb_status", "kb_map", "kb_recall", "kb_diagnose", "kb_remember", "kb_record_change",
 	"kb_verify", "kb_revert", "kb_task", "kb_investigate", "kb_submit_findings", "kb_adopt",
 	"kb_flow", "kb_maintain", "kb_session",
 }
@@ -82,6 +82,14 @@ var allTools = map[string]any{
 			"limit":  intp("关键词检索返回数,默认 5"),
 			"before": str("history 翻页:取此 change ID 之前的更早历史"),
 		}, "query"),
+	},
+	"kb_diagnose": map[string]any{
+		"name":        "kb_diagnose",
+		"description": "症状→位置反向定位(与 recall 相反):输入症状/报错('支付回调偶发超时'),返回最可能的位置 + 相关 pitfall + 排障流程 + 历史否决方案。不必猜文件名 + grep,直接按问题现象定位代码。",
+		"inputSchema": obj(map[string]any{
+			"symptom": str("症状/报错/问题现象描述(中英文均可)"),
+			"limit":   intp("返回位置上限,默认 8"),
+		}, "symptom"),
 	},
 	"kb_remember": map[string]any{
 		"name":        "kb_remember",
