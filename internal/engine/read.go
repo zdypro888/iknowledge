@@ -248,6 +248,46 @@ func (e *Engine) Status() (string, error) {
 			fmt.Fprintf(&b, "  - %s 分 %d\n", m.nodeID, m.score)
 		}
 	}
+	// 轮31 批次3 知识缺口 TOP5:高被依赖(calledBy 多)却零活跃知识的节点——
+	// 这些是"每次用都得从零读代码"的盲区,优先沉淀契约/坑(跨改动仍成立的不变量)。
+	if cg := e.ensureCallGraphLocked(); cg != nil {
+		type gap struct {
+			nodeID  string
+			callers int
+		}
+		var gaps []gap
+		for _, ref := range e.rt.ix.Nodes() {
+			n := ref.Node
+			if n.Level != model.LevelFunction && n.Level != model.LevelDecl {
+				continue
+			}
+			if hasActiveEntries(n) {
+				continue // 有知识的不算缺口
+			}
+			if n.Status == model.StatusOrphaned {
+				continue
+			}
+			callers := len(cg.calledByOf(n.ID))
+			if callers >= 2 { // 至少被 2 处调用才算值得沉淀的缺口
+				gaps = append(gaps, gap{n.ID, callers})
+			}
+		}
+		sort.Slice(gaps, func(i, j int) bool {
+			if gaps[i].callers != gaps[j].callers {
+				return gaps[i].callers > gaps[j].callers
+			}
+			return gaps[i].nodeID < gaps[j].nodeID
+		})
+		if len(gaps) > 5 {
+			gaps = gaps[:5]
+		}
+		if len(gaps) > 0 {
+			b.WriteString("知识缺口 TOP5(高被依赖却无知识,读原文后 kb_remember 沉淀契约/坑):\n")
+			for _, g := range gaps {
+				fmt.Fprintf(&b, "  - %s 被 %d 处调用,零覆盖\n", g.nodeID, g.callers)
+			}
+		}
+	}
 
 	// 活跃任务态。
 	if len(e.rt.wips) > 0 {
