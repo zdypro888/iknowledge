@@ -32,8 +32,8 @@ func toolDefs(role string) []any {
 
 var toolOrder = []string{
 	"kb_init", "kb_status", "kb_map", "kb_recall", "kb_remember", "kb_record_change",
-	"kb_verify", "kb_task", "kb_investigate", "kb_submit_findings", "kb_adopt",
-	"kb_flow", "kb_maintain",
+	"kb_verify", "kb_revert", "kb_task", "kb_investigate", "kb_submit_findings", "kb_adopt",
+	"kb_flow", "kb_maintain", "kb_session",
 }
 
 func obj(props map[string]any, required ...string) map[string]any {
@@ -201,6 +201,21 @@ var allTools = map[string]any{
 			"id":          str("complete/dismiss 必填:欠账 ID"),
 			"scope":       str("next 可选:路径前缀,只取本任务相关的债"),
 			"era_summary": str("era-compress 债完成时提交的时代摘要文本"),
+		}, "action"),
+	},
+	"kb_revert": map[string]any{
+		"name":        "kb_revert",
+		"description": "撤销一条全错的 record_change/verify(误 refute 级联、错误 overturns)。撤销是追加一条记录(不删历史),反向恢复被它设的 RefutedBy/RetiredBy。正常迭代别用它——用 record_change 的 overturned 机制。",
+		"inputSchema": obj(map[string]any{
+			"change": str("被撤销的 change ID(kb_recall mode=history 取)"),
+			"reason": str("撤销理由(必填,留痕可追溯)"),
+		}, "change", "reason"),
+	},
+	"kb_session": map[string]any{
+		"name":        "kb_session",
+		"description": "本会话摘要:聚合本次 session 写入了多少知识(remember/record_change/verify 等),任务结束前看一眼确认沉淀完整。零存储成本(查 usage log)。",
+		"inputSchema": obj(map[string]any{
+			"action": map[string]any{"type": "string", "enum": []string{"summary"}, "description": "summary:本会话读写统计"},
 		}, "action"),
 	},
 }

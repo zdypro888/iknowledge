@@ -211,6 +211,12 @@ func (e *Engine) computeDebtsLocked() []Debt {
 			}
 		}
 	}
+	// ⑤ 跨节点疑似重复(R29 批次4):dup-entries 只比同节点内;不同节点写了语义
+	// 相同的条目(如 login.go#Login 和 auth_handler.go#PostLogin 各写一条"密码明文传")
+	// 永远不被标重复,双双注入撑爆 context。这里跨节点两两 bigram,scope 限界,
+	// 上限 5 条(成本维度:entry 级 O(n²) 但数量级是百级,可控)。
+	crossDups := e.crossNodeDupCandidates()
+	debts = append(debts, crossDups...)
 	if len(dismissed) > 0 {
 		kept := debts[:0]
 		for _, d := range debts {
@@ -354,4 +360,42 @@ func (e *Engine) Maintain(a MaintainArgs, sid, author string) (string, error) {
 		return e.patrolBriefLocked(a.Scope), nil
 	}
 	return "", kbErr("INVALID_ARGUMENT", "非法 action "+a.Action, "action ∈ next|complete|dismiss|patrol")
+}
+
+// crossNodeDupCandidates 扫描跨节点疑似重复条目(R29 批次4)。dup-entries 只比同节点内;
+// 这里收集所有节点的活跃条目做跨节点两两 bigram——语义相同的条目散落不同节点(典型:
+// login.go#Login 和 auth_handler.go#PostLogin 各写一条"密码明文传")不会被同节点检查发现。
+// 上限 5 条(限额哲学);pairwise O(n²) 但活跃条目数量级是百级,可控。
+// 前提:已持 rt.mu(读 ix.Nodes)。
+func (e *Engine) crossNodeDupCandidates() []Debt {
+	type entryRef struct {
+		nodeID string
+		entry  *model.Entry
+	}
+	var all []entryRef
+	for id, ref := range e.rt.ix.Nodes() {
+		for i := range ref.Node.Entries {
+			if ref.Node.Entries[i].Active() {
+				all = append(all, entryRef{nodeID: id, entry: &ref.Node.Entries[i]})
+			}
+		}
+	}
+	var debts []Debt
+	for i := 0; i < len(all) && len(debts) < 5; i++ {
+		for j := i + 1; j < len(all) && len(debts) < 5; j++ {
+			if all[i].nodeID == all[j].nodeID {
+				continue // 同节点内的 dup 由 dup-entries 处理
+			}
+			if BigramJaccard(all[i].entry.Text, all[j].entry.Text) > 0.8 {
+				fromRef := all[i].nodeID + "#" + all[i].entry.ID
+				toRef := all[j].nodeID + "#" + all[j].entry.ID
+				debts = append(debts, Debt{
+					ID: debtID("xdup:"+fromRef+":"+toRef, all[i].nodeID), Kind: "cross-dup", Node: all[i].nodeID,
+					Desc: fromRef + " 与 " + toRef + " 跨节点疑似重复(相似度>0.8)",
+					Hint: "读两条内容:若确为重复,用 kb_remember 合并文本 + supersedes,或提炼为 kb_flow 共享约定;非重复则 dismiss",
+				})
+			}
+		}
+	}
+	return debts
 }

@@ -957,3 +957,123 @@ func gitHead(repo string) string {
 	}
 	return head[:min(12, len(head))]
 }
+
+// ---- kb_revert(R29 批次4:撤销 record_change/verify 的"全错"记录) ----
+
+// RevertArgs 是 kb_revert 入参。
+type RevertArgs struct {
+	Change string `json:"change"` // 被撤销的 change ID(必填)
+	Reason string `json:"reason"` // 撤销理由(必填:留痕,后续可追溯为什么撤)
+}
+
+// Revert 撤销一条 change。撤销本身是追加一条带 Reverts 字段的 Change(追加式不变量不破),
+// 并反向应用被撤销 change 的副作用:
+//   - 被撤销的是 record_change 带 overturns:清除该 overturns 链(被推翻的决策恢复)
+//   - 被撤销的是 verify(refute):恢复被 refute 级联的 entry(清 RefutedBy)
+//   - 被撤销的是 verify(confirm/obsolete):恢复 confidence/status
+//
+// 只能撤销最近一条针对同一目标的记录(已被后续 change 再次修改的不可逆撤)。
+// 不碰源码(铁律二),只改 .knowledge/。
+func (e *Engine) Revert(a RevertArgs, sid, author string) (string, error) {
+	if strings.TrimSpace(a.Change) == "" {
+		return "", kbErr("INVALID_PARAMS", "缺 change(被撤销的记录 ID)", "用 kb_recall mode=history 取 change ID")
+	}
+	if strings.TrimSpace(a.Reason) == "" {
+		return "", kbErr("INVALID_PARAMS", "缺 reason(撤销理由必填,留痕)", "说明为什么这条记录全错")
+	}
+	if err := e.Sync(); err != nil {
+		return "", err
+	}
+	e.rt.mu.Lock()
+	defer e.rt.mu.Unlock()
+	if err := e.reloadLocked(); err != nil {
+		return "", err
+	}
+
+	// 找被撤销的 change。
+	var target *model.Change
+	for i := range e.rt.ix.Changes() {
+		c := e.rt.ix.Changes()[i]
+		if c.ID == a.Change {
+			target = &c
+			break
+		}
+	}
+	if target == nil {
+		return "", kbErr("NODE_NOT_FOUND", "change "+a.Change+" 不存在", "kb_recall mode=history 确认 ID")
+	}
+	// 不可重复撤销:已有 revert 指向它。
+	for _, c := range e.rt.ix.Changes() {
+		if c.Reverts == a.Change {
+			return "", kbErr("ALREADY_REVERTED", "change "+a.Change+" 已被 "+c.ID+" 撤销", "一条记录只能撤一次")
+		}
+	}
+
+	// 反向应用副作用:遍历 target 涉及的节点,清理被它设的 SupersededBy/RefutedBy。
+	// 这是机械反推:target 的 overturns/refute 级联设的字段,清掉即恢复。
+	restored := 0
+	touched := map[string]*store.Shard{}
+	shardOf := func(rel string) *store.Shard {
+		if touched[rel] == nil {
+			if cs := e.rt.cache.Shards()[rel]; cs != nil {
+				touched[rel] = cs.Shard
+			}
+		}
+		return touched[rel]
+	}
+	for _, nodeID := range target.Nodes {
+		ref := e.rt.ix.Node(nodeID)
+		if ref == nil {
+			continue
+		}
+		n := ref.Node
+		changed := false
+		for i := range n.Entries {
+			en := &n.Entries[i]
+			// refute 级联:被 target 标 RefutedBy 的恢复(清字段,重新 Active)。
+			if en.RefutedBy == target.ID {
+				en.RefutedBy = ""
+				restored++
+				changed = true
+			}
+			// obsolete:被 target 标 RetiredBy 的恢复。
+			if en.RetiredBy == target.ID {
+				en.RetiredBy = ""
+				restored++
+				changed = true
+			}
+		}
+		if changed {
+			shardOf(ref.ShardRel)
+		}
+	}
+	// 追加撤销记录(Reverts 指向被撤销的,Why 记理由)。
+	chID := model.NewChangeID(e.now())
+	ids := map[string]bool{}
+	for _, c := range e.rt.ix.Changes() {
+		ids[c.ID] = true
+	}
+	for ids[chID] {
+		chID = model.NewChangeID(e.now())
+	}
+	revertChange := model.Change{
+		ID: chID, Nodes: target.Nodes, At: e.now().UTC(),
+		What: "撤销 " + target.ID, Why: a.Reason,
+		Reverts: target.ID, Author: author,
+		Commit: gitHead(e.Store.RepoRoot()),
+	}
+	if err := e.Store.AppendChange(revertChange); err != nil {
+		return "", err
+	}
+	// 落盘恢复的 entries。
+	for rel, sh := range touched {
+		if sh == nil {
+			continue
+		}
+		path := filepath.Join(e.Store.Dir(), filepath.FromSlash(rel))
+		if err := e.Store.SaveShard(path, sh, e.rt.cache.Shards()[rel].Raw); err != nil {
+			e.warnOpsLocked("revert 落盘失败(下次重试):" + err.Error())
+		}
+	}
+	return fmt.Sprintf("ack:已撤销 %s(恢复 %d 条条目)。撤销记录 %s 已追加(journal 可追溯理由)。", target.ID, restored, chID), nil
+}

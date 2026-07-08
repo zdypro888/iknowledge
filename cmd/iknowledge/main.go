@@ -14,6 +14,7 @@ import (
 	"os/signal"
 	"runtime"
 	"runtime/debug"
+	"strings"
 	"syscall"
 	"time"
 
@@ -33,6 +34,8 @@ const usage = `iknowledge——AI 代码知识库(MCP 服务)
   iknowledge maintain --repo <path>                            打印维护欠账清单(只读;取用/销账走 MCP kb_maintain)
   iknowledge setup  --repo <path>                              打印接入三件套(.mcp.json/纪律段/hook),只打印不代写
   iknowledge hook   [--repo <path>]                            宿主 hook 桥(Claude Code PostToolUse):注入所触文件的知识
+  iknowledge export  --repo <path> [-o file.kbundle]           导出知识为 .kbundle(tar.gz;备份/迁移;缺省输出 stdout)
+  iknowledge import  --repo <path> -i file.kbundle [--remap from=to]  导入 .kbundle(跨仓迁移用 --remap 重映射路径前缀)
   iknowledge version                                           版本自报(排障:确认在跑哪个构建)
 `
 
@@ -58,6 +61,10 @@ func run(args []string) int {
 		return runMaintain(args[1:], os.Stdout)
 	case "setup":
 		return runSetup(args[1:], os.Stdout)
+	case "export":
+		return runExport(args[1:])
+	case "import":
+		return runImport(args[1:])
 	case "hook":
 		return runHook(args[1:], os.Stdin, os.Stdout)
 	case "version", "-v", "--version":
@@ -336,6 +343,97 @@ func runMaintain(args []string, w io.Writer) int {
 	for _, d := range debts {
 		fmt.Fprintf(w, "- %s [%s] %s\n  %s\n", d.ID, d.Kind, d.Node, d.Desc)
 	}
+	return 0
+}
+
+// runExport(R29 批次4):导出 .knowledge/ 为 .kbundle(tar.gz)。
+// 用法:iknowledge export --repo <path> -o backup.kbundle
+func runExport(args []string) int {
+	fs := flag.NewFlagSet("export", flag.ContinueOnError)
+	repo := fs.String("repo", ".", "仓库路径")
+	out := fs.String("o", "", "输出文件(缺省 stdout)")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	s, err := store.Open(*repo)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "错误:", err)
+		return 1
+	}
+	if !s.Initialized() {
+		fmt.Fprintln(os.Stderr, "错误: 库未初始化")
+		return 1
+	}
+	e := engine.New(s)
+	if err := e.EnsureRuntime(); err != nil {
+		fmt.Fprintln(os.Stderr, "错误:", err)
+		return 1
+	}
+	var w io.Writer = os.Stdout
+	if *out != "" {
+		f, err := os.Create(*out)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "错误:", err)
+			return 1
+		}
+		defer f.Close()
+		w = f
+	}
+	if err := e.Export(w); err != nil {
+		fmt.Fprintln(os.Stderr, "错误:", err)
+		return 1
+	}
+	fmt.Fprintf(os.Stderr, "导出完成 → %s\n", outDesc(*out))
+	return 0
+}
+
+func outDesc(path string) string {
+	if path == "" {
+		return "stdout"
+	}
+	return path
+}
+
+// runImport(R29 批次4):从 .kbundle(tar.gz)导入知识到目标仓。
+// 用法:iknowledge import --repo <path> -i backup.kbundle [--remap internal/auth/=pkg/auth/]
+func runImport(args []string) int {
+	fs := flag.NewFlagSet("import", flag.ContinueOnError)
+	repo := fs.String("repo", ".", "目标仓库路径")
+	in := fs.String("i", "", "输入文件(缺省 stdin)")
+	remapStr := fs.String("remap", "", "路径前缀重映射(跨仓迁移,格式 from=to,可重复用逗号或多次)")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	s, err := store.Open(*repo)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "错误:", err)
+		return 1
+	}
+	remap := map[string]string{}
+	if *remapStr != "" {
+		for _, pair := range strings.Split(*remapStr, ",") {
+			if from, to, ok := strings.Cut(pair, "="); ok {
+				remap[strings.TrimSpace(from)] = strings.TrimSpace(to)
+			}
+		}
+	}
+	var r io.Reader = os.Stdin
+	if *in != "" {
+		f, err := os.Open(*in)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "错误:", err)
+			return 1
+		}
+		defer f.Close()
+		r = f
+	}
+	e := engine.New(s)
+	count, err := e.Import(r, remap)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "错误:", err)
+		return 1
+	}
+	fmt.Fprintf(os.Stderr, "导入完成:%d 个文件已写入 %s/.knowledge/(重启 serve 生效)\n", count, s.RepoRoot())
 	return 0
 }
 

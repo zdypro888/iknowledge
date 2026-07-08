@@ -385,6 +385,14 @@ func (s *Server) dispatch(name string, args json.RawMessage, sid string) (string
 		text, err := s.E.Adopt(a, sid, author)
 		return text, meta, err
 
+	case "kb_revert":
+		var a engine.RevertArgs
+		if err := un(&a); err != nil {
+			return "", meta, kbInvalid(err)
+		}
+		text, err := s.E.Revert(a, sid, author)
+		return text, meta, err
+
 	case "kb_task":
 		var a engine.TaskArgs
 		if err := un(&a); err != nil {
@@ -399,6 +407,10 @@ func (s *Server) dispatch(name string, args json.RawMessage, sid string) (string
 			return "", meta, kbInvalid(err)
 		}
 		text, err := s.E.Flow(a, sid, author)
+		return text, meta, err
+
+	case "kb_session":
+		text, err := s.E.SessionSummary(sid)
 		return text, meta, err
 
 	case "kb_maintain":

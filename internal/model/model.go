@@ -152,6 +152,10 @@ type Change struct {
 	Rejected  []Rejected `json:"rejected,omitempty"`
 	Overturns string     `json:"overturns,omitempty"` // 决策链:被推翻的 change ID
 	Rebuttal  string     `json:"rebuttal,omitempty"`  // Overturns 非空时必填(engine 校验)
+	// Reverts(R29 批次4):kb_revert 撤销记录——指向被撤销的 change ID。撤销本身是
+	// 追加的 Change(追加式不变量不破):反向应用被撤销 change 的副作用(恢复被 supersede
+	// 的 entry、回滚 verify 级联)。用于撤销"全错"的记录(误 refute 级联、错误 overturns)。
+	Reverts string `json:"reverts,omitempty"`
 	// Remaps 重构申报(knowledge.md §12.6 第 2 层):拆分/合并机器猜不了,谁重构谁申报。
 	Remaps   []Remap `json:"remaps,omitempty"`
 	Verified string  `json:"verified,omitempty"`

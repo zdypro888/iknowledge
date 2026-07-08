@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/zdypro888/iknowledge/internal/index"
 	"github.com/zdypro888/iknowledge/internal/model"
@@ -599,6 +600,92 @@ func (e *Engine) resolveQueryLocked(query string) (string, []string) {
 	return "", nil
 }
 
+// SessionSummary 聚合"本会话学到了什么"(R29 批次4):按 session 过滤 usage log,
+// 统计写工具调用次数。零存储成本(usage log 已有 session 字段)。
+func (e *Engine) SessionSummary(sid string) (string, error) {
+	if sid == "" {
+		return "无会话 ID(匿名连接),无摘要。", nil
+	}
+	recs, err := e.Store.LoadUsage()
+	if err != nil {
+		return "", err
+	}
+	writeTools := map[string]bool{
+		"kb_remember": true, "kb_record_change": true, "kb_verify": true,
+		"kb_revert": true, "kb_adopt": true, "kb_flow": true, "kb_maintain": true,
+	}
+	var reads, writes int
+	writeByTool := map[string]int{}
+	for _, r := range recs {
+		if r.Session != sid {
+			continue
+		}
+		if writeTools[r.Tool] {
+			writes++
+			if r.OK {
+				writeByTool[r.Tool]++
+			}
+		} else {
+			reads++
+		}
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "会话 %s 摘要:\n", sid)
+	fmt.Fprintf(&b, "  读取 %d 次(recall/map/inject),写入 %d 次。\n", reads, writes)
+	if writes == 0 {
+		b.WriteString("  本会话未沉淀任何知识。\n")
+	} else {
+		b.WriteString("  写入明细(成功次数):\n")
+		for _, tool := range []string{"kb_remember", "kb_record_change", "kb_verify", "kb_revert", "kb_adopt", "kb_flow", "kb_maintain"} {
+			if n := writeByTool[tool]; n > 0 {
+				fmt.Fprintf(&b, "    %s: %d\n", tool, n)
+			}
+		}
+		b.WriteString("  任务结束时:确认已记账的变更(kb_record_change),沉淀难懂的知识(kb_remember)。\n")
+	}
+	return strings.TrimRight(b.String(), "\n"), nil
+}
+
+// rankEntry 给活跃 entry 一个排序键:verified 优先 > inferred > suspect;
+// 同级按 ConfirmedAt/At 倒序(最近确认的先存活过 token 预算)。R29 批次4 注入排序。
+func rankEntry(e *model.Entry) (confidenceRank int, recent time.Time) {
+	switch e.Confidence {
+	case model.ConfidenceVerified:
+		confidenceRank = 0
+	case model.ConfidenceInferred:
+		confidenceRank = 1
+	case model.ConfidenceSuspect:
+		confidenceRank = 2
+	default: // derived 等
+		confidenceRank = 3
+	}
+	recent = e.ConfirmedAt
+	if e.At.After(recent) {
+		recent = e.At
+	}
+	return
+}
+
+// activeEntriesSorted 返回按重要性排序的活跃 entry 指针切片(不改原存储顺序)。
+// R29 批次4:recall/inject 渲染前排序,让 verified + 近期确认的活过 token 预算截断。
+func activeEntriesSorted(n *model.Node) []*model.Entry {
+	var out []*model.Entry
+	for i := range n.Entries {
+		if n.Entries[i].Active() {
+			out = append(out, &n.Entries[i])
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		ci, ri := rankEntry(out[i])
+		cj, rj := rankEntry(out[j])
+		if ci != cj {
+			return ci < cj
+		}
+		return ri.After(rj) // 近期在前
+	})
+	return out
+}
+
 // recallNodeLocked 命中节点:读取时对账 → 台账/警报 → 按模式渲染。
 func (e *Engine) recallNodeLocked(nodeID string, a RecallArgs, sid string) (string, ReadMeta, error) {
 	ref := e.rt.ix.Node(nodeID)
@@ -667,12 +754,9 @@ func (e *Engine) recallNodeLocked(nodeID string, a RecallArgs, sid string) (stri
 	}
 
 	// 条目(superseded/refuted/retired 不出现,impl §7.3)。
+	// R29 批次4:按重要性排序——verified + 近期确认的在前,活过 token 预算截断。
 	anchorless := n.Anchor.Hash == "" && !n.PendingAnchor
-	for i := range n.Entries {
-		en := &n.Entries[i]
-		if !en.Active() {
-			continue
-		}
+	for _, en := range activeEntriesSorted(n) {
 		fmt.Fprintf(&b, "[%s|%s] %s(id %s", en.Kind, en.Confidence, en.Text, en.ID)
 		if en.Author != "" {
 			fmt.Fprintf(&b, ",author %s", en.Author)
@@ -1202,11 +1286,9 @@ func (e *Engine) Inject(file, sid, tool string) (string, error) {
 		}
 		_, symbol := model.SplitNodeID(id)
 		fmt.Fprintf(&b, "#%s(%s)\n", symbol, ref.Node.Status)
-		for i := range ref.Node.Entries {
-			en := &ref.Node.Entries[i]
-			if en.Active() {
-				fmt.Fprintf(&b, "  [%s|%s] %s\n", en.Kind, en.Confidence, en.Text)
-			}
+		// R29 批次4:按重要性排序注入(verified 优先活过 token 预算)。
+		for _, en := range activeEntriesSorted(ref.Node) {
+			fmt.Fprintf(&b, "  [%s|%s] %s\n", en.Kind, en.Confidence, en.Text)
 		}
 		if flows := e.rt.ix.FlowsOf(id); len(flows) > 0 {
 			fmt.Fprintf(&b, "  流程: %s\n", strings.Join(flows, ", "))

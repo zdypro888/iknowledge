@@ -191,11 +191,11 @@ func TestToolVisibilityByEndpoint(t *testing.T) {
 		return names
 	}
 	mainTools := list(ts.URL + "/mcp/main")
-	if len(mainTools) != 13 {
-		t.Errorf("main 端点应 13 个工具,got %d: %v", len(mainTools), mainTools)
+	if len(mainTools) != 15 { // R29 批次4:+kb_revert +kb_session
+		t.Errorf("main 端点应 15 个工具,got %d: %v", len(mainTools), mainTools)
 	}
 	scoutTools := list(ts.URL + "/mcp/scout/job_x")
-	for _, banned := range []string{"kb_investigate", "kb_record_change", "kb_init", "kb_adopt", "kb_verify", "kb_maintain", "kb_status"} {
+	for _, banned := range []string{"kb_investigate", "kb_record_change", "kb_init", "kb_adopt", "kb_verify", "kb_revert", "kb_maintain", "kb_status", "kb_session"} {
 		if scoutTools[banned] {
 			t.Errorf("scout 端点不应可见 %s(防套娃/侦察兵不改码)", banned)
 		}
