@@ -43,6 +43,27 @@ func (s *Store) Initialized() bool {
 	return err == nil
 }
 
+// WriteKnowledgeFile 原子写 .knowledge/ 内的相对路径。用于导入等跨分片写入:
+// 仍然复用 store 的 temp+fsync+rename 写入纪律,且拒绝路径逃逸。
+func (s *Store) WriteKnowledgeFile(rel string, data []byte) error {
+	rel = filepath.ToSlash(rel)
+	cleanRel := filepath.ToSlash(filepath.Clean(filepath.FromSlash(rel)))
+	if rel == "" || rel != cleanRel || rel == "." || strings.HasPrefix(rel, "/") ||
+		strings.HasPrefix(rel, "../") || strings.Contains(rel, "\\") || strings.Contains(rel, ":") {
+		return fmt.Errorf("store: 非法 knowledge 路径 %q", rel)
+	}
+	target := filepath.Join(s.dir, filepath.FromSlash(rel))
+	cleanDir := filepath.Clean(s.dir)
+	cleanTarget := filepath.Clean(target)
+	if cleanTarget != cleanDir && !strings.HasPrefix(cleanTarget, cleanDir+string(filepath.Separator)) {
+		return fmt.Errorf("store: knowledge 路径逃逸 %q", rel)
+	}
+	if err := os.MkdirAll(filepath.Dir(cleanTarget), 0o755); err != nil {
+		return fmt.Errorf("store: 建目录 %s: %w", filepath.Dir(cleanTarget), err)
+	}
+	return atomicWrite(cleanTarget, data)
+}
+
 // EnsureLayout 幂等创建目录布局(knowledge.md §11.4):
 // tree/、journal/、wip/、local/、flows/、topics/(后三类一期只建目录不实现逻辑)。
 func (s *Store) EnsureLayout() error {

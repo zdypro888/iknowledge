@@ -47,7 +47,7 @@ The three snippets printed by `setup` go into three files of the target repo:
 
 | Where | What | Why |
 |---|---|---|
-| `.mcp.json` | MCP stdio bridge (`command: iknowledge stdio`) | The agent sees the 13 `kb_*` tools; the bridge auto-starts the background serve on demand — zero service management (required) |
+| `.mcp.json` | MCP stdio bridge (`command: iknowledge stdio`) | The agent sees the 16 `kb_*` tools; the bridge auto-starts the background serve on demand — zero service management (required) |
 | `CLAUDE.md` | Discipline prompt | The working rules for the AI: query before locating, record after changing, distill what was hard-won (required) |
 | `.claude/settings.json` | Hook snippet | Every time the AI Reads/Edits a file, that file's knowledge + staleness alerts are injected into context automatically (recommended) |
 
@@ -98,7 +98,9 @@ You only occasionally need:
 
 ```bash
 iknowledge status --repo .     # coverage / freshness / maintenance debts + hotspot digestion list (git churn × cross-file fan-in)
-iknowledge maintain --repo .   # read-only debt listing (repayment goes through kb_maintain, done by the AI)
+iknowledge doctor --repo . --deploy   # init/config/parser/deploy self-check; also flags accidental serve processes
+iknowledge maintain --repo . --plan   # read-only debt roadmap (repayment goes through kb_maintain, done by the AI)
+iknowledge import --repo . -i backup.kbundle --dry-run --backup   # preview/backup before bundle migration
 git add .knowledge && git commit   # knowledge ships with the code: team-shared, branch-aware
 iknowledge init --repo . --reanchor-all   # bulk re-anchor after a global change (e.g. repo-wide gofmt)
 ```
@@ -107,18 +109,21 @@ A screen full of `undigested` right after init is **by design**: skeleton first,
 
 You never manage the server: the stdio bridge auto-starts the background serve on demand (the first session after a reboot brings it back). And even if everything is down, the AI just works normally and the hook stays silently inert.
 
-## The 13 tools at a glance
+## The 16 tools at a glance
 
 | Kind | Tool | One-liner |
 |---|---|---|
 | Query | `kb_map` | Pyramid navigation: what lives where, coverage |
 | Query | `kb_recall` | Knowledge / history / call relations and interface↔implementation (method-set matching) by keyword or node; hits auto-expand one hop along the call graph, flows & implementations; skeleton/suspect nodes get the commit trail attached |
+| Query | `kb_diagnose` | Symptom/error → likely code locations, pitfalls, troubleshooting flows, and rejected-history context |
 | Write | `kb_remember` | Distill experience (usage/pitfall/contract/summary…); supports declaring contradictions (disputes) for adjudication |
 | Write | `kb_record_change` | The change ledger: what / why / what was rejected (one logical change = one record) |
 | Write | `kb_verify` | confirm (upgrade confidence — evidence required, logged) / refute (with evidence; cascades to derived knowledge) / obsolete (graceful retirement) |
+| Write | `kb_revert` | Append-only undo for an entirely wrong record_change / verify record |
 | Write | `kb_adopt` | Claim orphaned knowledge (symbol moved) or bury it (archive) |
 | State | `kb_task` | Work-in-progress ledger: start/update/complete, with end-of-task repayment & distillation reminders |
 | State | `kb_flow` | Cross-file flow/topic nodes (login flow, payment chain…) |
+| State | `kb_session` | Current-session summary and end-of-task gate for missing distillation / accounting risks |
 | Scout | `kb_investigate` | Dispatch a disposable scout to locate things repo-wide; only conclusions come back — the main context stays clean |
 | Scout | `kb_submit_findings` | The scout's report-back exit |
 | Maint | `kb_status` | Library health: coverage / suspects / orphans / debts / hotspot list |
@@ -152,7 +157,7 @@ Do the per-project sentence first, then the machine-level script (reversed order
 
 ## Status
 
-Phase 1 fully delivered and continuously hardened: 13 MCP tools + the `/mcp/main` and `/mcp/scout` endpoints + `GET /inject` and the read-only legs (`/recall` `/map` `/status`) + the `iknowledge hook/setup/maintain` suite, fixed through multiple adversarial reviews and a third-party full-repo audit. On 2026-07-04 the originally-deferred phase 2/3/4 items landed: full-repo call graph & structural search expansion, hotspot digestion list, dispute registration, review reminders for non-code knowledge, `--auth`, multi-repo single daemon, Windows support (CI green on all three OSes), and the PTY self-dispatch scout fallback. **Both clients field-tested** (Claude Code + Codex, including instructions semantics). **M1.4 A/B acceptance passed**: 10 fixed code-location tasks, knowledge-base-connected (19 % seeded coverage) vs bare grep, same model — median tokens down 41 % (59 % ≤ the 60 % threshold), cheaper on 8/10 tasks, faster wall-clock; protocol, harness (`cmd/kbeval`) and both rounds of raw data live in [eval/m14/](eval/m14/).
+Phase 1 fully delivered and continuously hardened: now 16 MCP tools + the `/mcp/main` and `/mcp/scout` endpoints + `GET /inject` and the read-only legs (`/recall` `/map` `/status`) + the `iknowledge hook/setup/maintain/doctor` suite, fixed through multiple adversarial reviews and a third-party full-repo audit. On 2026-07-04 the originally-deferred phase 2/3/4 items landed: full-repo call graph & structural search expansion, hotspot digestion list, dispute registration, review reminders for non-code knowledge, `--auth`, multi-repo single daemon, Windows support (CI green on all three OSes), and the PTY self-dispatch scout fallback. **Both clients field-tested** (Claude Code + Codex, including instructions semantics). **M1.4 A/B acceptance passed**: 10 fixed code-location tasks, knowledge-base-connected (19 % seeded coverage) vs bare grep, same model — median tokens down 41 % (59 % ≤ the 60 % threshold), cheaper on 8/10 tasks, faster wall-clock; protocol, harness (`cmd/kbeval`) and both rounds of raw data live in [eval/m14/](eval/m14/).
 
 - [`knowledge.md`](knowledge.md) — the concept design (the convergence of 20 design rounds: five dimensions, self-healing, economics, security, four thought-experiments) *(Chinese)*
 - [`knowledge-impl.md`](knowledge-impl.md) — the phase-1 engineering spec (package layout, data model, storage, full MCP API spec, milestones) *(Chinese)*

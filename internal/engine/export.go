@@ -2,10 +2,12 @@ package engine
 
 import (
 	"archive/tar"
+	"bytes"
 	"compress/gzip"
 	"fmt"
 	"io"
 	"os"
+	"path"
 	"path/filepath"
 	"strings"
 	"time"
@@ -64,58 +66,161 @@ func (e *Engine) Export(w io.Writer) error {
 	})
 }
 
+const maxImportEntryBytes = 16 << 20
+
+// ImportOptions 控制 .kbundle 导入。DryRun 只解析报告不写盘;Backup 在写入前把
+// 当前知识库导出到 .knowledge/local/import-backups/(仍遵守工具只写 .knowledge)。
+type ImportOptions struct {
+	PathRemap     map[string]string
+	DryRun        bool
+	Backup        bool
+	MaxEntryBytes int64
+}
+
+// ImportReport 是导入预演/执行报告。
+type ImportReport struct {
+	Scanned    int
+	Imported   int
+	Skipped    int
+	Bytes      int64
+	BackupPath string
+	Entries    []ImportEntry
+}
+
+type ImportEntry struct {
+	Name   string
+	Action string // import | skip
+	Reason string
+	Bytes  int64
+}
+
+func (r ImportReport) Text() string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "导入报告: scanned=%d importable=%d skipped=%d bytes=%d", r.Scanned, r.Imported, r.Skipped, r.Bytes)
+	if r.BackupPath != "" {
+		fmt.Fprintf(&b, "\n备份: %s", r.BackupPath)
+	}
+	shown := r.Entries
+	if len(shown) > 20 {
+		shown = shown[:20]
+	}
+	for _, ent := range shown {
+		if ent.Action == "import" {
+			fmt.Fprintf(&b, "\n  + %s (%d bytes)", ent.Name, ent.Bytes)
+		} else {
+			fmt.Fprintf(&b, "\n  - %s (%s)", ent.Name, ent.Reason)
+		}
+	}
+	if len(r.Entries) > len(shown) {
+		fmt.Fprintf(&b, "\n  ... 另有 %d 条", len(r.Entries)-len(shown))
+	}
+	return b.String()
+}
+
 // Import 从 r 读 tar.gz bundle,解包到目标 .knowledge/ 的 tree+journal+flows+topics。
 // pathRemap 可选:把 Node-ID 的路径前缀 from 映射到 to(跨仓迁移,如 "internal/auth/" → "pkg/auth/")。
 // 已存在的文件会被覆盖(导入是合并语义:同名 shard 后者覆盖前者)。
 // 不碰源码(铁律二),只写目标 .knowledge/。
 func (e *Engine) Import(r io.Reader, pathRemap map[string]string) (int, error) {
+	rep, err := e.ImportWithOptions(r, ImportOptions{PathRemap: pathRemap})
+	return rep.Imported, err
+}
+
+// ImportWithOptions 是报告化导入入口,供 CLI dry-run/backup 使用。
+func (e *Engine) ImportWithOptions(r io.Reader, opts ImportOptions) (ImportReport, error) {
+	var rep ImportReport
 	gz, err := gzip.NewReader(r)
 	if err != nil {
-		return 0, fmt.Errorf("解压失败(不是有效的 .kbundle?):%w", err)
+		return rep, fmt.Errorf("解压失败(不是有效的 .kbundle?):%w", err)
 	}
 	defer gz.Close()
+	limit := opts.MaxEntryBytes
+	if limit <= 0 {
+		limit = maxImportEntryBytes
+	}
+	if opts.Backup && !opts.DryRun {
+		var buf bytes.Buffer
+		if err := e.Export(&buf); err != nil {
+			return rep, fmt.Errorf("导入前备份失败:%w", err)
+		}
+		rel := "local/import-backups/import-" + e.now().UTC().Format("20060102T150405Z") + ".kbundle"
+		if err := e.Store.WriteKnowledgeFile(rel, buf.Bytes()); err != nil {
+			return rep, fmt.Errorf("写入导入前备份失败:%w", err)
+		}
+		rep.BackupPath = ".knowledge/" + rel
+	}
 	tr := tar.NewReader(gz)
-	dir := e.Store.Dir()
-	count := 0
 	for {
 		hdr, err := tr.Next()
 		if err == io.EOF {
 			break
 		}
 		if err != nil {
-			return count, err
+			return rep, err
 		}
+		rep.Scanned++
 		if hdr.Typeflag != tar.TypeReg {
+			rep.Skipped++
+			rep.Entries = append(rep.Entries, ImportEntry{Name: hdr.Name, Action: "skip", Reason: "非普通文件"})
 			continue
 		}
-		// 安全:只解包到 .knowledge/ 内,防路径穿越(tar slip)。
-		clean := filepath.Clean(hdr.Name)
-		if strings.HasPrefix(clean, "..") || filepath.IsAbs(hdr.Name) {
+		clean, ok := importableBundleEntry(hdr.Name)
+		if !ok {
+			rep.Skipped++
+			rep.Entries = append(rep.Entries, ImportEntry{Name: hdr.Name, Action: "skip", Reason: "不属于可导入知识路径"})
 			continue
 		}
-		target := filepath.Join(dir, filepath.FromSlash(clean))
-		// 再次确认 target 在 dir 内(双保险)。
-		if !strings.HasPrefix(filepath.Clean(target)+string(filepath.Separator), filepath.Clean(dir)+string(filepath.Separator)) &&
-			filepath.Clean(target) != filepath.Clean(dir) {
+		if hdr.Size > limit {
+			rep.Skipped++
+			rep.Entries = append(rep.Entries, ImportEntry{Name: clean, Action: "skip", Reason: fmt.Sprintf("单文件超过上限 %d bytes", limit), Bytes: hdr.Size})
 			continue
 		}
-		data, err := io.ReadAll(tr)
+		data, err := io.ReadAll(io.LimitReader(tr, limit+1))
 		if err != nil {
-			return count, err
+			return rep, err
+		}
+		if int64(len(data)) > limit {
+			return rep, fmt.Errorf("bundle 条目 %s 超过上限 %d bytes", clean, limit)
 		}
 		// 路径前缀重映射(tree shards 的 Node-ID 与文件名都要改)。
-		if len(pathRemap) > 0 && (strings.HasPrefix(clean, "tree/") || strings.HasPrefix(clean, "journal/")) {
-			data = remapBytes(data, pathRemap)
+		if len(opts.PathRemap) > 0 && (strings.HasPrefix(clean, "tree/") || strings.HasPrefix(clean, "journal/")) {
+			data = remapBytes(data, opts.PathRemap)
 		}
-		if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
-			return count, err
+		rep.Imported++
+		rep.Bytes += int64(len(data))
+		rep.Entries = append(rep.Entries, ImportEntry{Name: clean, Action: "import", Bytes: int64(len(data))})
+		if opts.DryRun {
+			continue
 		}
-		if err := os.WriteFile(target, data, 0o644); err != nil {
-			return count, err
+		if err := e.Store.WriteKnowledgeFile(clean, data); err != nil {
+			return rep, err
 		}
-		count++
 	}
-	return count, nil
+	return rep, nil
+}
+
+func importableBundleEntry(name string) (string, bool) {
+	clean := path.Clean(strings.TrimPrefix(name, "./"))
+	if clean == "." || strings.HasPrefix(clean, "../") || strings.HasPrefix(clean, "/") ||
+		strings.Contains(clean, "\\") || strings.Contains(clean, ":") {
+		return "", false
+	}
+	if clean == "MANIFEST.json" {
+		return "", false
+	}
+	if clean == "config.yaml" {
+		return clean, true
+	}
+	switch {
+	case strings.HasPrefix(clean, "tree/"):
+		return clean, strings.HasSuffix(clean, ".yaml")
+	case strings.HasPrefix(clean, "journal/"):
+		return clean, strings.HasSuffix(clean, ".jsonl")
+	case strings.HasPrefix(clean, "flows/"), strings.HasPrefix(clean, "topics/"):
+		return clean, strings.HasSuffix(clean, ".yaml") || strings.HasSuffix(clean, ".jsonl")
+	default:
+		return "", false
+	}
 }
 
 func writeTarFile(tw *tar.Writer, name string, data []byte) error {

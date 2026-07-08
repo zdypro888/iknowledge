@@ -63,3 +63,5 @@ go test -race ./...
 ③**雷区标记 + Inject 强警告 + kb_status 雷区 TOP5(轮30-C)**:index.Build 预计算 landmine 分(变更频次 + 推翻×2 + refute 数)。Inject 对 landmine≥3 的文件强警告"动手前必读否决理由"。kb_status 加雷区 TOP5(与热点 TOP5 语义不同:热点=常改该消化,雷区=易错该警惕)。
 
 回归:防撞(相似强警告/disputes 软化/不相似不误报)+ diagnose(pitfall 命中/rejected 上下文/无命中引导)+ 雷区(Inject 警告/Status TOP5/无信号不误报)共 9 测试通过。build/vet/-race 全套绿。零新依赖(go.mod 仍只 yaml.v3)。
+
+**轮 31(2026-07-09,运维与收尾闭环)**:把"下一步缺什么"做成可执行闭环而非口头建议。①新增 `iknowledge doctor` 仓库/部署自检:初始化、config、parser health、维护欠账、活跃 wip、PATH/常见部署软链、误留 `iknowledge serve` 进程提示;②导入升级为报告化 `ImportWithOptions`,CLI 支持 `import --dry-run --backup --max-entry-mb`,导入前备份写入 `.knowledge/local/import-backups/`,并限制单条 bundle 大小;③`kb_session` 增加 `gate` 质量门,任务收尾提示失败调用、读而未沉淀、多次读取未沉淀、suspect 使用风险与 record_change 义务;④`kb_recall`/`kb_diagnose` 输出命中解释(score/归一化来源/pitfall 命中数),降低 AI 误把弱相关当确定结论的风险;⑤`iknowledge maintain --plan` 输出按债种分组的维护路线。顺手修 import tar slip 后续问题:bundle 只允许 tree/journal/flows/topics/config,排除 local/wip/MANIFEST/路径逃逸,写入统一走 store 原子写。回归覆盖 dry-run/backup、parser health/doctor、session gate、导入路径限制。仍零新依赖,不改服务模式。

@@ -19,8 +19,8 @@ import (
 //   - keywordOverlap(investigate.go)匹配 Flow.Troubleshoot 字段;
 //   - ix.History 取命中节点的 rejected 方案(动手前必读的负知识)。
 type DiagnoseArgs struct {
-	Symptom string `json:"symptom"`           // 症状/报错描述(必填)
-	Limit   int    `json:"limit,omitempty"`   // 返回位置上限(缺省 8)
+	Symptom string `json:"symptom"`         // 症状/报错描述(必填)
+	Limit   int    `json:"limit,omitempty"` // 返回位置上限(缺省 8)
 }
 
 // Diagnose 按症状反向定位代码位置 + 附 pitfall/排障/否决方案上下文。
@@ -103,6 +103,7 @@ func (e *Engine) Diagnose(a DiagnoseArgs, sid string) (string, ReadMeta, error) 
 		if ref := e.rt.ix.Node(l.nodeID); ref != nil {
 			fmt.Fprintf(&b, " [%s]", ref.Node.Status)
 		}
+		fmt.Fprintf(&b, "\n     ↳ 命中解释:score=%d,pitfall=%d,其他条目命中=%d", l.score, len(l.pitfalls), l.other)
 		for _, p := range l.pitfalls {
 			fmt.Fprintf(&b, "\n     ⚠ pitfall: %s", shortText(p, 80))
 		}

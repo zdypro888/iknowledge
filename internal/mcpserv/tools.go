@@ -221,9 +221,9 @@ var allTools = map[string]any{
 	},
 	"kb_session": map[string]any{
 		"name":        "kb_session",
-		"description": "本会话摘要:聚合本次 session 写入了多少知识(remember/record_change/verify 等),任务结束前看一眼确认沉淀完整。零存储成本(查 usage log)。",
+		"description": "本会话摘要/质量门:summary 聚合读写统计;gate 在任务结束前检查失败调用、读而未沉淀、suspect 风险与 record_change 提醒。零存储成本(查 usage log + 活跃会话台账)。",
 		"inputSchema": obj(map[string]any{
-			"action": map[string]any{"type": "string", "enum": []string{"summary"}, "description": "summary:本会话读写统计"},
+			"action": map[string]any{"type": "string", "enum": []string{"summary", "gate"}, "description": "summary:本会话读写统计;gate:任务结束前质量门"},
 		}, "action"),
 	},
 }

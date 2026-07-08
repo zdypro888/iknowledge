@@ -443,7 +443,13 @@ func (s *Server) dispatch(name string, args json.RawMessage, sid string) (string
 		return text, meta, err
 
 	case "kb_session":
-		text, err := s.E.SessionSummary(sid)
+		var a struct {
+			Action string `json:"action"`
+		}
+		if err := un(&a); err != nil {
+			return "", meta, kbInvalid(err)
+		}
+		text, err := s.E.Session(sid, a.Action)
 		return text, meta, err
 
 	case "kb_maintain":

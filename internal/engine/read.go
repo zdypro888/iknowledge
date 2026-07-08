@@ -62,9 +62,9 @@ func (e *Engine) Status() (string, error) {
 	conflicts := 0
 	var orphanIDs []string
 	// R29-续:知识健康度统计(零新存储,运行时聚合)。
-	confCounts := map[string]int{}    // Confidence → 活跃条目数
-	var entryAges []time.Duration      // 活跃条目的年龄(距 At/ConfirmedAt 最近)
-	oldestSuspect := 0 * time.Second   // 最久的 suspect 节点年龄(积压可见度)
+	confCounts := map[string]int{}   // Confidence → 活跃条目数
+	var entryAges []time.Duration    // 活跃条目的年龄(距 At/ConfirmedAt 最近)
+	oldestSuspect := 0 * time.Second // 最久的 suspect 节点年龄(积压可见度)
 	oldestSuspectID := ""
 	suspectCount := 0
 	type fileDigest struct{ done, total int }
@@ -688,7 +688,8 @@ func (e *Engine) Recall(a RecallArgs, sid string) (string, ReadMeta, error) {
 		var ids []string
 		for _, h := range hits {
 			ref := e.rt.ix.Node(h.NodeID)
-			fmt.Fprintf(&b, "- %s %s\n", h.NodeID, nodeLine(ref.Node))
+			fmt.Fprintf(&b, "- %s %s\n  ↳ 命中解释:score=%d(精确 token 权重 2,trigram 近似权重 1)\n",
+				h.NodeID, nodeLine(ref.Node), h.Score)
 			ids = append(ids, h.NodeID)
 		}
 		// 结构扩展一跳(检索三级递进第 2 级,knowledge.md §10.2):
@@ -731,8 +732,16 @@ func (e *Engine) resolveQueryLocked(query string) (string, []string) {
 // SessionSummary 聚合"本会话学到了什么"(R29 批次4):按 session 过滤 usage log,
 // 统计写工具调用次数。零存储成本(usage log 已有 session 字段)。
 func (e *Engine) SessionSummary(sid string) (string, error) {
+	return e.Session(sid, "summary")
+}
+
+// Session 聚合会话质量信号。summary 给统计,gateway/gate 给任务结束前检查清单。
+func (e *Engine) Session(sid, action string) (string, error) {
 	if sid == "" {
 		return "无会话 ID(匿名连接),无摘要。", nil
+	}
+	if action == "" {
+		action = "summary"
 	}
 	recs, err := e.Store.LoadUsage()
 	if err != nil {
@@ -742,11 +751,15 @@ func (e *Engine) SessionSummary(sid string) (string, error) {
 		"kb_remember": true, "kb_record_change": true, "kb_verify": true,
 		"kb_revert": true, "kb_adopt": true, "kb_flow": true, "kb_maintain": true,
 	}
-	var reads, writes int
+	var reads, writes, failed int
 	writeByTool := map[string]int{}
+	readHits := map[string]int{}
 	for _, r := range recs {
 		if r.Session != sid {
 			continue
+		}
+		if !r.OK {
+			failed++
 		}
 		if writeTools[r.Tool] {
 			writes++
@@ -755,11 +768,44 @@ func (e *Engine) SessionSummary(sid string) (string, error) {
 			}
 		} else {
 			reads++
+			if r.Hit && r.HitStatus != "" {
+				readHits[r.HitStatus]++
+			}
 		}
 	}
 	var b strings.Builder
+	if action == "gate" || action == "gateway" {
+		fmt.Fprintf(&b, "会话 %s 质量门:\n", sid)
+		issues := 0
+		if failed > 0 {
+			issues++
+			fmt.Fprintf(&b, "  ! 有 %d 次失败工具调用:先确认失败是否已处理。\n", failed)
+		}
+		if reads > 0 && writes == 0 {
+			issues++
+			b.WriteString("  ! 本会话读过知识但没有任何写入:若读懂了代码上看不出的约定/坑,补 kb_remember;若改过代码,补 kb_record_change。\n")
+		}
+		if writeByTool["kb_record_change"] == 0 {
+			b.WriteString("  - 若本会话修改过源码,现在必须 kb_record_change；未改源码可忽略。\n")
+		}
+		if remind := e.settleReminder(sid); len(remind) > 0 {
+			issues++
+			fmt.Fprintf(&b, "  ! 多次读取但未沉淀: %s。费功夫才懂的内容补 kb_remember。\n", strings.Join(remind, "、"))
+		}
+		if readHits[string(model.StatusSuspect)] > 0 {
+			issues++
+			fmt.Fprintf(&b, "  ! 读到 %d 次 suspect 知识:使用前需重验,准确则 kb_verify confirm,不准则 refute/obsolete。\n", readHits[string(model.StatusSuspect)])
+		}
+		if issues == 0 {
+			b.WriteString("  ok:未发现明显收尾风险。仍需人工确认是否改过源码并已记账。\n")
+		}
+		return strings.TrimRight(b.String(), "\n"), nil
+	}
+	if action != "summary" {
+		return "", kbErr("INVALID_ARGUMENT", "非法 action "+action, "action ∈ summary|gate")
+	}
 	fmt.Fprintf(&b, "会话 %s 摘要:\n", sid)
-	fmt.Fprintf(&b, "  读取 %d 次(recall/map/inject),写入 %d 次。\n", reads, writes)
+	fmt.Fprintf(&b, "  读取 %d 次(recall/map/inject),写入 %d 次,失败 %d 次。\n", reads, writes, failed)
 	if writes == 0 {
 		b.WriteString("  本会话未沉淀任何知识。\n")
 	} else {
@@ -859,6 +905,11 @@ func (e *Engine) recallNodeLocked(nodeID string, a RecallArgs, sid string) (stri
 	}
 
 	fmt.Fprintf(&b, "节点: %s(%s,%s)\n", nodeID, n.Level, n.Status)
+	if strings.TrimSpace(a.Query) != "" && strings.TrimSpace(a.Query) != nodeID {
+		fmt.Fprintf(&b, "命中解释: query %q 归一到现任节点 %s(lineage/宽松符号匹配)\n", a.Query, nodeID)
+	} else {
+		b.WriteString("命中解释: 精确节点 ID 命中\n")
+	}
 	if auto.signature != "" {
 		fmt.Fprintf(&b, "签名: %s\n", auto.signature)
 	}

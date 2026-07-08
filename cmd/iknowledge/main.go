@@ -11,9 +11,12 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/exec"
 	"os/signal"
+	"path/filepath"
 	"runtime"
 	"runtime/debug"
+	"sort"
 	"strings"
 	"syscall"
 	"time"
@@ -31,11 +34,12 @@ const usage = `iknowledge——AI 代码知识库(MCP 服务)
   iknowledge serve  --repo <path> [--repo <path2> …] [--auth]  启动 MCP 服务;--repo 可重复(单进程多仓库);--auth 启用 token 鉴权
                     [--addr host:port]                         (仅单仓库)覆盖监听地址
   iknowledge status --repo <path> [--prompt]                   库状态;--prompt 打印纪律提示词
-  iknowledge maintain --repo <path>                            打印维护欠账清单(只读;取用/销账走 MCP kb_maintain)
+  iknowledge doctor --repo <path> [--deploy] [--strict]        自检:初始化/配置/parser/维护欠账/PATH 部署
+  iknowledge maintain --repo <path> [--plan]                   打印维护欠账清单/路线(只读;取用/销账走 MCP kb_maintain)
   iknowledge setup  --repo <path>                              打印接入三件套(.mcp.json/纪律段/hook),只打印不代写
   iknowledge hook   [--repo <path>]                            宿主 hook 桥(Claude Code PostToolUse):注入所触文件的知识
   iknowledge export  --repo <path> [-o file.kbundle]           导出知识为 .kbundle(tar.gz;备份/迁移;缺省输出 stdout)
-  iknowledge import  --repo <path> -i file.kbundle [--remap from=to]  导入 .kbundle(跨仓迁移用 --remap 重映射路径前缀)
+  iknowledge import  --repo <path> -i file.kbundle [--dry-run] [--backup] [--remap from=to]  导入 .kbundle(跨仓迁移用 --remap 重映射路径前缀)
   iknowledge version                                           版本自报(排障:确认在跑哪个构建)
 `
 
@@ -57,6 +61,8 @@ func run(args []string) int {
 		return runStdio(args[1:], os.Stdin, os.Stdout)
 	case "status":
 		return runStatus(args[1:])
+	case "doctor":
+		return runDoctor(args[1:], os.Stdout)
 	case "maintain":
 		return runMaintain(args[1:], os.Stdout)
 	case "setup":
@@ -209,12 +215,12 @@ func runServe(args []string) int {
 		// 那些路由 handler 内自带短超时;scout 路由显式解除 WriteDeadline(见 server.go)。
 		units = append(units, unit{s: s, ln: ln, listen: listen,
 			hs: &http.Server{
-				Handler:            srv.Handler(),
-				ReadHeaderTimeout:  10 * time.Second,
-				ReadTimeout:        30 * time.Second,
-				IdleTimeout:        120 * time.Second,
-				WriteTimeout:       0, // 见上:scout 长路由在 handler 层自管
-				MaxHeaderBytes:     1 << 20,
+				Handler:           srv.Handler(),
+				ReadHeaderTimeout: 10 * time.Second,
+				ReadTimeout:       30 * time.Second,
+				IdleTimeout:       120 * time.Second,
+				WriteTimeout:      0, // 见上:scout 长路由在 handler 层自管
+				MaxHeaderBytes:    1 << 20,
 			}})
 	}
 
@@ -306,12 +312,89 @@ func runStatus(args []string) int {
 	return 0
 }
 
+func runDoctor(args []string, w io.Writer) int {
+	fs := flag.NewFlagSet("doctor", flag.ContinueOnError)
+	repo := fs.String("repo", ".", "仓库路径")
+	deploy := fs.Bool("deploy", false, "检查当前 iknowledge 二进制与常见部署路径")
+	strict := fs.Bool("strict", false, "发现警告时返回非 0")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	s, err := store.Open(*repo)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "错误:", err)
+		return 1
+	}
+	rep, err := engine.New(s).Doctor()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "错误:", err)
+		return 1
+	}
+	fmt.Fprintln(w, rep.Text())
+	warnings := len(rep.Warnings)
+	if *deploy {
+		text, n := deployDoctorText()
+		if text != "" {
+			fmt.Fprintln(w, text)
+		}
+		warnings += n
+	}
+	if *strict && warnings > 0 {
+		return 1
+	}
+	return 0
+}
+
+func deployDoctorText() (string, int) {
+	var b strings.Builder
+	warnings := 0
+	b.WriteString("deploy:\n")
+	if p, err := exec.LookPath("iknowledge"); err == nil {
+		fmt.Fprintf(&b, "  PATH iknowledge: %s\n", p)
+		if real, err := filepath.EvalSymlinks(p); err == nil && real != p {
+			fmt.Fprintf(&b, "    -> %s\n", real)
+		}
+	} else {
+		warnings++
+		b.WriteString("  ⚠ PATH 中找不到 iknowledge\n")
+	}
+	home, _ := os.UserHomeDir()
+	paths := []string{"/opt/homebrew/bin/iknowledge", "/usr/local/bin/iknowledge"}
+	if home != "" {
+		paths = append([]string{filepath.Join(home, "go/bin/iknowledge"), filepath.Join(home, ".local/bin/iknowledge")}, paths...)
+	}
+	for _, p := range paths {
+		st, err := os.Lstat(p)
+		if err != nil {
+			continue
+		}
+		mode := "file"
+		if st.Mode()&os.ModeSymlink != 0 {
+			mode = "symlink"
+		}
+		fmt.Fprintf(&b, "  %s: %s", p, mode)
+		if real, err := filepath.EvalSymlinks(p); err == nil && real != p {
+			fmt.Fprintf(&b, " -> %s", real)
+		}
+		b.WriteString("\n")
+	}
+	if out, err := exec.Command("pgrep", "-fl", "iknowledge serve").Output(); err == nil && strings.TrimSpace(string(out)) != "" {
+		warnings++
+		b.WriteString("  ⚠ 检测到 iknowledge serve 进程(若客户端应自行拉起,不需要服务模式):\n")
+		for line := range strings.SplitSeq(strings.TrimSpace(string(out)), "\n") {
+			fmt.Fprintf(&b, "    %s\n", line)
+		}
+	}
+	return strings.TrimRight(b.String(), "\n"), warnings
+}
+
 // runMaintain 打印维护欠账清单(knowledge.md §12.7 的 CLI 侧只读落地):
 // 会话外看清欠了什么账;清账动作仍由 AI 会话经 kb_maintain 完成(需要语言能力)。
 func runMaintain(args []string, w io.Writer) int {
 	fs := flag.NewFlagSet("maintain", flag.ContinueOnError)
 	repo := fs.String("repo", ".", "仓库路径")
 	patrol := fs.Bool("patrol", false, "打印跨节点矛盾巡检简报(只读;裁决仍由 AI 会话经 kb_verify/kb_remember 完成)")
+	plan := fs.Bool("plan", false, "按欠账类型打印维护路线")
 	scope := fs.String("scope", "", "巡检范围(路径前缀,仅 -patrol 用)")
 	if err := fs.Parse(args); err != nil {
 		return 2
@@ -339,11 +422,43 @@ func runMaintain(args []string, w io.Writer) int {
 		fmt.Fprintln(w, "无维护欠账。")
 		return 0
 	}
+	if *plan {
+		fmt.Fprintln(w, renderMaintainPlan(debts))
+		return 0
+	}
 	fmt.Fprintf(w, "维护欠账 %d 条(清账走 MCP:kb_maintain next → 处理 → complete/dismiss):\n", len(debts))
 	for _, d := range debts {
 		fmt.Fprintf(w, "- %s [%s] %s\n  %s\n", d.ID, d.Kind, d.Node, d.Desc)
 	}
 	return 0
+}
+
+func renderMaintainPlan(debts []engine.Debt) string {
+	byKind := map[string]int{}
+	for _, d := range debts {
+		byKind[d.Kind]++
+	}
+	var kinds []string
+	for k := range byKind {
+		kinds = append(kinds, k)
+	}
+	sort.Strings(kinds)
+	var b strings.Builder
+	fmt.Fprintf(&b, "维护路线:共 %d 条欠账\n", len(debts))
+	for _, k := range kinds {
+		fmt.Fprintf(&b, "  - %s: %d\n", k, byKind[k])
+	}
+	b.WriteString("建议顺序:suspect-reverify → dispute-open/cross-dup/dup-entries → confidence-lag → summary-stale → era-compress/review-overdue\n")
+	limit := 8
+	if len(debts) < limit {
+		limit = len(debts)
+	}
+	b.WriteString("下一批:\n")
+	for i := 0; i < limit; i++ {
+		d := debts[i]
+		fmt.Fprintf(&b, "  %d. %s [%s] %s\n     %s\n", i+1, d.ID, d.Kind, d.Node, d.Desc)
+	}
+	return strings.TrimRight(b.String(), "\n")
 }
 
 // runExport(R29 批次4):导出 .knowledge/ 为 .kbundle(tar.gz)。
@@ -401,6 +516,9 @@ func runImport(args []string) int {
 	repo := fs.String("repo", ".", "目标仓库路径")
 	in := fs.String("i", "", "输入文件(缺省 stdin)")
 	remapStr := fs.String("remap", "", "路径前缀重映射(跨仓迁移,格式 from=to,可重复用逗号或多次)")
+	dryRun := fs.Bool("dry-run", false, "只解析 bundle 并打印将导入的文件,不写盘")
+	backup := fs.Bool("backup", false, "导入前备份当前知识库到 .knowledge/local/import-backups/")
+	maxEntryMB := fs.Int("max-entry-mb", 16, "单个 bundle 条目大小上限(MB)")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -427,13 +545,31 @@ func runImport(args []string) int {
 		defer f.Close()
 		r = f
 	}
+	if !*dryRun {
+		release, err := s.AcquireWriterLock()
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "错误:", err)
+			return 1
+		}
+		defer release()
+	}
 	e := engine.New(s)
-	count, err := e.Import(r, remap)
+	rep, err := e.ImportWithOptions(r, engine.ImportOptions{
+		PathRemap:     remap,
+		DryRun:        *dryRun,
+		Backup:        *backup,
+		MaxEntryBytes: int64(*maxEntryMB) << 20,
+	})
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "错误:", err)
 		return 1
 	}
-	fmt.Fprintf(os.Stderr, "导入完成:%d 个文件已写入 %s/.knowledge/(重启 serve 生效)\n", count, s.RepoRoot())
+	fmt.Fprintln(os.Stderr, rep.Text())
+	if *dryRun {
+		fmt.Fprintln(os.Stderr, "dry-run 完成:未写入任何文件。")
+	} else {
+		fmt.Fprintf(os.Stderr, "导入完成:%d 个文件已写入 %s/.knowledge/(重启 serve 生效)\n", rep.Imported, s.RepoRoot())
+	}
 	return 0
 }
 
