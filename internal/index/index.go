@@ -30,6 +30,7 @@ type Index struct {
 	nodes       map[string]*NodeRef
 	lineage     map[string][]string        // 旧节点 ID → 现任节点 ID(拆分可多个,#8)
 	inverted    map[string]map[string]bool // token → 节点 ID 集合
+	fileNodes   map[string][]string        // 文件路径 → 该文件的所有节点 ID(R29 批次3:文件域查询免扫全表)
 	basedOnRev  map[string][]string        // 归一化 "node#entry" → 依赖它的 "node#entry"
 	disputesRev map[string][]string        // 归一化 "node#entry" → 声明与它矛盾的 "node#entry"
 	flowsByNode map[string][]string        // 节点 ID → flow IDs(反向链接,现算不落盘)
@@ -46,6 +47,7 @@ func Build(shards map[string][]model.Node, changes []model.Change, flows []model
 		nodes:       map[string]*NodeRef{},
 		lineage:     map[string][]string{},
 		inverted:    map[string]map[string]bool{},
+		fileNodes:   map[string][]string{},
 		basedOnRev:  map[string][]string{},
 		disputesRev: map[string][]string{},
 		flowsByNode: map[string][]string{},
@@ -63,6 +65,10 @@ func Build(shards map[string][]model.Node, changes []model.Change, flows []model
 				continue
 			}
 			ix.nodes[n.ID] = &NodeRef{ShardRel: rel, Node: n}
+			// R29 批次3:file→nodes 索引(文件域查询免扫全表:Inject/LooseMatch/missProtocol)。
+			if file, _ := model.SplitNodeID(n.ID); file != "" {
+				ix.fileNodes[file] = append(ix.fileNodes[file], n.ID)
+			}
 			for _, oldID := range n.Lineage {
 				ix.lineage[oldID] = append(ix.lineage[oldID], n.ID)
 			}
@@ -150,6 +156,9 @@ func Build(shards map[string][]model.Node, changes []model.Change, flows []model
 
 // Node 取现任节点(仅精确 ID)。
 func (ix *Index) Node(id string) *NodeRef { return ix.nodes[id] }
+
+// FileNodes 返回某文件的所有节点 ID(R29 批次3:文件域查询免扫全表)。
+func (ix *Index) FileNodes(file string) []string { return ix.fileNodes[file] }
 
 // Nodes 返回全部节点表(只读用)。
 func (ix *Index) Nodes() map[string]*NodeRef { return ix.nodes }

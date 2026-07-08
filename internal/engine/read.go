@@ -208,6 +208,10 @@ func (e *Engine) Status() (string, error) {
 	for _, w := range e.rt.opsWarns {
 		fmt.Fprintf(&b, "⚠ %s\n", w)
 	}
+	// R29 批次3:config.yaml 解析失败不再静默吞——kb_status 显式提示。
+	if cerr := e.configError(); cerr != nil {
+		fmt.Fprintf(&b, "⚠ config.yaml 解析失败(用空配置运行,includes/excludes/extensions 可能失效):%v\n", cerr)
+	}
 	return strings.TrimRight(b.String(), "\n"), nil
 }
 
@@ -297,21 +301,47 @@ func (e *Engine) Map(pathArg string, depth int, sid string) (string, ReadMeta, e
 			"路径 "+pathArg+" 下没有任何节点", "用 kb_map 不带 path 看全景,或检查路径拼写(相对仓库根,正斜杠)")
 	}
 
-	coverage := func(prefix string) (dig, tot int) {
-		for id, ref := range e.rt.ix.Nodes() {
-			file, _ := model.SplitNodeID(id)
-			if prefix != "" && file != prefix && !strings.HasPrefix(file, prefix+"/") {
-				continue
-			}
-			if ref.Node.Level == model.LevelDir || ref.Node.Level == model.LevelProject {
-				continue
-			}
-			tot++
+	// R29 批次3:覆盖率单遍预计算。原先 coverage(prefix) 每目录遍历全索引 O(D×N),
+	// 几千节点仓库 kb_map 主成本。现一遍遍历所有节点,每个符号节点累加进它的各祖先目录。
+	type covEntry struct{ dig, tot int }
+	cov := map[string]*covEntry{} // dir → {dig, tot}
+	covOf := func(d string) *covEntry {
+		c := cov[d]
+		if c == nil {
+			c = &covEntry{}
+			cov[d] = c
+		}
+		return c
+	}
+	for id, ref := range e.rt.ix.Nodes() {
+		if ref.Node.Level == model.LevelDir || ref.Node.Level == model.LevelProject {
+			continue
+		}
+		file, _ := model.SplitNodeID(id)
+		// fileDir 取文件所在目录(internal/auth/login.go → internal/auth)。
+		dir := path.Dir(file)
+		if dir == "." || dir == "/" || dir == "" {
+			continue // 文件在根下,没有目录壳(极少)
+		}
+		c := covOf(dir)
+		c.tot++
+		if hasActiveEntries(ref.Node) {
+			c.dig++
+		}
+		// 上溯祖先目录也累加(父目录覆盖率含子树)。
+		for parent := path.Dir(dir); parent != "." && parent != "/" && parent != ""; parent = path.Dir(parent) {
+			pc := covOf(parent)
+			pc.tot++
 			if hasActiveEntries(ref.Node) {
-				dig++
+				pc.dig++
 			}
 		}
-		return
+	}
+	coverage := func(prefix string) (dig, tot int) {
+		if c := cov[prefix]; c != nil {
+			return c.dig, c.tot
+		}
+		return 0, 0
 	}
 
 	var b strings.Builder
@@ -606,7 +636,8 @@ func (e *Engine) recallNodeLocked(nodeID string, a RecallArgs, sid string) (stri
 	// 不违 #21(那是针对全库扫描不进锁)。
 	if file, _ := model.SplitNodeID(nodeID); file != "" && !strings.HasSuffix(file, "/") &&
 		nodeID != model.ProjectNodeID && (!hasActiveEntries(n) || n.Status == model.StatusSuspect || auto.stale) {
-		if trail := gitTrail(e.Store.RepoRoot(), []string{file}); trail != "" {
+		// R29 批次3:用缓存 git trail(60s TTL),消除读锁内稳态子进程。
+		if trail := e.cachedGitTrail(file); trail != "" {
 			b.WriteString("来时路(近期提交——「为什么长这样」的档案,深挖 git show/blame):\n")
 			b.WriteString(trail)
 		}
@@ -1130,12 +1161,8 @@ func (e *Engine) Inject(file, sid, tool string) (string, error) {
 	var parts []string
 	var nodeIDs []string
 
-	// 过时警报置顶(§9.2)。
-	for id := range e.rt.ix.Nodes() {
-		f, _ := model.SplitNodeID(id)
-		if f != file {
-			continue
-		}
+	// 过时警报置顶(§9.2)。R29 批次3:用 fileNodes 索引免扫全表。
+	for _, id := range e.rt.ix.FileNodes(file) {
 		nodeIDs = append(nodeIDs, id)
 		if l := e.ledger(sid); l != nil {
 			if prev, ok := l.reads[id]; ok {

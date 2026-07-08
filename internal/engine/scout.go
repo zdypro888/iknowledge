@@ -30,7 +30,8 @@ func (e *Engine) scoutBase() string {
 	if e.scoutAddr != "" {
 		return e.scoutAddr
 	}
-	if cfg, _ := e.Store.LoadConfig(); cfg != nil {
+	// R29 批次3:用缓存 config。
+	if cfg := e.cachedConfig(); cfg != nil {
 		return fmt.Sprintf("127.0.0.1:%d", cfg.Port)
 	}
 	return ""

@@ -53,7 +53,9 @@ func (e *Engine) ensureCallGraphLocked() *callGraph {
 	e.rt.cgMu.Lock()
 	defer e.rt.cgMu.Unlock()
 	repo := e.Store.RepoRoot()
-	cfg, _ := e.Store.LoadConfig()
+	// R29 批次3:callgraph 不走 cachedSourceFiles——它的增量语义依赖实时文件清单
+	// 检测增删(cachedSourceFiles 的 60s TTL 会让删除的文件滞留,破坏增量)。config 用缓存。
+	cfg := e.cachedConfig()
 	rels, err := listSourceFiles(repo, e.Reg, cfg)
 	if err != nil {
 		return nil

@@ -32,7 +32,8 @@ func (e *Engine) Investigate(a InvestigateArgs, sid, author string) (string, err
 	if err := e.Sync(); err != nil {
 		return "", err
 	}
-	cfg, _ := e.Store.LoadConfig()
+	// R29 批次3:用缓存 config(60s TTL,错误不再吞——configError() 进 kb_status)。
+	cfg := e.cachedConfig()
 	selfMode := cfg != nil && cfg.Scout == "self"
 
 	out, job, clueFiles, err := e.investigateLocked(a, selfMode)

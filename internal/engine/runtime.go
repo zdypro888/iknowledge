@@ -61,6 +61,29 @@ type runtime struct {
 	parseFailedN  int
 	parseFailedAt time.Time
 	pfFiles       map[string]pfEntry
+
+	// R29 批次3:config + 源文件列表缓存。原先每次 parseFailedCached / ensureCallGraph /
+	// investigate / scout 都各自 LoadConfig(读盘+YAML 解析)且吞错误;listSourceFiles
+	// 每次 git ls-files + os.Stat 每文件。单请求内多处调用重复付。现 60s TTL 共享,
+	// LoadConfig 错误进 opsWarns 不再静默吞。
+	cfgMu     sync.Mutex
+	cfgCache  *store.Config
+	cfgErr    error
+	cfgAt     time.Time
+	filesMu   sync.Mutex
+	filesList []string
+	filesErr  error
+	filesAt   time.Time
+
+	// R29 批次3:per-file git trail 缓存。recallNodeLocked 在读锁内调 gitTrail
+	// (每文件一次 git log --follow 子进程),阻塞其他读。60s TTL 缓存消除稳态子进程。
+	trailMu    sync.Mutex
+	trailCache map[string]trailEntry
+}
+
+type trailEntry struct {
+	text string
+	at   time.Time
 }
 
 // pfEntry 是单文件的解析结果指纹。
@@ -87,8 +110,9 @@ func (e *Engine) parseFailedCached() int {
 
 	n := 0
 	next := map[string]pfEntry{}
-	cfg, _ := e.Store.LoadConfig()
-	if files, err := listSourceFiles(e.Store.RepoRoot(), e.Reg, cfg); err == nil {
+	// R29 批次3:用缓存源文件列表(60s TTL,cachedSourceFiles 内部用 cachedConfig)。
+	files, err := e.cachedSourceFiles()
+	if err == nil {
 		for _, rel := range files {
 			abs := filepath.Join(e.Store.RepoRoot(), filepath.FromSlash(rel))
 			st, err := os.Stat(abs)
@@ -133,6 +157,73 @@ func (e *Engine) gitCountsCached() map[string]int {
 	e.rt.gitCounts, e.rt.gitCountsAt = counts, e.now()
 	e.rt.gitCountsMu.Unlock()
 	return counts
+}
+
+// cachedConfig 返回 config(60s TTL,缓存解析结果)。R29 批次3:原先 4 个调用点
+// 各自 LoadConfig(读盘+YAML 解析)且 `_, _ :=` 吞错误——config.yaml 坏了静默退化
+// 为空(includes/excludes/extensions 全失效)。现在错误保留进 cfgErr,
+// kb_status 渲染时 configError() 取出显示。不持 rt.mu 调用。
+func (e *Engine) cachedConfig() *store.Config {
+	e.rt.cfgMu.Lock()
+	if e.rt.cfgCache != nil && e.rt.cfgErr == nil && e.now().Sub(e.rt.cfgAt) < time.Minute {
+		defer e.rt.cfgMu.Unlock()
+		return e.rt.cfgCache
+	}
+	e.rt.cfgMu.Unlock()
+	cfg, err := e.Store.LoadConfig()
+	e.rt.cfgMu.Lock()
+	e.rt.cfgCache, e.rt.cfgErr, e.rt.cfgAt = cfg, err, e.now()
+	e.rt.cfgMu.Unlock()
+	return cfg
+}
+
+// configError 返回上次 LoadConfig 的错误(若有),供 kb_status 显示。不持 rt.mu。
+func (e *Engine) configError() error {
+	e.rt.cfgMu.Lock()
+	defer e.rt.cfgMu.Unlock()
+	return e.rt.cfgErr
+}
+
+// cachedSourceFiles 返回源文件列表(60s TTL)。R29 批次3:parseFailedCached 与
+// ensureCallGraphLocked 各自调 listSourceFiles(git ls-files + os.Stat 每文件),
+// 单请求重复付。现共享缓存。不持 rt.mu 调用。
+func (e *Engine) cachedSourceFiles() ([]string, error) {
+	e.rt.filesMu.Lock()
+	if e.rt.filesList != nil && e.rt.filesErr == nil && e.now().Sub(e.rt.filesAt) < time.Minute {
+		defer e.rt.filesMu.Unlock()
+		return e.rt.filesList, nil
+	}
+	e.rt.filesMu.Unlock()
+	cfg := e.cachedConfig()
+	files, err := listSourceFiles(e.Store.RepoRoot(), e.Reg, cfg)
+	e.rt.filesMu.Lock()
+	e.rt.filesList, e.rt.filesErr, e.rt.filesAt = files, err, e.now()
+	e.rt.filesMu.Unlock()
+	return files, err
+}
+
+// cachedGitTrail 返回单文件的 git 提交轨迹(60s TTL 缓存)。R29 批次3:recallNodeLocked
+// 在读锁内调 gitTrail(每文件一次 git log --follow 子进程)会阻塞并发读;缓存消除稳态
+// 子进程调用。不持 rt.mu 调用(用独立 trailMu),但调用方通常在 RLock 内——子进程在
+// RLock 下仍会阻塞同 RLock 的其他 reader(RWMutex 的 RLock 之间也不并发子进程 I/O,
+// 但不互斥内存操作);缓存让首次外的调用零子进程。
+func (e *Engine) cachedGitTrail(file string) string {
+	e.rt.trailMu.Lock()
+	if e.rt.trailCache != nil {
+		if ent, ok := e.rt.trailCache[file]; ok && e.now().Sub(ent.at) < time.Minute {
+			defer e.rt.trailMu.Unlock()
+			return ent.text
+		}
+	}
+	e.rt.trailMu.Unlock()
+	text := gitTrail(e.Store.RepoRoot(), []string{file})
+	e.rt.trailMu.Lock()
+	if e.rt.trailCache == nil {
+		e.rt.trailCache = map[string]trailEntry{}
+	}
+	e.rt.trailCache[file] = trailEntry{text: text, at: e.now()}
+	e.rt.trailMu.Unlock()
+	return text
 }
 
 // sessionLedger 是一个会话的读取台账(knowledge.md §9.3):
