@@ -168,7 +168,14 @@ func TestRecordChangeAtomicOnFailure(t *testing.T) {
 		Entries: []RememberEntry{{Kind: "summary", Text: "orig"}}}, "s", "codex"); err != nil {
 		t.Fatal(err)
 	}
-	loginBefore, _ := os.ReadFile(filepath.Join(repo, ".knowledge", "tree", "a.go.yaml"))
+	// R29 批次2:reloadLocked 末尾的 reconcileAllLocked 会对源码变更做后台对账
+	// (哈希失配→降 suspect 落盘),这是合法的独立副作用——测试改源文件触发它。
+	// 因此"分片字节完全不变"不再是正确断言;原子性保证的核心是:
+	// record_change 的特有副作用(重锚、新增 entry、journal 追加)不半应用。
+	// 取 Login 的 entry 数与锚定哈希做基线(而非整分片字节)。
+	loginNodeBefore := e.rt.ix.Node("a.go#Login").Node
+	entriesBefore := len(loginNodeBefore.Entries)
+	anchorHashBefore := loginNodeBefore.Anchor.Hash
 	journalDir := filepath.Join(repo, ".knowledge", "journal")
 	before, _ := os.ReadDir(journalDir)
 
@@ -181,10 +188,16 @@ func TestRecordChangeAtomicOnFailure(t *testing.T) {
 	if err == nil {
 		t.Fatal("含不存在符号的 record_change 应失败")
 	}
-	// 失败后:Login 分片未被改(没有半应用重锚),journal 未追加。
-	loginAfter, _ := os.ReadFile(filepath.Join(repo, ".knowledge", "tree", "a.go.yaml"))
-	if string(loginBefore) != string(loginAfter) {
-		t.Error("record_change 失败却改了 Login 分片(半应用,#10/#29/#41)")
+	// 失败后:record_change 没半应用——Login 的 entry 数不变(没多出 record_change 写的),
+	// 锚定哈希不变(没半应用重锚——后台对账只改 status 不改 Anchor.Hash),journal 未追加。
+	loginNodeAfter := e.rt.ix.Node("a.go#Login").Node
+	if len(loginNodeAfter.Entries) != entriesBefore {
+		t.Errorf("record_change 失败却改了 Login 的 entry 数: before=%d after=%d(半应用,#10/#29/#41)",
+			entriesBefore, len(loginNodeAfter.Entries))
+	}
+	if loginNodeAfter.Anchor.Hash != anchorHashBefore {
+		t.Errorf("record_change 失败却改了 Login 锚定哈希: before=%s after=%s(半应用重锚)",
+			anchorHashBefore, loginNodeAfter.Anchor.Hash)
 	}
 	after, _ := os.ReadDir(journalDir)
 	if journalTotalSize(after) != journalTotalSize(before) {

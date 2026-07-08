@@ -16,9 +16,13 @@ import (
 )
 
 // runtime 是 serve 期的内存态:缓存+索引+会话台账+侦查作业表。
-// 写操作服务端内部串行化(knowledge.md §10.5 单一写入口)——mu 全局互斥。
+//
+// R29 批次2 并发改造:mu 由 sync.Mutex 升级为 sync.RWMutex——读路径(Map/Recall/
+// Inject/Status)经改造后为纯读(reconcile/callgraph 搬进 reloadLocked 预计算,
+// 会话台账与 job 走独立小锁),用 RLock 并发;写路径(remember/record_change/verify/
+// adopt/task/flow/maintain/init)与 reloadLocked 用 Lock。
 type runtime struct {
-	mu    sync.Mutex
+	mu    sync.RWMutex
 	cache *store.Cache
 	ix    *index.Index
 	wips  []model.WIP
@@ -29,12 +33,19 @@ type runtime struct {
 	// 有界去重,进程存续期保留。
 	opsWarns []string
 
-	sessions map[string]*sessionLedger
-	job      *scoutJob // 同 repo 最多 1 个活跃 job(递归护栏)
+	// sessions 走独立小锁(R29 批次2):读路径的会话台账登记/过时警报不再吃大锁,
+	// 多读并发不互斥。照 gitCountsMu/pfMu 同型范式。job 仅写路径(investigate)访问,
+	// 仍归 rt.mu 保护,无需独立锁。
+	sessionMu sync.Mutex
+	sessions  map[string]*sessionLedger
+	job       *scoutJob // 同 repo 最多 1 个活跃 job(递归护栏);归 rt.mu 保护
 
 	// cg 是全仓调用图(auto 派生值,不落盘;文件指纹增量,见 callgraph.go)。
 	// 生命周期独立于 ix:reloadLocked 重建索引不清它,指纹自会对账。
-	cg *callGraph
+	// R29 批次2:cg 走独立锁 cgMu——它是派生值(只读文件系统+自身 files map,不依赖
+	// rt.mu 保护的 cache/ix),读路径增量刷新它不必持 rt.mu 写锁,多读并发可同时建图。
+	cgMu sync.Mutex
+	cg   *callGraph
 
 	// gitCounts 热区频率因子缓存(60s TTL;git log 大仓库百毫秒级)。
 	// 用独立小锁:计算在 rt.mu 之外跑(#21 同族,git 子进程不占大锁)。
@@ -175,7 +186,9 @@ func (e *Engine) Sync() error {
 func (e *Engine) reloadLocked() error {
 	if e.rt.cache == nil {
 		e.rt.cache = store.NewCache(e.Store)
+		e.rt.sessionMu.Lock()
 		e.rt.sessions = map[string]*sessionLedger{}
+		e.rt.sessionMu.Unlock()
 	}
 	if _, err := e.rt.cache.Refresh(); err != nil {
 		return err
@@ -203,6 +216,10 @@ func (e *Engine) reloadLocked() error {
 		healthy[rel] = cs.Shard.Nodes
 	}
 	e.rt.ix = index.Build(healthy, changes, flows)
+	// R29 批次2:读路径状态对账预算(从 reconcileOnReadLocked 外移)。写锁内做,
+	// 使读路径变纯读——失配降 suspect、pending_anchor 补全、回到锚定恢复 fresh。
+	// 只对有活跃知识且 fresh/suspect/pending 的节点做,成本受限。
+	e.reconcileAllLocked()
 	return nil
 }
 
@@ -228,10 +245,13 @@ func (e *Engine) warnOpsLocked(msg string) {
 const ledgerTTL = 2 * time.Hour
 
 // ledger 取(或建)会话台账;sid 为空(匿名连接)返回 nil——台账类功能退化关闭。
+// R29 批次2:走 sessionMu 独立锁(不再要求持 rt.mu)。
 func (e *Engine) ledger(sid string) *sessionLedger {
 	if sid == "" {
 		return nil
 	}
+	e.rt.sessionMu.Lock()
+	defer e.rt.sessionMu.Unlock()
 	e.evictStaleSessionsLocked()
 	l, ok := e.rt.sessions[sid]
 	if !ok {
@@ -242,7 +262,7 @@ func (e *Engine) ledger(sid string) *sessionLedger {
 	return l
 }
 
-// evictStaleSessionsLocked 回收空闲超过 TTL 的会话台账。前提:已持锁。
+// evictStaleSessionsLocked 回收空闲超过 TTL 的会话台账。前提:已持 sessionMu。
 func (e *Engine) evictStaleSessionsLocked() {
 	now := e.now()
 	for sid, l := range e.rt.sessions {
@@ -253,14 +273,24 @@ func (e *Engine) evictStaleSessionsLocked() {
 }
 
 // recordRead 登记读取(台账);返回过时警报文本(若该会话读过旧版)。
+// R29 批次2:reads 走 sessionMu;staleAlert 由调用方的 rt.mu 锁保护(不在本函数取)。
+// sid 为空(匿名)直接返回空——不建台账。
 func (e *Engine) recordRead(sid, nodeID, curHash string) string {
-	l := e.ledger(sid)
-	if l == nil {
+	if sid == "" {
 		return ""
 	}
+	e.rt.sessionMu.Lock()
+	e.evictStaleSessionsLocked()
+	l, ok := e.rt.sessions[sid]
+	if !ok {
+		l = &sessionLedger{reads: map[string]readRecord{}}
+		e.rt.sessions[sid] = l
+	}
+	l.lastActive = e.now()
 	prev, seen := l.reads[nodeID]
 	rec := readRecord{Hash: curHash, At: e.now(), Reads: prev.Reads + 1, Digested: prev.Digested}
 	l.reads[nodeID] = rec
+	e.rt.sessionMu.Unlock()
 	if seen && prev.Hash != "" && curHash != "" && prev.Hash != curHash {
 		return e.staleAlert(nodeID, prev)
 	}
@@ -268,6 +298,9 @@ func (e *Engine) recordRead(sid, nodeID, curHash string) string {
 }
 
 // staleAlert 组装过时警报(knowledge.md §9.5):要具体——谁改的、改了什么、为什么。
+// R29 批次2:前提——调用方已持 rt.mu 的读锁或写锁(ix.History 读索引快照)。
+// recordRead 在 recallNodeLocked(Recall 的 RLock/Lock 区间)内调本函数,锁已持有,
+// 这里不再自取(Go RWMutex 不支持重入,重复取会死锁)。
 func (e *Engine) staleAlert(nodeID string, prev readRecord) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "⚠ 过时警报:你在本会话早前读过 %s(当时哈希 %s),它之后已被修改。", nodeID, shortHash(prev.Hash))
@@ -296,9 +329,12 @@ func shortHash(h string) string {
 }
 
 // markDigested 会话对节点完成过沉淀(remember/record_change),沉淀提醒不再点名它。
+// R29 批次2:走 sessionMu。
 func (e *Engine) markDigested(sid string, nodeIDs ...string) {
-	l := e.ledger(sid)
-	if l == nil {
+	e.rt.sessionMu.Lock()
+	defer e.rt.sessionMu.Unlock()
+	l, ok := e.rt.sessions[sid]
+	if !ok {
 		return
 	}
 	for _, id := range nodeIDs {
@@ -310,9 +346,12 @@ func (e *Engine) markDigested(sid string, nodeIDs ...string) {
 
 // settleReminder 沉淀提醒(knowledge.md §9.3 第 2 用途):台账里多次下钻却没
 // 对应 remember 的节点,提醒补沉淀——对抗"读过即弃"。上限 3 条(§12.2 同限额哲学)。
+// R29 批次2:走 sessionMu。
 func (e *Engine) settleReminder(sid string) []string {
-	l := e.ledger(sid)
-	if l == nil {
+	e.rt.sessionMu.Lock()
+	defer e.rt.sessionMu.Unlock()
+	l, ok := e.rt.sessions[sid]
+	if !ok {
 		return nil
 	}
 	var out []string

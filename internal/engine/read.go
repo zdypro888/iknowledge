@@ -52,8 +52,10 @@ func (e *Engine) Status() (string, error) {
 	// git log 在大仓库百毫秒级,频繁 kb_status 不该每次付。
 	gitCounts := e.gitCountsCached()
 
-	e.rt.mu.Lock()
-	defer e.rt.mu.Unlock()
+	// R29 批次2:Status 改用读锁——ensureCallGraphLocked 走 cgMu 独立锁,
+	// computeDebtsLocked/节点遍历全纯读。parseFailed/gitCounts 已锁外算。
+	e.rt.mu.RLock()
+	defer e.rt.mu.RUnlock()
 
 	total, digested, suspect, orphaned, pending := 0, 0, 0, 0, 0
 	conflicts := 0
@@ -235,8 +237,9 @@ func (e *Engine) Map(pathArg string, depth int, sid string) (string, ReadMeta, e
 	if err := e.Sync(); err != nil {
 		return "", ReadMeta{}, err
 	}
-	e.rt.mu.Lock()
-	defer e.rt.mu.Unlock()
+	// R29 批次2:Map 是纯读(不调 reconcile/ledger/callgraph),用读锁,多并发不互斥。
+	e.rt.mu.RLock()
+	defer e.rt.mu.RUnlock()
 
 	if depth <= 0 {
 		depth = 2
@@ -475,8 +478,11 @@ func (e *Engine) Recall(a RecallArgs, sid string) (string, ReadMeta, error) {
 	if err := e.Sync(); err != nil {
 		return "", ReadMeta{}, err
 	}
-	e.rt.mu.Lock()
-	defer e.rt.mu.Unlock()
+	// R29 批次2:Recall 改用读锁——reconcileOnReadLocked 状态对账已搬进
+	// reconcileAllLocked(reloadLocked 内,写锁),recordRead 走 sessionMu 独立锁,
+	// recallNodeLocked 其余全是纯读。多会话 recall 可并发。
+	e.rt.mu.RLock()
+	defer e.rt.mu.RUnlock()
 
 	if a.Mode == "" {
 		a.Mode = "usage"
@@ -907,8 +913,13 @@ type autoInfo struct {
 	stale     bool
 }
 
-// reconcileOnReadLocked 重算命中节点的源码哈希:失配 → 即时降 suspect 并落盘;
-// pending_anchor 且文件可解析 → 自动补锚。返回 auto 现算结果。
+// reconcileOnReadLocked 现算命中节点的展示派生数据(curHash/signature/calls)并据
+// 已对账的 status 决定 stale 横幅。
+//
+// R29 批次2 状态对账外移:原先这里还做 suspect 降级/anchor 补全/落盘(读时写)——
+// 现在那些状态变更搬进了 reconcileAllLocked(reloadLocked 调,写锁内),读路径变纯读。
+// 这里仍读源文件算 curHash/signature(auto 展示数据本就要读源码,增量成本≈0),
+// 并比对已落盘的 status 决定要不要报 stale。
 func (e *Engine) reconcileOnReadLocked(ref *index.NodeRef) autoInfo {
 	n := ref.Node
 	file, symbol := model.SplitNodeID(n.ID)
@@ -935,11 +946,10 @@ func (e *Engine) reconcileOnReadLocked(ref *index.NodeRef) autoInfo {
 	if symbol == "" {
 		fh := parser.HashFileFor(p, syms, src)
 		auto.curHash = fh
-		// #42(R2-A3 补齐文件节点分支):已 suspect 且仍失配同样要报 stale,
-		// 否则第二次读取横幅消失,AI 以为没问题。
+		// #42:哈希失配 + 有活跃知识 + fresh/suspect → 报 stale。
+		// 状态已是 reconcileAllLocked 预算的(失配的已降 suspect),这里只据 status 报横幅。
 		if n.Anchor.Hash != "" && fh != n.Anchor.Hash && hasActiveEntries(n) &&
 			(n.Status == model.StatusFresh || n.Status == model.StatusSuspect) {
-			e.downgradeLocked(ref)
 			auto.stale = true
 		}
 		return auto
@@ -951,9 +961,8 @@ func (e *Engine) reconcileOnReadLocked(ref *index.NodeRef) autoInfo {
 		}
 	}
 	if cur == nil {
-		// 符号不在原位 = 失配的一种:有知识则降 suspect(对账/迁移由 init 兜)。
-		if hasActiveEntries(n) && n.Status == model.StatusFresh {
-			e.downgradeLocked(ref)
+		// 符号不在原位 = 失配的一种(reconcileAllLocked 已降 suspect);这里只报横幅。
+		if hasActiveEntries(n) && n.Status == model.StatusSuspect {
 			auto.stale = true
 		}
 		return auto
@@ -970,30 +979,108 @@ func (e *Engine) reconcileOnReadLocked(ref *index.NodeRef) autoInfo {
 		auto.impls = displayEdges(cg.implementationsOf(nodeID), file, 12)
 		auto.ifaces = displayEdges(cg.interfacesOf(nodeID), file, 12)
 	}
-
-	// 读路径落盘尽力而为:失败不阻断读取(内存态已更新、返回信息正确),记警下次重试。
-	bestEffortSave := func() {
-		if err := e.saveNodeShardLocked(ref); err != nil {
-			e.warnOpsLocked("读取时对账落盘失败(下次重试):" + err.Error())
-		}
-	}
-	switch {
-	case n.PendingAnchor:
-		// 待补锚:文件重新可解析,自动补锚(impl §7.3 第四情形收尾)。
-		n.Anchor.Hash, n.Anchor.StructHash, n.Anchor.Lines = cur.Hash, cur.StructHash, cur.Lines
-		n.PendingAnchor = false
-		bestEffortSave()
-	case n.Anchor.Hash != "" && cur.Hash != n.Anchor.Hash && (n.Status == model.StatusFresh || n.Status == model.StatusSuspect) && hasActiveEntries(n):
-		// #42:哈希失配就报 stale,不论当前是 fresh 还是【已 suspect 仍失配】——
-		// 否则第二次读一个已 suspect 且代码又变的节点,横幅消失、AI 以为没问题。
-		e.downgradeLocked(ref)
+	// #42:哈希失配就报 stale,不论当前是 fresh 还是【已 suspect 仍失配】。
+	// 状态变更已在 reconcileAllLocked 预算(失配→suspect),这里只据现状报横幅。
+	if n.Anchor.Hash != "" && cur.Hash != n.Anchor.Hash && (n.Status == model.StatusFresh || n.Status == model.StatusSuspect) && hasActiveEntries(n) {
 		auto.stale = true
-	case n.Status == model.StatusSuspect && cur.Hash == n.Anchor.Hash:
-		// 代码回到锚定状态:恢复(与 init 对账同规则)。
-		n.Status = model.StatusFresh
-		bestEffortSave()
 	}
 	return auto
+}
+
+// reconcileAllLocked 是读路径状态对账的预算版(R29 批次2 从 reconcileOnReadLocked 外移):
+// 遍历所有有活跃知识、状态 fresh/suspect 或 pending_anchor 的节点,比对源码哈希——
+// 失配降 suspect、回到锚定恢复 fresh、pending_anchor 补全——批量落盘。
+// 在 reloadLocked 末尾调(写锁内),使读路径不必再做这些读时写。
+//
+// 成本控制:只对"有活跃知识 且 (fresh|suspect|pending)"的节点做(纯骨架节点跳过),
+// 且每文件 parse 结果用 rcParse 缓存(同文件多符号共享,避免重复解析)。
+func (e *Engine) reconcileAllLocked() {
+	repo := e.Store.RepoRoot()
+	type parsed struct {
+		syms []parser.Symbol
+		src  []byte
+		p    parser.Parser
+		ok   bool
+	}
+	fileCache := map[string]*parsed{}
+	dirty := map[string]bool{} // 有状态变更的分片,需落盘
+
+	for _, ref := range e.rt.ix.Nodes() {
+		n := ref.Node
+		if !hasActiveEntries(n) && !n.PendingAnchor {
+			continue
+		}
+		if n.Status != model.StatusFresh && n.Status != model.StatusSuspect && !n.PendingAnchor {
+			continue
+		}
+		file, symbol := model.SplitNodeID(n.ID)
+		if file == "" || strings.HasSuffix(file, "/") {
+			continue
+		}
+		pp, ok := fileCache[file]
+		if !ok {
+			pp = &parsed{}
+			fileCache[file] = pp
+			src, err := os.ReadFile(filepath.Join(repo, filepath.FromSlash(file)))
+			if err != nil {
+				continue
+			}
+			p := e.Reg.ForFile(file)
+			if p == nil {
+				continue
+			}
+			syms, err := p.Parse(file, src)
+			if err != nil {
+				continue // 不可解析:锚保持不降级(PARSE 三态)
+			}
+			pp.syms, pp.src, pp.p, pp.ok = syms, src, p, true
+		}
+		if !pp.ok {
+			continue
+		}
+		var curHash string
+		if symbol == "" {
+			curHash = parser.HashFileFor(pp.p, pp.syms, pp.src)
+		} else {
+			for i := range pp.syms {
+				if pp.syms[i].Name == symbol {
+					// pending_anchor 补全需要完整 Symbol(StructHash/Lines)。
+					if n.PendingAnchor {
+						n.Anchor.Hash = pp.syms[i].Hash
+						n.Anchor.StructHash = pp.syms[i].StructHash
+						n.Anchor.Lines = pp.syms[i].Lines
+						n.PendingAnchor = false
+						dirty[ref.ShardRel] = true
+					}
+					curHash = pp.syms[i].Hash
+					break
+				}
+			}
+			if curHash == "" {
+				// 符号不在原位:有活跃知识则降 suspect。
+				if hasActiveEntries(n) && n.Status == model.StatusFresh {
+					n.Status = model.StatusSuspect
+					dirty[ref.ShardRel] = true
+				}
+				continue
+			}
+		}
+		switch {
+		case n.Anchor.Hash != "" && curHash != n.Anchor.Hash &&
+			(n.Status == model.StatusFresh || n.Status == model.StatusSuspect) && hasActiveEntries(n):
+			n.Status = model.StatusSuspect
+			dirty[ref.ShardRel] = true
+		case n.Status == model.StatusSuspect && curHash == n.Anchor.Hash:
+			n.Status = model.StatusFresh
+			dirty[ref.ShardRel] = true
+		}
+	}
+	for shardRel := range dirty {
+		ref := &index.NodeRef{ShardRel: shardRel}
+		if err := e.saveNodeShardLocked(ref); err != nil {
+			e.warnOpsLocked("reconcileAll 落盘失败(下次重试):" + err.Error())
+		}
+	}
 }
 
 // downgradeLocked 降 suspect 落盘(保留旧锚,重验即重锚的基准)。
@@ -1029,8 +1116,10 @@ func (e *Engine) Inject(file, sid, tool string) (string, error) {
 	if err := e.Sync(); err != nil {
 		return "", err
 	}
-	e.rt.mu.Lock()
-	defer e.rt.mu.Unlock()
+	// R29 批次2:Inject 改用读锁——ledger 走 sessionMu,staleAlert/computeDebts/
+	// wipAttachment 全纯读。hook 注入高频(每次 Read/Edit),读锁让并发不互斥。
+	e.rt.mu.RLock()
+	defer e.rt.mu.RUnlock()
 
 	file = strings.Trim(filepath.ToSlash(file), "/")
 	fileRef := e.rt.ix.Node(file)

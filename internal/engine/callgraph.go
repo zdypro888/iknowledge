@@ -45,9 +45,13 @@ type fileCallsEntry struct {
 	fc      *parser.FileCalls
 }
 
-// ensureCallGraphLocked 惰性构建/增量刷新调用图。前提:已持 rt.mu。
+// ensureCallGraphLocked 惰性构建/增量刷新调用图。
+// R29 批次2:走 cgMu 独立锁(不再要求持 rt.mu)——它是派生值,只读文件系统+自身
+// files map,不依赖 rt.mu 保护的 cache/ix;读路径可并发刷新它而不互斥。
 // 图是尽力而为的派生值:清单/解析失败返回 nil,调用方按"无图"降级,不阻断读路径。
 func (e *Engine) ensureCallGraphLocked() *callGraph {
+	e.rt.cgMu.Lock()
+	defer e.rt.cgMu.Unlock()
 	repo := e.Store.RepoRoot()
 	cfg, _ := e.Store.LoadConfig()
 	rels, err := listSourceFiles(repo, e.Reg, cfg)
