@@ -787,13 +787,11 @@ func (e *Engine) RecordChange(a ChangeArgs, sid, author string) (string, error) 
 			if len(callers) == 0 {
 				continue
 			}
-			// 区分:有活跃知识的调用方(可能受影响,需复核)vs 无知识的(仅列出计数)。
-			var withKnowledge, bare []string
+			// 只列出带活跃知识的调用方:这些契约/pitfall 可能被本次改动破坏。
+			var withKnowledge []string
 			for _, caller := range callers {
 				if ref := e.rt.ix.Node(caller); ref != nil && hasActiveEntries(ref.Node) {
 					withKnowledge = append(withKnowledge, caller)
-				} else {
-					bare = append(bare, caller)
 				}
 			}
 			if len(withKnowledge) == 0 {

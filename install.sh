@@ -52,19 +52,21 @@ install_binary() {
     # 校验 sha256(若 checksums 文件存在且含本资产)。
     sums_url="https://github.com/${REPO}/releases/download/${latest_tag}/sha256sums.txt"
     if curl -fsSL "$sums_url" -o "$tmpdir/sha256sums.txt" 2>/dev/null; then
-        if grep "$asset" "$tmpdir/sha256sums.txt" >/dev/null 2>&1; then
+        awk -v a="$asset" '$2 == a { print }' "$tmpdir/sha256sums.txt" > "$tmpdir/$asset.sha256"
+        if [ -s "$tmpdir/$asset.sha256" ]; then
             (cd "$tmpdir" && if command -v sha256sum >/dev/null 2>&1; then
-                sha256sum -c sha256sums.txt 2>/dev/null || { echo "   校验失败" >&2; return 1; }
+                sha256sum -c "$asset.sha256" 2>/dev/null || { echo "   校验失败" >&2; return 1; }
             elif command -v shasum >/dev/null 2>&1; then
-                shasum -a 256 -c sha256sums.txt 2>/dev/null || { echo "   校验失败" >&2; return 1; }
+                shasum -a 256 -c "$asset.sha256" 2>/dev/null || { echo "   校验失败" >&2; return 1; }
             fi) || return 1
             echo "   sha256 校验通过"
         fi
     fi
 
-    # 解压。tar 包内文件名是 iknowledge-{os}-{arch}(见 release.yml,无 .exe)。
+    # 解压。tar 包内文件名是 iknowledge-{os}-{arch}(Windows 带 .exe)。
     tar xzf "$tmpdir/$asset" -C "$tmpdir"
     inner="iknowledge-${os}-${arch}"
+    [ "$os" = "windows" ] && inner="$inner.exe"
     if [ ! -f "$tmpdir/$inner" ]; then
         echo "   解压后未找到 $inner" >&2
         return 1

@@ -45,6 +45,7 @@ jobs:
           build_one linux  amd64 ""
           build_one linux  arm64 ""
           build_one windows amd64 .exe
+          build_one windows arm64 .exe
 
       # sha256 校验:install.sh 下完二进制校验完整性(防传输损坏/中间人)。
       - name: Generate checksums

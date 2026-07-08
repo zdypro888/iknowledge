@@ -153,9 +153,6 @@ func mapScalar(n *yaml.Node, key string) string {
 	return ""
 }
 
-// cloneNode 深拷贝 yaml 节点(R29-E7.4:depth 限制防极端嵌套栈溢出)。
-func cloneNode(n *yaml.Node) *yaml.Node { return cloneNodeDepth(n, 0) }
-
 func cloneNodeDepth(n *yaml.Node, depth int) *yaml.Node {
 	if n == nil || depth > maxMergeDepth {
 		return nil

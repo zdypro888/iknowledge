@@ -1417,16 +1417,6 @@ func (e *Engine) reconcileAllLocked() {
 	}
 }
 
-// downgradeLocked 降 suspect 落盘(保留旧锚,重验即重锚的基准)。
-// 读路径上的降级:落盘失败不阻断本次读取(内存已降级,返回给用户的信息正确),
-// 但把错误记进告警,下次写路径会重试落盘。
-func (e *Engine) downgradeLocked(ref *index.NodeRef) {
-	ref.Node.Status = model.StatusSuspect
-	if err := e.saveNodeShardLocked(ref); err != nil {
-		e.warnOpsLocked("降级落盘失败(下次写路径重试):" + err.Error())
-	}
-}
-
 // saveNodeShardLocked 把 ref 所在分片写回(未知字段由 store 合并保留)。
 // 返回错误——写路径调用方必须上抬(#18/#31:原先 _ = 吞掉,落盘失败静默丢数据)。
 func (e *Engine) saveNodeShardLocked(ref *index.NodeRef) error {

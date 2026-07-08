@@ -647,13 +647,6 @@ func skipSpacesRange(src []byte, i *int, hi int) {
 	}
 }
 
-func indexOfAfter(src []byte, pos, hi int) int {
-	if pos >= hi {
-		return hi
-	}
-	return pos
-}
-
 // funcDeclStart 回退到声明所在行首(含可能的装饰器/注释行,近似:找最近的 \n+1)。
 func funcDeclStart(src []byte, nameStart int) int {
 	// 简化:从 nameStart 向前找 function/class 关键字位置作为 start。
