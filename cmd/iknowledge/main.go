@@ -80,6 +80,7 @@ func runServe(args []string) int {
 	})
 	addr := fs.String("addr", "", "监听地址(缺省 127.0.0.1:<config 端口>;仅单仓库可用)")
 	auth := fs.Bool("auth", false, "启用 Bearer 鉴权(每仓 token 生成于各自 .knowledge/local/token,0600;共享多用户机器用)")
+	allowInsecure := fs.Bool("allow-insecure-bind", false, "确认监听非回环地址的风险(无 --auth 时裸奔于网络;仅限可信隔离网络)")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -169,23 +170,45 @@ func runServe(args []string) int {
 			return 1
 		}
 		e.SetScoutAddr(listen) // 自派侦察兵回连实际监听地址(--addr 覆盖时 config 端口不可信)
-		// 无鉴权服务的信任模型是"仅回环"(impl §1);监听非回环时 Origin 校验挡不住
-		// 直连的非浏览器客户端,必须显式警示而不是默默裸奔。
+		// R29-S1.5:无鉴权服务的信任模型是"仅回环"(impl §1)。监听非回环时,Origin 校验
+		// 挡不住直连的非浏览器客户端(curl/任何本机进程)——以前只 warn 就放行,现在强制:
+		// 非 loopback 且无 --auth,必须显式 --allow-insecure-bind 才启动,否则拒绝(退出 2)。
+		// 这把"一条 flag 之差就网络裸奔"的失误从可能变成不可能。
 		if host, _, err := net.SplitHostPort(listen); err == nil {
 			ip := net.ParseIP(host)
-			if host != "localhost" && (ip == nil || !ip.IsLoopback()) {
+			nonLoopback := host != "localhost" && (ip == nil || !ip.IsLoopback())
+			if nonLoopback {
+				if !*auth && !*allowInsecure {
+					fmt.Fprintln(os.Stderr, "错误: 监听非回环地址且无 --auth——任何能连通该端口的主机都可读写知识库。")
+					fmt.Fprintln(os.Stderr, "若确为可信隔离网络,加 --allow-insecure-bind 显式确认此风险;否则用 --auth 或保持缺省回环监听。")
+					cleanup()
+					return 2
+				}
 				if *auth {
 					fmt.Fprintln(os.Stderr, "警告: 监听非回环地址——token 鉴权已启用,但明文 HTTP 仍可被网络窃听(含 token 本身);仅限可信隔离网络使用。")
 				} else {
-					fmt.Fprintln(os.Stderr, "警告: 监听非回环地址——服务无鉴权,Origin 校验不构成认证,任何能连通该端口的主机都可读写知识库;仅限可信隔离网络使用(或加 --auth)。")
+					fmt.Fprintln(os.Stderr, "警告: 监听非回环地址且无鉴权(--allow-insecure-bind 已确认)——任何能连通该端口的主机都可读写知识库。")
 				}
 			}
 		}
 		fmt.Printf("knowledge MCP 已启动:http://%s/mcp/main?repo=%s\nhook 注入端点:http://%s/inject?file=<path>\n",
 			listen, url.QueryEscape(s.RepoRoot()), listen)
-		// ReadHeaderTimeout:防半开连接无限占用(R2-D3);业务无流式/长轮询,10s 富余。
+		// R29-S1.4:HTTP 服务器超时硬化(防 slowloris / 慢客户端无限占用 goroutine)。
+		// ReadHeaderTimeout 10s 防半开连接(R2-D3,原有);ReadTimeout 30s 限制请求体读取;
+		// IdleTimeout 120s 回收 keep-alive 空闲连接。WriteTimeout 不在 Server 层设——
+		// scout 自派路由(/mcp/scout/ 的 kb_investigate selfDispatch)可阻塞最长
+		// ScoutTimeoutSec(缺省 300s)等侦察兵交卷,全局 WriteTimeout 会误杀。
+		// 改在快端点(/inject /recall /map /status /mcp/main)用 srv.scoutExempt 区分:
+		// 那些路由 handler 内自带短超时;scout 路由显式解除 WriteDeadline(见 server.go)。
 		units = append(units, unit{s: s, ln: ln, listen: listen,
-			hs: &http.Server{Handler: srv.Handler(), ReadHeaderTimeout: 10 * time.Second}})
+			hs: &http.Server{
+				Handler:            srv.Handler(),
+				ReadHeaderTimeout:  10 * time.Second,
+				ReadTimeout:        30 * time.Second,
+				IdleTimeout:        120 * time.Second,
+				WriteTimeout:       0, // 见上:scout 长路由在 handler 层自管
+				MaxHeaderBytes:     1 << 20,
+			}})
 	}
 
 	// SIGINT/SIGTERM 优雅停机:等在途工具调用落完盘再退(记账是多步文件写,

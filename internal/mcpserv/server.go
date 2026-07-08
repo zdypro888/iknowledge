@@ -91,7 +91,9 @@ func (s *Server) authGuard(next http.Handler) http.Handler {
 	want := []byte("Bearer " + s.AuthToken)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		got := []byte(r.Header.Get("Authorization"))
-		if len(got) != len(want) || subtle.ConstantTimeCompare(got, want) != 1 {
+		// R29-S1.3:删 len 预检——它泄露 token 长度,否定了 ConstantTimeCompare 的常数时间性。
+		// subtle.ConstantTimeCompare 自身安全处理不等长(对较长输入恒定时间返回 0)。
+		if subtle.ConstantTimeCompare(got, want) != 1 {
 			w.Header().Set("WWW-Authenticate", `Bearer realm="iknowledge"`)
 			http.Error(w, "unauthorized: serve 以 --auth 启动,需 Authorization: Bearer <.knowledge/local/token>", http.StatusUnauthorized)
 			return
@@ -224,7 +226,11 @@ func (s *Server) handleInitialize(w http.ResponseWriter, req rpcRequest) {
 		author = "unknown"
 	}
 	b := make([]byte, 8)
-	rand.Read(b)
+	if _, err := rand.Read(b); err != nil {
+		// 低熵源不可用:不发可预测 ID(session fixation 面)。fail closed。
+		writeRPCError(w, req.ID, -32603, "entropy unavailable, retry initialize")
+		return
+	}
 	sid := hex.EncodeToString(b)
 	s.mu.Lock()
 	for id, sess := range s.sessions { // initialize 低频,顺手回收过期会话
@@ -422,8 +428,10 @@ func (s *Server) dispatch(name string, args json.RawMessage, sid string) (string
 	return "", meta, &engine.KBError{Code: "NODE_NOT_FOUND", Msg: "未知工具 " + name, Hint: "tools/list 查看可用工具"}
 }
 
+// kbInvalid 包装入参解析失败。R29-S1.6:错误码修正——参数解析失败用 INVALID_PARAMS,
+// 不是 NODE_NOT_FOUND(语义不符,AI 按 KB_ERR: 前缀自纠错会被误导)。
 func kbInvalid(err error) *engine.KBError {
-	return &engine.KBError{Code: "NODE_NOT_FOUND", Msg: "入参解析失败:" + err.Error(), Hint: "对照工具 inputSchema 修正参数"}
+	return &engine.KBError{Code: "INVALID_PARAMS", Msg: "入参解析失败:" + err.Error(), Hint: "对照工具 inputSchema 修正参数"}
 }
 
 // serveInject 是 hook 注入端点(GET /inject?file=&session=,非 MCP,impl §7.1)。

@@ -72,7 +72,10 @@ func (e *Engine) investigateLocked(a InvestigateArgs, selfMode bool) (string, *s
 			"等它交卷(kb_submit_findings)或 TTL 过期后重试")
 	}
 	b := make([]byte, 4)
-	rand.Read(b)
+	if _, err := rand.Read(b); err != nil {
+		// job ID 是 kb_submit_findings 的凭证(R29-S1.2),低熵源不可用则 fail closed。
+		return "", nil, nil, kbErr("INTERNAL", "熵源不可用,重试", "稍后重试 kb_investigate")
+	}
 	job := &scoutJob{
 		ID: "job_" + hex.EncodeToString(b), Question: a.Question, Scope: a.Scope,
 		Started: nowT, TTL: 30 * time.Minute,
