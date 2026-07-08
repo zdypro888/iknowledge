@@ -20,7 +20,7 @@
 curl -fsSL https://raw.githubusercontent.com/zdypro888/iknowledge/main/install.sh | sh
 ```
 
-装机脚本做三件事:`go install` 二进制、把 [`kb-bootstrap`](skills/kb-bootstrap/SKILL.md) 技能装进 Claude Code(`~/.claude/skills/`)、检测到 Codex 时同步装进 `~/.codex/skills/`。
+装机脚本做三件事:**下载预编译二进制**(免 Go 工具链——仅当无匹配平台的预编译包时才回退 `go install`)、把 [`kb-bootstrap`](skills/kb-bootstrap/SKILL.md) 技能装进 Claude Code(`~/.claude/skills/`)、检测到 Codex 时同步装进 `~/.codex/skills/`。预编译二进制按发布提供(macOS/Linux × amd64/arm64、Windows amd64);首个 `v*` tag 会触发自动发布(cross-compile + checksums)。
 
 之后在任何项目里,对 **Claude Code 或 Codex** 说:**"初始化当前项目知识库"**——AI 自己建骨架、代写全部接入配置(Claude Code 三件套 + Codex 的 config.toml/AGENTS.md)并验证连通(两侧均已实测)。重启会话后 kb_* 工具与 hook 注入就位;服务由 stdio 桥按需自动拉起,机器重启后也不用管。
 

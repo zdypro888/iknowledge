@@ -20,7 +20,7 @@ Two iron laws: **knowledge navigates, source code decides** (the knowledge base 
 curl -fsSL https://raw.githubusercontent.com/zdypro888/iknowledge/main/install.sh | sh
 ```
 
-The installer does three things: `go install`s the binary, installs the [`kb-bootstrap`](skills/kb-bootstrap/SKILL.md) skill into Claude Code (`~/.claude/skills/`), and — if Codex is detected — into `~/.codex/skills/` as well.
+The installer does three things: downloads a **prebuilt binary** (no Go toolchain needed — falls back to `go install` only if no prebuilt build matches your platform), installs the [`kb-bootstrap`](skills/kb-bootstrap/SKILL.md) skill into Claude Code (`~/.claude/skills/`), and — if Codex is detected — into `~/.codex/skills/` as well. Prebuilt binaries are published per release (macOS/Linux × amd64/arm64, Windows amd64); the first `v*` tag will trigger a release with cross-compiled binaries + checksums.
 
 Then, inside any project, tell **Claude Code or Codex**: **"initialize the knowledge base for this project"**. The AI builds the skeleton, writes all integration config for you (the Claude Code trio + Codex's `config.toml`/`AGENTS.md`) and verifies connectivity (both clients field-tested). After restarting the session, the `kb_*` tools and hook injection are live; the server is auto-started on demand by the stdio bridge, so even a machine reboot needs no attention.
 

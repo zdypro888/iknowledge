@@ -1,0 +1,64 @@
+# 轮33:预编译二进制发布。打 v* tag 时 cross-compile 上传 GitHub Releases,
+# 让 install.sh 优先下二进制(去掉 Go 工具链门槛,扩大用户基数)。
+# 零第三方 action 依赖:用官方 actions/checkout + setup-go,纯 go build cross-compile。
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write # 创建 Release 上传资产需要
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      # 三关:确保发布的二进制本身是通过全部测试的代码构建的。
+      - run: go build ./...
+      - run: go vet ./...
+      - run: go test -race ./...
+
+      # cross-compile 6 个目标:darwin/linux × amd64/arm64 + windows amd64。
+      # CGO_DISABLED=1:纯 Go(yaml.v3 是纯 Go),静态二进制跨机可跑。
+      # -trimpath -ldflags="-s -w":去路径/去符号表,体积小且 reproducible。
+      - name: Build binaries
+        run: |
+          VERSION="${GITHUB_REF_NAME:-dev}"
+          LDFLAGS="-s -w"
+          build_one() {
+            os="$1"; arch="$2"; ext="$3"
+            target="iknowledge-${os}-${arch}"
+            GOOS="$os" GOARCH="$arch" CGO_ENABLED=0 \
+              go build -trimpath -ldflags="$LDFLAGS" \
+              -o "dist/${target}${ext}" ./cmd/iknowledge
+            (cd dist && tar czf "${target}.tar.gz" "${target}${ext}" && rm "${target}${ext}")
+            echo "✓ ${target}"
+          }
+          mkdir -p dist
+          build_one darwin amd64 ""
+          build_one darwin arm64 ""
+          build_one linux  amd64 ""
+          build_one linux  arm64 ""
+          build_one windows amd64 .exe
+
+      # sha256 校验:install.sh 下完二进制校验完整性(防传输损坏/中间人)。
+      - name: Generate checksums
+        run: |
+          cd dist
+          sha256sum *.tar.gz > sha256sums.txt
+          cat sha256sums.txt
+
+      # gh release create:把 dist/ 下全部资产附到 Release。--generate-notes 自动生成。
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" \
+            --title "${GITHUB_REF_NAME}" \
+            --generate-notes \
+            dist/*
