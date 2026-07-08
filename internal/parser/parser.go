@@ -52,12 +52,14 @@ type Registry struct {
 // NewRegistry 返回注册了全部内置解析器的注册表:Go(go/ast)恒在;
 // Python(自托管助手,2026-07-04 多语言 T1)按本机 python3 可用性注册——
 // 不可用则 .py 不索引(可经 config extensions 白名单降级为文件级覆盖)。
+// TypeScript/JavaScript(R29 批次6,纯 Go 词法,零运行时依赖)恒注册。
 func NewRegistry() *Registry {
 	r := &Registry{byExt: map[string]Parser{}}
 	r.Register(Golang{})
 	if PythonAvailable() {
 		r.Register(Python{})
 	}
+	r.Register(TypeScript{}) // 纯 Go 词法,无需运行时探测
 	return r
 }
 
