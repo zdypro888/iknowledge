@@ -1,8 +1,10 @@
 package engine
 
 import (
+	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/zdypro888/iknowledge/internal/model"
 )
@@ -25,6 +27,7 @@ func (e *Engine) Task(a TaskArgs, sid, author string) (string, error) {
 	}
 	e.rt.mu.Lock()
 	defer e.rt.mu.Unlock()
+	owner := taskOwner(sid, author)
 
 	switch a.Action {
 	case "start":
@@ -32,7 +35,7 @@ func (e *Engine) Task(a TaskArgs, sid, author string) (string, error) {
 			return "", kbErr("INVALID_ARGUMENT", "start 需要 wip.task", "给任务一句话描述")
 		}
 		w := a.WIP
-		w.Owner = author // owner = 会话方(服务端定,防冒名)
+		w.Owner = owner // owner = 会话唯一键(服务端定,防冒名/同客户端多会话覆盖)
 		w.Updated = e.now().UTC()
 		if err := e.Store.SaveWIP(w); err != nil {
 			return "", err
@@ -40,18 +43,40 @@ func (e *Engine) Task(a TaskArgs, sid, author string) (string, error) {
 		if err := e.reloadLocked(); err != nil {
 			return "", err
 		}
-		return "wip 已建立(owner " + author + ")。touching 声明的节点在他人 recall/map 时会自动附带此台账。", nil
+		return "wip 已建立(owner " + owner + ")。touching 声明的节点在他人 recall/map 时会自动附带此台账。", nil
 
 	case "update":
-		cur := e.wipOfLocked(author)
+		cur := e.wipForSessionLocked(owner, author)
 		if cur == nil {
 			return "", kbErr("NODE_NOT_FOUND", "没有你的活跃 wip", "先 kb_task start")
 		}
+		var sessionBefore *model.WIP
+		if existing := e.wipOfLocked(owner); existing != nil {
+			copy := *existing
+			sessionBefore = &copy
+		}
 		merged := mergeWIP(*cur, a.WIP)
-		merged.Owner = author
+		merged.Owner = owner
 		merged.Updated = e.now().UTC()
 		if err := e.Store.SaveWIP(merged); err != nil {
-			return "", err
+			reloadErr := e.reloadLocked()
+			return "", errors.Join(err, reloadErr)
+		}
+		// 升级前按 author 命名的 WIP 迁到 session 唯一键。即使上一次迁移
+		// 半途留下了 session+legacy 两份，也在本次成功更新时收敛。
+		if legacy := e.wipOfLocked(author); author != owner && legacy != nil {
+			legacyCopy := *legacy
+			if err := e.Store.ClearWIP(author); err != nil {
+				legacyRestoreErr := e.Store.SaveWIP(legacyCopy)
+				var sessionRollbackErr error
+				if sessionBefore != nil {
+					sessionRollbackErr = e.Store.SaveWIP(*sessionBefore)
+				} else {
+					sessionRollbackErr = e.Store.ClearWIP(owner)
+				}
+				reloadErr := e.reloadLocked()
+				return "", errors.Join(fmt.Errorf("迁移 legacy WIP: %w", err), legacyRestoreErr, sessionRollbackErr, reloadErr)
+			}
 		}
 		if err := e.reloadLocked(); err != nil {
 			return "", err
@@ -59,7 +84,7 @@ func (e *Engine) Task(a TaskArgs, sid, author string) (string, error) {
 		return "wip 已更新", nil
 
 	case "complete":
-		cur := e.wipOfLocked(author)
+		cur := e.wipForSessionLocked(owner, author)
 		if cur == nil {
 			return "", kbErr("NODE_NOT_FOUND", "没有你的活跃 wip", "先 kb_task start")
 		}
@@ -84,16 +109,44 @@ func (e *Engine) Task(a TaskArgs, sid, author string) (string, error) {
 		}
 		change := model.Change{
 			ID: chID, Nodes: nodes, At: e.now().UTC(),
-			Task: cur.Task, What: what, Why: why, Author: author,
+			Task: cur.Task, What: what, Why: why, Author: author, EffectsVersion: 1,
+		}
+		// WIP 删除与 journal 追加是一个崩溃事务；prepared intent 在 ClearWIP
+		// 前同时收录两者，进程在任一写后退出都会于下次 reload 全量恢复。
+		tx, err := e.prepareTruthTransactionLocked(map[string]bool{
+			e.Store.WIPRelFor(cur.Owner):  true,
+			e.Store.JournalRelFor(change): true,
+		})
+		if err != nil {
+			return "", err
+		}
+		defer e.guardTruthTransactionPanicLocked(tx)
+		rollback := func(cause error) (string, error) {
+			return "", e.rollbackTruthTransactionLocked(tx, cause)
+		}
+		if err := e.Store.ClearWIP(cur.Owner); err != nil {
+			return rollback(fmt.Errorf("task complete 清除 WIP: %w", err))
 		}
 		if err := e.Store.AppendChange(change); err != nil {
-			return "", err
+			committed := false
+			if changes, _, loadErr := e.Store.LoadJournal(); loadErr == nil {
+				for _, c := range changes {
+					if c.ID == change.ID {
+						committed = true
+						break
+					}
+				}
+			}
+			if !committed {
+				return rollback(fmt.Errorf("task complete 追加 journal: %w", err))
+			}
 		}
-		if err := e.Store.ClearWIP(author); err != nil {
-			return "", err
+		committed, commitErr := e.commitTruthTransactionLocked(tx)
+		if !committed {
+			return rollback(fmt.Errorf("task complete 写 committed marker: %w", commitErr))
 		}
-		if err := e.reloadLocked(); err != nil {
-			return "", err
+		if commitErr != nil {
+			return "", fmt.Errorf("task complete 已提交但 WAL 清理/重载失败(不要重试): %w", commitErr)
 		}
 		out := "已归档为变更记录 " + chID + ",wip 清空。"
 		// 任务尾偿还(§12.2 第 3 条,≤3 条,仅本任务读过的)+ 沉淀提醒(§9.3)。
@@ -132,6 +185,28 @@ func (e *Engine) wipOfLocked(owner string) *model.WIP {
 	return nil
 }
 
+// taskOwner 用 MCP session 区分同一客户端的并行任务。clientInfo.name 只表示
+// "codex"/"claude-code",不是会话 ID;直接当 owner 会让后一个 start 覆盖前一个。
+// 匿名/旧客户端没有 sid 时退化为 author。author 仍保留在前缀,展示可溯源。
+func taskOwner(sid, author string) string {
+	if strings.TrimSpace(sid) == "" {
+		return author
+	}
+	return author + "@" + sid
+}
+
+// wipForSessionLocked 优先取会话唯一台账;legacyOwner 兼容升级前按 author
+// 命名的本地 WIP,首次 update 后会迁到新键。
+func (e *Engine) wipForSessionLocked(owner, legacyOwner string) *model.WIP {
+	if w := e.wipOfLocked(owner); w != nil {
+		return w
+	}
+	if legacyOwner != owner {
+		return e.wipOfLocked(legacyOwner)
+	}
+	return nil
+}
+
 // mergeWIP 提供了字段就替换(update 语义)。
 func mergeWIP(cur, in model.WIP) model.WIP {
 	if in.Task != "" {
@@ -157,12 +232,12 @@ func mergeWIP(cur, in model.WIP) model.WIP {
 
 // sessionSuspectsLocked 本会话读取过且仍有待重验条目/状态的节点(≤3)。
 func (e *Engine) sessionSuspectsLocked(sid string) []string {
-	l := e.ledger(sid)
-	if l == nil {
+	reads := e.ledgerSnapshot(sid)
+	if reads == nil {
 		return nil
 	}
 	var out []string
-	for id := range l.reads {
+	for id := range reads {
 		ref := e.rt.ix.Node(id)
 		if ref == nil {
 			continue
@@ -253,8 +328,10 @@ func (e *Engine) Flow(a FlowArgs, sid, author string) (string, error) {
 		if existing != nil {
 			f.Since = existing.Since
 			f.Deprecated = existing.Deprecated
+			stampFlowStepGenerations(&f, existing, e.now().UTC())
 		} else {
 			f.Since = e.now().UTC()
+			stampFlowStepGenerations(&f, nil, f.Since)
 		}
 		if err := e.Store.SaveFlow(f); err != nil {
 			return "", err
@@ -279,4 +356,26 @@ func (e *Engine) Flow(a FlowArgs, sid, author string) (string, error) {
 		return a.Flow.ID + " 已废弃(文件保留可溯,退出注入与反向链接)", nil
 	}
 	return "", kbErr("INVALID_ARGUMENT", "非法 action "+a.Action, "action ∈ get|create|update|deprecate")
+}
+
+func stampFlowStepGenerations(next *model.Flow, previous *model.Flow, now time.Time) {
+	byNode := map[string][]time.Time{}
+	if previous != nil {
+		for _, step := range previous.Steps {
+			since := step.Since
+			if since.IsZero() {
+				since = previous.Since
+			}
+			byNode[step.Node] = append(byNode[step.Node], since)
+		}
+	}
+	for i := range next.Steps {
+		queue := byNode[next.Steps[i].Node]
+		if len(queue) > 0 {
+			next.Steps[i].Since = queue[0]
+			byNode[next.Steps[i].Node] = queue[1:]
+		} else {
+			next.Steps[i].Since = now
+		}
+	}
 }

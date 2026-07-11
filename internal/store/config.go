@@ -4,9 +4,13 @@ import (
 	"fmt"
 	"hash/fnv"
 	"os"
+	"path"
 	"path/filepath"
+	"strings"
 
 	"gopkg.in/yaml.v3"
+
+	"github.com/zdypro888/iknowledge/internal/model"
 )
 
 // Config 是 .knowledge/config.yaml(impl §1/§5):端口与 include/exclude 覆盖。
@@ -45,7 +49,7 @@ func (s *Store) configPath() string { return filepath.Join(s.dir, "config.yaml")
 
 // LoadConfig 读配置;文件不存在返回 (nil, nil)。
 func (s *Store) LoadConfig() (*Config, error) {
-	data, err := os.ReadFile(s.configPath())
+	data, err := s.readKnowledgeFile(s.configPath())
 	if os.IsNotExist(err) {
 		return nil, nil
 	}
@@ -56,7 +60,54 @@ func (s *Store) LoadConfig() (*Config, error) {
 	if err := yaml.Unmarshal(data, &cfg); err != nil {
 		return nil, fmt.Errorf("store: 解析 config: %w", err)
 	}
+	if err := ValidateConfig(&cfg); err != nil {
+		return nil, fmt.Errorf("store: 非法 config: %w", err)
+	}
 	return &cfg, nil
+}
+
+// ValidateConfig 是运行时与 bundle import 共用的 fail-closed 配置校验。
+func ValidateConfig(cfg *Config) error {
+	if cfg == nil {
+		return fmt.Errorf("config 为空")
+	}
+	if cfg.Schema != model.SchemaVersion {
+		return fmt.Errorf("schema=%d，当前仅支持 %d", cfg.Schema, model.SchemaVersion)
+	}
+	if cfg.Port < 1 || cfg.Port > 65535 {
+		return fmt.Errorf("port=%d 越界(1..65535)", cfg.Port)
+	}
+	if cfg.Scout != "" && cfg.Scout != "delegate" && cfg.Scout != "self" {
+		return fmt.Errorf("scout=%q 非法(仅 delegate|self)", cfg.Scout)
+	}
+	if cfg.ScoutTimeoutSec < 0 {
+		return fmt.Errorf("scout_timeout_seconds 不得为负")
+	}
+	for _, group := range []struct {
+		kind     string
+		patterns []string
+	}{{"include", cfg.Include}, {"exclude", cfg.Exclude}} {
+		for _, pattern := range group.patterns {
+			if pattern == "" || strings.HasPrefix(pattern, "/") || strings.ContainsAny(pattern, "\\\x00") {
+				return fmt.Errorf("%s pattern %q 非法", group.kind, pattern)
+			}
+			for segment := range strings.SplitSeq(strings.TrimSuffix(pattern, "/"), "/") {
+				if segment == "." || segment == ".." {
+					return fmt.Errorf("%s pattern %q 含非法路径段", group.kind, pattern)
+				}
+			}
+			if _, err := path.Match(strings.TrimSuffix(pattern, "/"), "probe"); err != nil {
+				return fmt.Errorf("%s pattern %q: %w", group.kind, pattern, err)
+			}
+		}
+	}
+	for _, ext := range cfg.Extensions {
+		name := strings.TrimPrefix(ext, ".")
+		if name == "" || len(ext) > 32 || strings.ContainsAny(ext, "/\\\x00") || strings.Contains(name, ".") {
+			return fmt.Errorf("extension %q 非法(应为 ext 或 .ext)", ext)
+		}
+	}
+	return nil
 }
 
 // EnsureConfig 幂等写配置:不存在才生成(用户手改的 config 永不被 init 覆盖),
@@ -70,7 +121,7 @@ func (s *Store) EnsureConfig() (*Config, error) {
 	if err != nil {
 		return nil, fmt.Errorf("store: 编码 config: %w", err)
 	}
-	if err := atomicWrite(s.configPath(), data); err != nil {
+	if err := s.atomicWrite(s.configPath(), data); err != nil {
 		return nil, err
 	}
 	return cfg, nil

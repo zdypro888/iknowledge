@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"net"
 	"net/http"
@@ -27,7 +28,13 @@ func startServe(t *testing.T, repo string, e *engine.Engine) int {
 	if err := os.WriteFile(filepath.Join(repo, ".knowledge", "config.yaml"), []byte(cfg), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	srv := &http.Server{Handler: mcpserv.New(e).Handler()}
+	identity, err := e.Store.EnsureLocalIdentity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	msrv := mcpserv.New(e)
+	msrv.LocalIdentity = identity
+	srv := &http.Server{Handler: msrv.Handler()}
 	go srv.Serve(ln)
 	t.Cleanup(func() { srv.Close() })
 	return port
@@ -112,6 +119,11 @@ func TestHookBridgeAuth(t *testing.T) {
 	}
 	msrv := mcpserv.New(e)
 	msrv.AuthToken = tok
+	identity, err := e.Store.EnsureLocalIdentity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	msrv.LocalIdentity = identity
 	srv := &http.Server{Handler: msrv.Handler()}
 	go srv.Serve(ln)
 	t.Cleanup(func() { srv.Close() })
@@ -177,7 +189,7 @@ func TestSetupPrints(t *testing.T) {
 	for _, want := range []string{
 		"mcpServers", "/mcp/main?repo=",
 		"本仓库配有 knowledge MCP", // 纪律段(engine.DisciplinePrompt 首行)
-		"PostToolUse", "iknowledge hook --repo",
+		"PostToolUse", `"command": "iknowledge hook"`,
 		"[mcp_servers.knowledge]", "AGENTS.md", // Codex 段(config.toml + 纪律载体)
 	} {
 		if !strings.Contains(out.String(), want) {
@@ -216,5 +228,31 @@ func TestSetupPrintsCodexAuthHeaders(t *testing.T) {
 		if !strings.Contains(got, want) {
 			t.Errorf("auth setup 输出缺 %q\n%s", want, got)
 		}
+	}
+}
+
+func TestHooksJSONSnippetIsCrossShellSafe(t *testing.T) {
+	snippet := hooksJSONSnippet()
+	if !json.Valid([]byte(snippet)) {
+		t.Fatalf("hook 片段不是合法 JSON:\n%s", snippet)
+	}
+	var got struct {
+		Hooks struct {
+			PostToolUse []struct {
+				Hooks []struct {
+					Command string `json:"command"`
+				} `json:"hooks"`
+			} `json:"PostToolUse"`
+		} `json:"hooks"`
+	}
+	if err := json.Unmarshal([]byte(snippet), &got); err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Hooks.PostToolUse) != 1 || len(got.Hooks.PostToolUse[0].Hooks) != 1 {
+		t.Fatalf("hook 结构异常: %+v", got)
+	}
+	want := "iknowledge hook"
+	if command := got.Hooks.PostToolUse[0].Hooks[0].Command; command != want {
+		t.Fatalf("command = %q, want %q", command, want)
 	}
 }

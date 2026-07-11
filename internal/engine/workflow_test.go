@@ -44,8 +44,8 @@ var errEmpty error
 // recall(history 含负知识) → 第二个会话 remember 相似方案触发防撞 → revert。
 func TestWorkflowRecordRecallCollisionRevert(t *testing.T) {
 	e, repo := initEngine(t, map[string]string{
-		"go.mod":                  "module example.com/m\n\ngo 1.26\n",
-		"internal/auth/login.go":  workflowSrc,
+		"go.mod":                 "module example.com/m\n\ngo 1.26\n",
+		"internal/auth/login.go": workflowSrc,
 	})
 
 	// ① 会话 A:读懂 Login,沉淀契约 + pitfall。
@@ -65,8 +65,8 @@ func TestWorkflowRecordRecallCollisionRevert(t *testing.T) {
 
 	// ② 会话 A:改造完成,record_change(否决了"sync.Map 缓存"方案)。
 	_, err = e.RecordChange(ChangeArgs{
-		Nodes:   []string{"internal/auth/login.go#Login"},
-		What:    "登录限流改造", Why: "防止暴力破解",
+		Nodes: []string{"internal/auth/login.go#Login"},
+		What:  "登录限流改造", Why: "防止暴力破解",
 		Rejected: []model.Rejected{
 			{Option: "用 sync.Map 做登录尝试计数缓存", Reason: "尺寸不可预估,长跑内存泄漏"},
 		},
@@ -184,8 +184,8 @@ func TestWorkflowLandmineAccumulationAndWarning(t *testing.T) {
 	e.rt.mu.RUnlock()
 	if prevID != "" {
 		if _, err := e.RecordChange(ChangeArgs{
-			Nodes:    []string{"internal/auth/login.go#Login"},
-			What:     "推翻之前的限流方案", Why: "实测发现空锁不够",
+			Nodes: []string{"internal/auth/login.go#Login"},
+			What:  "推翻之前的限流方案", Why: "实测发现空锁不够",
 			Overturns: prevID, Rebuttal: "空锁在并发下无效",
 		}, "s", "codex"); err != nil {
 			t.Logf("overturns 需 scope 校验,若失败忽略:%v", err)

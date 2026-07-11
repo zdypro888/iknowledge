@@ -35,8 +35,12 @@ func (e *Engine) Investigate(a InvestigateArgs, sid, author string) (string, err
 	// R29 批次3:用缓存 config(60s TTL,错误不再吞——configError() 进 kb_status)。
 	cfg := e.cachedConfig()
 	selfMode := cfg != nil && cfg.Scout == "self"
+	var trustErr error
+	if selfMode {
+		trustErr = scoutTrusted(e.Store, cfg)
+	}
 
-	out, job, clueFiles, err := e.investigateLocked(a, selfMode)
+	out, job, clueFiles, err := e.investigateLocked(a, selfMode, trustErr)
 	if err != nil || job == nil {
 		return out, err // 库内命中(不派兵)或错误
 	}
@@ -52,7 +56,7 @@ func (e *Engine) Investigate(a InvestigateArgs, sid, author string) (string, err
 
 // investigateLocked 是 Investigate 的持锁段。返回值三态:
 // (库内命中文本, nil, nil, nil)不派兵;(简报, job, 线索文件, nil)已开 job;错误。
-func (e *Engine) investigateLocked(a InvestigateArgs, selfMode bool) (string, *scoutJob, []string, error) {
+func (e *Engine) investigateLocked(a InvestigateArgs, selfMode bool, trustErr error) (string, *scoutJob, []string, error) {
 	e.rt.mu.Lock()
 	defer e.rt.mu.Unlock()
 
@@ -63,6 +67,10 @@ func (e *Engine) investigateLocked(a InvestigateArgs, selfMode bool) (string, *s
 	// ① 先查库:流程/排障命中且新鲜 → 直接返回 findings,不派兵。
 	if out, hit := e.libraryFindingsLocked(a.Question); hit {
 		return framed(out), nil, nil, nil
+	}
+	if selfMode && trustErr != nil {
+		return "", nil, nil, kbErr("SCOUT_TRUST_REQUIRED", trustErr.Error(),
+			"核对 .knowledge/config.yaml 后由本机用户运行 iknowledge trust-scout --repo "+e.Store.RepoRoot())
 	}
 
 	// ② 递归护栏:同 repo 最多 1 个活跃 job(SCOUT_BUSY 同时挡住侦察兵套娃)。

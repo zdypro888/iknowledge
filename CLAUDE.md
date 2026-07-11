@@ -8,10 +8,10 @@ AI 代码知识库(MCP 服务)。**两份设计文档是唯一真相源**,实现
 ## 铁律(违反即返工)
 
 - **零重依赖**:第一期仅允许 `gopkg.in/yaml.v3`;禁止引入 MCP SDK/JSON-RPC 框架/tokenizer——JSON-RPC 2.0 手写(风格参照 aibridge 的 `internal/bridge/mcp.go`)
-- **工具对源码只读**:唯一写入 `.knowledge/`(设计铁律二);任何往 `.knowledge/` 之外写文件的代码都是 bug
-- 包依赖方向:`mcpserv → engine → {store, index, parser, model}`;`model` 不依赖任何内部包
+- **工具对源码只读**:仓库内容只写 `.knowledge/`(设计铁律二),永不改源码;仓库外写入仅限按 canonical repo path 分仓的用户私有运行态(auth/local identity/scout trust/崩溃 WAL)、显式 `export -o` 制品与 install/uninstall 用户级部署,除此之外都是 bug
+- 包依赖方向:`mcpserv → engine → {store, index, parser, model, pty}`;`model`/`pty` 不依赖任何内部包
 - 表驱动测试;所有 YAML 写入走 temp + fsync + `os.Rename` + 目录 fsync 原子写(轮 25);分片读写必须保留未知字段(yaml.Node 往返)
-- 双哈希语义不许混用:`Hash` 只管腐烂检测,`StructHash` 只管迁移匹配(impl §5)
+- 三种哈希语义不许混用:`Hash` 只管腐烂检测,`StructHash` 只找迁移候选,`DocStructHash` 决定候选能否保持 fresh(impl §5/§6)
 - **测试 MCP:协议级手段优先**(curl / httptest,便宜无额度消耗);真实客户端联测**禁用 `claude -p`**(独立限流池,撞账号限额),用 **PTY 驱动交互式 claude**(aibridge `internal/agent` 模式,用户已授权)
 
 ## 命令
@@ -48,7 +48,7 @@ go test -race ./...
 
 ⑥**JS/TS 解析器**(多语言 T1):纯 Go 轻量词法(零运行时依赖,Node.js 不自带 AST 解析库),.ts/.tsx/.js/.jsx/.mjs/.cjs/.mts/.cts。近似解析(宁缺不要错),格式/注释免疫哈希 + 改名免疫 StructHash。恒注册(纯 Go 无需探测)。
 
-⑦**工程化/健壮性**:atomicWrite symlink 防线注释;fsyncdir build tag !unix→windows(+unknown 报错版);Python helper -S + 清环境变量;mergeUnknown/cloneNode 深度限(防恶意嵌套栈溢出);只读端点 limit 钳制;session 后台回收 goroutine + cap 10000。
+⑦**工程化/健壮性**:atomicWrite symlink 防线注释;fsyncdir build tag !unix→windows(+unknown 报错版);Python helper `-I -S` + 最小环境/非仓库 cwd;mergeUnknown/cloneNode 深度限(防恶意嵌套栈溢出);只读端点 limit 钳制;session 后台回收 goroutine + cap 10000。
 
 全轮零重依赖守住(go.mod 仍只 yaml.v3)、工具不碰源码、包依赖方向不变。新增 ~1500 行 Go(含测试),总测试 149→175+。
 
@@ -67,3 +67,7 @@ go test -race ./...
 **轮 31(2026-07-09,运维与收尾闭环)**:把"下一步缺什么"做成可执行闭环而非口头建议。①新增 `iknowledge doctor` 仓库/部署自检:初始化、config、parser health、维护欠账、活跃 wip、PATH/常见部署软链、误留 `iknowledge serve` 进程提示;②导入升级为报告化 `ImportWithOptions`,CLI 支持 `import --dry-run --backup --max-entry-mb`,导入前备份写入 `.knowledge/local/import-backups/`,并限制单条 bundle 大小;③`kb_session` 增加 `gate` 质量门,任务收尾提示失败调用、读而未沉淀、多次读取未沉淀、suspect 使用风险与 record_change 义务;④`kb_recall`/`kb_diagnose` 输出命中解释(score/归一化来源/pitfall 命中数),降低 AI 误把弱相关当确定结论的风险;⑤`iknowledge maintain --plan` 输出按债种分组的维护路线。顺手修 import tar slip 后续问题:bundle 只允许 tree/journal/flows/topics/config,排除 local/wip/MANIFEST/路径逃逸,写入统一走 store 原子写。回归覆盖 dry-run/backup、parser health/doctor、session gate、导入路径限制。仍零新依赖,不改服务模式。
 
 **轮 32(2026-07-09,地基验证 + 智能升级——"完善智能"三件)**:用户命题"按最完美方法做,尽量完善智能"。①**端到端工作流集成测试**:4 个测试模拟 AI 真实工作序列(record→recall→防撞→revert / diagnose 定位 / 雷区累积 / 跨会话 stale),验证轮29~30 所有功能协同正确(此前 181 测试全是单工具单点)。发现 stale 测试构造要点:Go parser 哈希 gofmt 免疫且行内注释不参与,须改实际语句才触发失配;②**变更影响面分析**:record_change 回执末尾用 callgraph calledByOf 报告波及调用方——改一个函数立刻知道"被 N 处调用,其中带契约知识的 M 处可能被破坏,建议 kb_recall 复核"。从"记忆"到"主动协作"的关键一跃;③**知识缺口发现**:kb_status 加知识缺口 TOP5(被依赖 calledBy≥2 却零活跃知识的节点),主动提示"这块每次用都得从零读代码,该沉淀契约/坑了"。三批次 build/vet/-race 全绿,新增 ~470 行(含测试),总测试 181→193。
+
+**轮 33(2026-07-09,预编译发布)**:release workflow 在 `v*` tag 构建 darwin/linux/windows × amd64/arm64、生成 sha256sums 并创建 GitHub Release;install.sh 优先预编译、无匹配资产回退 go install,双宿主 skill 同步安装。`v0.2.0` 为首个标签;随后主线补 Windows arm64 与 installer 静态加固。
+
+**轮 34(2026-07-11,先 pull 最新后全仓审核并修复)**:安全/事务/解析/并发四镜头清盘。①self scout 授权、auth 根 token、本机 listener identity 全迁仓外用户私有态;stdio/hook/scout 无论 Bearer 开关均先做 loopback 双向 HMAC,仓内临时配置只含 scope 短 session;源码与 `.knowledge` 根以下 symlink/非普通文件统一拒绝。②record_change/verify/revert/adopt/task-complete/import 统一用仓外 prepared/committed WAL,恢复只允许 writer-lock owner,panic 同进程回滚;结构化 Entry/Node effects 使 revert 可证明、旧记录 fail closed。③bundle 必须唯一 manifest/单 gzip,限制单条/总量/header/staging,拒尾随、非普通、不可便携与运行时不可见路径;默认不覆盖异内容,显式 `--force`;remap 覆盖 project/tree/flow/journal/config 并做最终引用/月分片/effects 校验。④Go 哈希/调用图按 `(dir,package)` 隔离,Python `-I -S`+PEP263,TS regex/class initializer,Java/Rust 边界修正;DocStructHash 护栏。⑤session ledger/callgraph 不可变快照,重复 Node ID 全隔离,历史/FlowStep 按 Since 路由代际,拆分 entry 找真实继承者,WIP 按 session。⑥安装/卸载/发布跨平台与 checksum/原子性加固。README/两份正本同步;交付门仍为 build/vet/全量 race + shell 语法/脚本动态回归 + Windows 双架构交叉构建。未发布/未打新 tag。

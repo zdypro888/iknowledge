@@ -2,8 +2,6 @@ package engine
 
 import (
 	"fmt"
-	"os"
-	"path/filepath"
 	"sort"
 	"strings"
 
@@ -42,7 +40,7 @@ func (e *Engine) ParserHealth() (ParserHealthReport, error) {
 		if p == nil {
 			continue
 		}
-		src, err := os.ReadFile(filepath.Join(e.Store.RepoRoot(), filepath.FromSlash(rel)))
+		src, err := safeRepoRead(e.Store.RepoRoot(), rel)
 		if err != nil || parser.IsGenerated(src) {
 			continue
 		}
@@ -125,6 +123,11 @@ func (r DoctorReport) Text() string {
 // Doctor 做只读仓库自检。未初始化时只报告基础状态。
 func (e *Engine) Doctor() (DoctorReport, error) {
 	rep := DoctorReport{RepoRoot: e.Store.RepoRoot(), Initialized: e.Store.Initialized(), GitFilesOK: e.Store.GitFilesOK()}
+	if rep.Initialized {
+		if err := e.Sync(); err != nil {
+			return rep, err
+		}
+	}
 	if cfg, err := e.Store.LoadConfig(); err != nil {
 		rep.Warnings = append(rep.Warnings, "config.yaml 解析失败:"+err.Error())
 	} else if cfg != nil {
@@ -133,9 +136,6 @@ func (e *Engine) Doctor() (DoctorReport, error) {
 	if !rep.Initialized {
 		rep.Warnings = append(rep.Warnings, "先运行 iknowledge init --repo "+e.Store.RepoRoot())
 		return rep, nil
-	}
-	if err := e.Sync(); err != nil {
-		return rep, err
 	}
 	ph, err := e.ParserHealth()
 	if err != nil {

@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"sort"
 	"strings"
 )
 
@@ -21,8 +22,9 @@ import (
 //
 // 粒度与哈希语义对齐 Go/Python 插件:
 //   - 符号 = 顶层 function/class + 类方法(Class.method 规范名);
-//   - Hash = sha256("ts\0"+kind+"\0"+归一化body):归一化 = 压缩空白 + 去注释,
-//     使格式/注释免疫(弱于 Go 的 go/printer 精确重打印,留痕);
+//   - Hash = sha256("ts\0"+kind+"\0"+归一化body):归一化 = 横向空白压缩 +
+//     LineTerminator 归一为 `\n` + 去注释。JS 的 ASI/受限产生式让换行可能改变
+//     语义，故只对横向格式免疫，换行保守敏感(弱于 Go 的 AST 精确重打印,留痕);
 //   - StructHash = 自身名换占位符后的归一化:改名免疫,仅迁移匹配;
 //   - class 符号的哈希剥离方法体(方法另有符号)——方法改动不连坐 class 节点。
 type TypeScript struct{}
@@ -103,10 +105,15 @@ func scanJSTS(src []byte) []Symbol {
 			i = skipString(src, i, n)
 			continue
 		}
-		if c == '/' && depth == 0 && i+1 < n {
-			// 顶层除号或正则;近似处理:跳过单行/多行注释,正则当除号略过。
+		if c == '/' && i+1 < n {
+			// 所有深度都跳过注释；能确定是正则字面量时整段跳过，避免
+			// `/class Fake {}/` 造假符号或 `/{/` 破坏花括号深度。
 			if src[i+1] == '/' || src[i+1] == '*' {
 				skipWS()
+				continue
+			}
+			if end := jsRegexLiteralEnd(src, i, n, 0); end > i {
+				i = end
 				continue
 			}
 		}
@@ -124,8 +131,10 @@ func scanJSTS(src []byte) []Symbol {
 			continue
 		}
 
-		// 只在顶层(depth 0)和 class body(depth 1)提取声明。
-		if depth <= 1 && (c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c == '_' || c == '$') {
+		// 主扫描只取顶层声明。class 方法由 extractClass 的有界二次扫描提取；
+		// 若把任意 depth=1 都当 class body，普通对象字面量
+		// `const x = { fake() {} }` 会被误建成顶层 method。
+		if depth == 0 && (c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c == '_' || c == '$') {
 			tokStart := i
 			tok, _ := readIdent()
 
@@ -140,12 +149,10 @@ func scanJSTS(src []byte) []Symbol {
 			case "async":
 				// async function / async method
 				skipWS()
-				nextTok, nextStart := readIdent()
+				nextTok, _ := readIdent()
 				if nextTok == "function" {
-					i = nextStart
 					tok = "function"
 				} else {
-					i = nextStart
 					continue
 				}
 			case "public", "private", "protected", "static", "readonly", "override":
@@ -153,18 +160,7 @@ func scanJSTS(src []byte) []Symbol {
 				skipWS()
 				continue
 			case "get", "set":
-				// getter/setter:当作方法名前缀,跳过看后面
-				skipWS()
-				nextTok, nextStart := readIdent()
-				if depth == 1 && isIdentStart(nextTok) {
-					// class 内 getter/setter:当方法处理
-					sym, ok := extractMethod(src, nextTok, nextStart, &i, n)
-					if ok {
-						syms = append(syms, sym)
-					}
-					continue
-				}
-				i = nextStart
+				// 顶层 get/set 不是独立声明；class getter/setter 由 extractClass 处理。
 				continue
 			}
 
@@ -200,15 +196,6 @@ func scanJSTS(src []byte) []Symbol {
 				}
 				continue
 			}
-			// class body 内的方法(depth 1):function 关键字或直接 methodName(...) {
-			if depth == 1 && tok != "" {
-				// 检查是否是方法(标识符后跟可选 <泛型> 和 ( 参数 )
-				sym, ok := tryExtractMethod(src, tok, tokStart, &i, n)
-				if ok {
-					syms = append(syms, sym)
-				}
-				continue
-			}
 			continue
 		}
 		i++
@@ -220,10 +207,16 @@ func isIdentStart(s string) bool { return len(s) > 0 }
 
 // extractFuncDecl 提取 function 声明:从 name 起到匹配的 } 结束。
 func extractFuncDecl(src []byte, name string, nameStart int, i *int, n int) (Symbol, bool) {
-	// 找到参数列表 ( ... ) 后的 {
-	brace := findOpenBrace(src, *i, n)
+	// 先完整匹配可选泛型与参数列表，再识别返回类型之后的正文。
+	// 这避免把解构参数、对象默认值或对象返回类型的 `{}` 当函数体。
+	afterName := *i
+	brace := findJSCallableBody(src, afterName, n)
 	if brace < 0 {
-		*i = n
+		// TypeScript overload/ambient declaration 合法地以 `;` 结尾。只跳过
+		// 当前签名，不能把扫描指针直接置到 EOF，否则首个 overload 会让后续
+		// 实现及整文件所有声明消失。找不到安全边界时至少停在名字之后，宁缺
+		// 当前声明也继续扫描后续顶层 declaration。
+		*i = skipJSDeclarationSignature(src, afterName, n)
 		return Symbol{}, false
 	}
 	end := matchBrace(src, brace, n)
@@ -266,6 +259,35 @@ func extractClass(src []byte, name string, nameStart int, i *int, n int) (Symbol
 			j++
 			continue
 		}
+		if c == '"' || c == '\'' || c == '`' {
+			j = skipString(src, j, end)
+			continue
+		}
+		if c == '/' && j+1 < end && (src[j+1] == '/' || src[j+1] == '*') {
+			j = skipLineOrBlockComment(src, j, end)
+			continue
+		}
+		if c == '/' {
+			if regexEnd := jsRegexLiteralEnd(src, j, end, brace+1); regexEnd > j {
+				j = regexEnd
+				continue
+			}
+		}
+		if c == '=' {
+			// class 字段 initializer 可含 named function/object method/arrow
+			// body；这些标识符都不是 class method。整段跳到字段边界，
+			// 否则 `handler = function fake(){}` 会伪造 Class.fake。
+			j = skipJSClassFieldInitializer(src, j+1, end)
+			continue
+		}
+		if c == '{' {
+			// 字段初始化器、static 块或嵌套类型不是方法声明。
+			if close := matchBrace(src, j, end); close >= 0 {
+				j = close + 1
+				continue
+			}
+			break
+		}
 		// 跳过修饰符。
 		if tok, ts := readIdentAt(src, j, end); tok != "" {
 			switch tok {
@@ -287,11 +309,16 @@ func extractClass(src []byte, name string, nameStart int, i *int, n int) (Symbol
 		}
 		j++
 	}
-	*i = end + 1
-	return Symbol{
+	classSym := Symbol{
 		Name: name, Kind: "type",
 		Start: start, End: end, Body: body, Lines: lines,
-	}, methods, true
+	}
+	// class 节点表达类型结构，不复制每个方法的实现。保留 extends/implements、
+	// 字段与方法签名，只把已确认的直接方法正文压成空块；方法实现由独立
+	// Class.method 节点锚定，修改它不能连坐 class knowledge。
+	computeTypeScriptHash(&classSym, stripTypeScriptMethodBodies(src, start, end, methods))
+	*i = end + 1
+	return classSym, methods, true
 }
 
 // extractMethod 提取 class 方法(从 i 处的方法名起)。供 scanJSTS 内联用。
@@ -303,35 +330,10 @@ func extractMethod(src []byte, name string, nameStart int, i *int, n int) (Symbo
 // tryExtractMethod 尝试从 nameStart 处提取方法:标识符后跟 ( ... ) {。
 func tryExtractMethod(src []byte, name string, nameStart int, i *int, n int) (Symbol, bool) {
 	*i = nameStart + len(name)
-	skipSpacesAdvance(src, i, n)
-	// 可选泛型 <T>
-	if *i < n && src[*i] == '<' {
-		gt := findChar(src, *i, n, '>')
-		if gt > 0 {
-			*i = gt + 1
-			skipSpacesAdvance(src, i, n)
-		}
-	}
-	// 可选类型参数对构造器等;必须跟 ( 才是方法。
-	if *i >= n || src[*i] != '(' {
-		return Symbol{}, false
-	}
-	// 找参数列表结束 )。
-	parEnd := matchParen(src, *i, n)
-	if parEnd < 0 {
-		return Symbol{}, false
-	}
-	*i = parEnd + 1
-	skipSpacesAdvance(src, i, n)
-	// 可选返回类型 :Type
-	if *i < n && src[*i] == ':' {
-		// 跳过类型注解到 { 或 ; 或 =。
-		*i = skipTypeAnnotation(src, *i, n)
-		skipSpacesAdvance(src, i, n)
-	}
+	bodyOpen := findJSCallableBody(src, *i, n)
 	// 方法体 { ... } 或抽象方法 ; 或表达式。
-	if *i < n && src[*i] == '{' {
-		end := matchBrace(src, *i, n)
+	if bodyOpen >= 0 {
+		end := matchBrace(src, bodyOpen, n)
 		if end < 0 {
 			*i = n
 			return Symbol{}, false
@@ -350,30 +352,9 @@ func tryExtractMethod(src []byte, name string, nameStart int, i *int, n int) (Sy
 
 // tryExtractMethodRange 在 [lo, hi) 范围内提取方法(供 extractClass body 扫描用)。
 func tryExtractMethodRange(src []byte, name string, nameStart, lo, hi int) (Symbol, bool) {
-	i := nameStart + len(name)
-	skipSpacesRange(src, &i, hi)
-	if i < hi && src[i] == '<' {
-		gt := findChar(src, i, hi, '>')
-		if gt > 0 {
-			i = gt + 1
-			skipSpacesRange(src, &i, hi)
-		}
-	}
-	if i >= hi || src[i] != '(' {
-		return Symbol{}, false
-	}
-	parEnd := matchParen(src, i, hi)
-	if parEnd < 0 {
-		return Symbol{}, false
-	}
-	i = parEnd + 1
-	skipSpacesRange(src, &i, hi)
-	if i < hi && src[i] == ':' {
-		i = skipTypeAnnotation(src, i, hi)
-		skipSpacesRange(src, &i, hi)
-	}
-	if i < hi && src[i] == '{' {
-		end := matchBrace(src, i, hi)
+	bodyOpen := findJSCallableBody(src, nameStart+len(name), hi)
+	if bodyOpen >= 0 {
+		end := matchBrace(src, bodyOpen, hi)
 		if end < 0 || end >= hi {
 			return Symbol{}, false
 		}
@@ -392,28 +373,80 @@ func tryExtractMethodRange(src []byte, name string, nameStart, lo, hi int) (Symb
 func computeHashes(syms []Symbol) []Symbol {
 	for i := range syms {
 		s := &syms[i]
-		norm := normalizeJS(s.Body)
-		// StructHash:自身名换占位符(改名免疫)。对 method,名是 "Class.method",
-		// 换最后一段;对 func/type,换整个名。近似:把 body 里的名字做字符串替换。
-		structNorm := norm
-		if dot := strings.LastIndex(s.Name, "."); dot >= 0 {
-			structNorm = bytes.ReplaceAll(norm, []byte(s.Name[dot+1:]), []byte("_$SELF$_"))
-		} else {
-			structNorm = bytes.ReplaceAll(norm, []byte(s.Name), []byte("_$SELF$_"))
+		if s.Hash == "" { // class 已用剥方法正文的结构源计算
+			computeTypeScriptHash(s, s.Body)
 		}
-		h := sha256.Sum256([]byte("ts\x00" + s.Kind + "\x00" + string(norm)))
-		sh := sha256.Sum256([]byte("ts\x00" + s.Kind + "\x00" + string(structNorm)))
-		s.Hash = "sha256:" + hex.EncodeToString(h[:])
-		s.StructHash = "sha256:" + hex.EncodeToString(sh[:])
 	}
 	return syms
 }
 
-// normalizeJS 归一化 JS/TS 源:压缩连续空白、去注释,使格式/注释免疫(近似 gofmt 免疫)。
+func computeTypeScriptHash(s *Symbol, hashBody []byte) {
+	norm := normalizeJS(hashBody)
+	// StructHash:自身名换占位符(改名免疫)。对 method,名是 "Class.method",
+	// 换最后一段;对 func/type,换整个名。近似:把 body 里的名字做字符串替换。
+	structNorm := norm
+	if dot := strings.LastIndex(s.Name, "."); dot >= 0 {
+		structNorm = bytes.ReplaceAll(norm, []byte(s.Name[dot+1:]), []byte("_$SELF$_"))
+	} else {
+		structNorm = bytes.ReplaceAll(norm, []byte(s.Name), []byte("_$SELF$_"))
+	}
+	h := sha256.Sum256([]byte("ts\x00" + s.Kind + "\x00" + string(norm)))
+	sh := sha256.Sum256([]byte("ts\x00" + s.Kind + "\x00" + string(structNorm)))
+	s.Hash = "sha256:" + hex.EncodeToString(h[:])
+	s.StructHash = "sha256:" + hex.EncodeToString(sh[:])
+}
+
+// stripTypeScriptMethodBodies 返回 class 的哈希专用源码：保留方法签名和 `{}`，
+// 删除直接方法正文。Symbol.Body 仍保持 [Start:End) 原文，不破坏 parser 契约。
+func stripTypeScriptMethodBodies(src []byte, classStart, classEnd int, methods []Symbol) []byte {
+	type bodyRange struct{ lo, hi int }
+	ranges := make([]bodyRange, 0, len(methods))
+	for _, method := range methods {
+		name := method.Name
+		if dot := strings.LastIndex(name, "."); dot >= 0 {
+			name = name[dot+1:]
+		}
+		open := findJSCallableBody(src, method.Start+len(name), method.End+1)
+		if open < method.Start || open >= method.End || open+1 > method.End {
+			continue // 边界不确定则保留原文，宁可 class 多报 stale
+		}
+		ranges = append(ranges, bodyRange{lo: open + 1, hi: method.End})
+	}
+	sort.Slice(ranges, func(i, j int) bool { return ranges[i].lo < ranges[j].lo })
+	var out bytes.Buffer
+	cursor := classStart
+	for _, r := range ranges {
+		if r.lo < cursor || r.hi < r.lo || r.hi > classEnd {
+			continue
+		}
+		out.Write(src[cursor:r.lo])
+		cursor = r.hi
+	}
+	out.Write(src[cursor:classEnd])
+	return out.Bytes()
+}
+
+// normalizeJS 归一化 JS/TS 源:横向空白压缩、去注释、LineTerminator 统一为
+// 单个 `\n`。JS 的 ASI、async/生成器与 postfix 等语义面依赖换行，无法像 Go
+// 一样安全地把所有空白压成空格；这里 fail closed，宁可换行 reflow 多报 suspect，
+// 不可让语义变化与旧哈希碰撞。
 func normalizeJS(src []byte) []byte {
 	var out bytes.Buffer
 	i, n := 0, len(src)
-	prevWS := false
+	pendingWS := false
+	pendingNewline := false
+	flushSpace := func() {
+		if !pendingWS || out.Len() == 0 {
+			pendingWS, pendingNewline = false, false
+			return
+		}
+		if pendingNewline {
+			out.WriteByte('\n')
+		} else {
+			out.WriteByte(' ')
+		}
+		pendingWS, pendingNewline = false, false
+	}
 	for i < n {
 		c := src[i]
 		// 注释。
@@ -421,41 +454,580 @@ func normalizeJS(src []byte) []byte {
 			for i < n && src[i] != '\n' {
 				i++
 			}
+			pendingWS = true
 			continue
 		}
 		if c == '/' && i+1 < n && src[i+1] == '*' {
+			start := i
 			i += 2
 			for i+1 < n && !(src[i] == '*' && src[i+1] == '/') {
 				i++
 			}
-			i += 2
+			i = min(i+2, n)
+			pendingWS = true
+			pendingNewline = pendingNewline || bytes.IndexByte(src[start:i], '\n') >= 0
 			continue
+		}
+		if c == '/' {
+			if end := jsRegexLiteralEnd(src, i, n, 0); end > i {
+				flushSpace()
+				out.Write(src[i:end]) // regex 内容逐字保留；只归一外部空白
+				i = end
+				continue
+			}
 		}
 		// 字符串(保留内容,只压外部空白)。
 		if c == '"' || c == '\'' || c == '`' {
+			flushSpace()
 			end := skipString(src, i, n)
 			out.Write(src[i:end])
 			i = end
-			prevWS = false
 			continue
 		}
 		// 空白压成一个空格。
 		if c == ' ' || c == '\t' || c == '\n' || c == '\r' {
-			if !prevWS {
-				out.WriteByte(' ')
-				prevWS = true
-			}
+			pendingWS = true
+			pendingNewline = pendingNewline || c == '\n' || c == '\r'
 			i++
 			continue
 		}
+		flushSpace()
+		if isJSIdentByte(c) {
+			start := i
+			for i < n && isJSIdentByte(src[i]) {
+				i++
+			}
+			out.Write(src[start:i])
+			continue
+		}
 		out.WriteByte(c)
-		prevWS = false
 		i++
 	}
 	return bytes.TrimSpace(out.Bytes())
 }
 
+// skipJSDeclarationSignature 在没有正文时跳过一个 overload/ambient 签名。
+// 仅把所有括号都闭合后的 `;` 当边界；对象返回类型里的属性分号不能截断。
+// 找不到确定边界时返回 start，让主扫描从函数名后继续，绝不吞掉后续文件。
+func skipJSDeclarationSignature(src []byte, start, n int) int {
+	parenDepth, bracketDepth, braceDepth, angleDepth := 0, 0, 0, 0
+	for i := start; i < n; {
+		c := src[i]
+		if c == '"' || c == '\'' || c == '`' {
+			i = skipString(src, i, n)
+			continue
+		}
+		if c == '/' && i+1 < n && (src[i+1] == '/' || src[i+1] == '*') {
+			i = skipLineOrBlockComment(src, i, n)
+			continue
+		}
+		if c == '/' {
+			if end := jsRegexLiteralEnd(src, i, n, start); end > i {
+				i = end
+				continue
+			}
+		}
+		switch c {
+		case '(':
+			parenDepth++
+		case ')':
+			if parenDepth > 0 {
+				parenDepth--
+			}
+		case '[':
+			bracketDepth++
+		case ']':
+			if bracketDepth > 0 {
+				bracketDepth--
+			}
+		case '{':
+			braceDepth++
+		case '}':
+			if braceDepth > 0 {
+				braceDepth--
+			}
+		case '<':
+			angleDepth++
+		case '>':
+			if angleDepth > 0 {
+				angleDepth--
+			}
+		case ';':
+			if parenDepth == 0 && bracketDepth == 0 && braceDepth == 0 && angleDepth == 0 {
+				return i + 1
+			}
+		}
+		i++
+	}
+	return start
+}
+
 // ---- 词法 helpers ----
+
+func isJSIdentByte(c byte) bool {
+	return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+		(c >= '0' && c <= '9') || c == '_' || c == '$' || c >= 0x80
+}
+
+// skipLineOrBlockComment 跳过 JS/TS/Java 风格注释。调用者已确认 i 在 `/`。
+func skipLineOrBlockComment(src []byte, i, n int) int {
+	if i+1 >= n {
+		return i + 1
+	}
+	if src[i+1] == '/' {
+		for i < n && src[i] != '\n' {
+			i++
+		}
+		return i
+	}
+	if src[i+1] == '*' {
+		i += 2
+		for i+1 < n && !(src[i] == '*' && src[i+1] == '/') {
+			i++
+		}
+		return min(i+2, n)
+	}
+	return i + 1
+}
+
+// jsRegexLiteralEnd 在 slash 能确定处于“表达式起点”时跳过正则字面量，返回
+// flags 之后的位置；不确定或字面量未闭合返回 slash 本身。JS 的 `/` 同时是
+// 除法运算符，宁可漏跳一个复杂正则，也不能把普通除法吞成字符串。
+func jsRegexLiteralEnd(src []byte, slash, n, lowerBound int) int {
+	if slash < lowerBound || slash >= n || src[slash] != '/' ||
+		!jsCanStartRegex(src, slash, lowerBound) {
+		return slash
+	}
+	inClass := false
+	for i := slash + 1; i < n; {
+		c := src[i]
+		if c == '\n' || c == '\r' || isJSUnicodeLineTerminator(src, i, n) {
+			return slash // regex literal 不能跨未转义 LineTerminator
+		}
+		if c == '\\' {
+			if i+1 >= n || src[i+1] == '\n' || src[i+1] == '\r' || isJSUnicodeLineTerminator(src, i+1, n) {
+				return slash
+			}
+			i += 2
+			continue
+		}
+		switch c {
+		case '[':
+			inClass = true
+		case ']':
+			inClass = false
+		case '/':
+			if !inClass {
+				i++
+				for i < n && isJSIdentByte(src[i]) { // flags；非法 flag 留给真实编译器裁决
+					i++
+				}
+				return i
+			}
+		}
+		i++
+	}
+	return slash
+}
+
+func isJSUnicodeLineTerminator(src []byte, i, n int) bool {
+	return i+2 < n && src[i] == 0xe2 && src[i+1] == 0x80 && (src[i+2] == 0xa8 || src[i+2] == 0xa9)
+}
+
+func jsCanStartRegex(src []byte, slash, lowerBound int) bool {
+	j := previousJSSignificant(src, slash, lowerBound)
+	if j < lowerBound {
+		return true
+	}
+	if src[j] == ')' && jsClosesControlHead(src, j, lowerBound) {
+		// `if (ok) /re/.test(x)` 等单语句控制体：`)` 平常结束表达式，
+		// 但在控制头之后恰好开启一条新 Statement，slash 使用 regexp 词法目标。
+		return true
+	}
+	switch src[j] {
+	case '(', '[', '{', ',', ';', ':', '=', '!', '?', '&', '|', '*', '%', '^', '~', '<', '>':
+		return true
+	case '+', '-':
+		// `value++ / 2` / `value-- / 2`：postfix 运算后的 slash 必为除法。
+		return j == lowerBound || src[j-1] != src[j]
+	}
+	if !isJSIdentByte(src[j]) {
+		return false
+	}
+	start := j
+	for start > lowerBound && isJSIdentByte(src[start-1]) {
+		start--
+	}
+	switch string(src[start : j+1]) {
+	case "await", "case", "delete", "do", "else", "in", "instanceof", "new", "of",
+		"return", "throw", "typeof", "void", "yield":
+		return true
+	}
+	return false
+}
+
+// jsClosesControlHead 判断 close 是否闭合 if/while/for/with 的控制头。正向扫描
+// 找匹配左括号，避免条件中的嵌套调用把简单反向计数扰乱。这里只在 slash 前一
+// token 是 `)` 时触发；递归识别更早的 regex 每次都向左推进，必然终止。
+func jsClosesControlHead(src []byte, close, lowerBound int) bool {
+	stack := make([]int, 0, 4)
+	open := -1
+	for i := lowerBound; i <= close; {
+		c := src[i]
+		if c == '"' || c == '\'' || c == '`' {
+			i = skipString(src, i, close+1)
+			continue
+		}
+		if c == '/' && i+1 <= close && (src[i+1] == '/' || src[i+1] == '*') {
+			i = skipLineOrBlockComment(src, i, close+1)
+			continue
+		}
+		if c == '/' {
+			if end := jsRegexLiteralEnd(src, i, close+1, lowerBound); end > i {
+				i = end
+				continue
+			}
+		}
+		switch c {
+		case '(':
+			stack = append(stack, i)
+		case ')':
+			if len(stack) == 0 {
+				return false
+			}
+			candidate := stack[len(stack)-1]
+			stack = stack[:len(stack)-1]
+			if i == close {
+				open = candidate
+			}
+		}
+		i++
+	}
+	if open < 0 {
+		return false
+	}
+	j := previousJSSignificant(src, open, lowerBound)
+	if j < lowerBound || !isJSIdentByte(src[j]) {
+		return false
+	}
+	start := j
+	for start > lowerBound && isJSIdentByte(src[start-1]) {
+		start--
+	}
+	switch string(src[start : j+1]) {
+	case "if", "while", "for", "with":
+		return true
+	}
+	return false
+}
+
+// previousJSSignificant 向后越过 trivia。调用点已按正向词法跳过注释；这里的
+// 反向处理只用于判定 slash 前一个 token，覆盖 regex 前常见的块/行注释。
+func previousJSSignificant(src []byte, before, lowerBound int) int {
+	j := before - 1
+	for {
+		crossedLine := false
+		for j >= lowerBound {
+			switch src[j] {
+			case ' ', '\t':
+				j--
+			case '\n', '\r':
+				crossedLine = true
+				j--
+			default:
+				goto triviaSkipped
+			}
+		}
+		return j
+
+	triviaSkipped:
+		if j > lowerBound && src[j] == '/' && src[j-1] == '*' {
+			if rel := bytes.LastIndex(src[lowerBound:j-1], []byte("/*")); rel >= 0 {
+				j = lowerBound + rel - 1
+				continue
+			}
+		}
+		if crossedLine {
+			lineStart := lowerBound
+			if rel := bytes.LastIndexByte(src[lowerBound:j+1], '\n'); rel >= 0 {
+				lineStart = lowerBound + rel + 1
+			}
+			if rel := bytes.Index(src[lineStart:j+1], []byte("//")); rel >= 0 {
+				j = lineStart + rel - 1
+				continue
+			}
+		}
+		return j
+	}
+}
+
+// skipJSClassFieldInitializer 跳过 class 字段 `=` 后的表达式。initializer 内的
+// named function / object method / arrow body 不是 class 方法，不能交给成员扫描器。
+// 有分号时精确停在分号后；无分号时仅在顶层 LineTerminator 后能确认下一个 token
+// 是新成员时停下，否则保守吞到 class 末尾（漏节点优于造假节点）。
+func skipJSClassFieldInitializer(src []byte, i, n int) int {
+	parenDepth, bracketDepth, braceDepth := 0, 0, 0
+	sawValue, canEndExpression := false, false
+	for i < n {
+		c := src[i]
+		if c == ' ' || c == '\t' {
+			i++
+			continue
+		}
+		if c == '\n' || c == '\r' {
+			if parenDepth == 0 && bracketDepth == 0 && braceDepth == 0 && sawValue && canEndExpression {
+				next := skipJSTrivia(src, i+1, n)
+				if next >= n || looksLikeJSClassMember(src, next, n) {
+					return next
+				}
+			}
+			i++
+			continue
+		}
+		if c == '"' || c == '\'' || c == '`' {
+			i = skipString(src, i, n)
+			sawValue, canEndExpression = true, true
+			continue
+		}
+		if c == '/' && i+1 < n && (src[i+1] == '/' || src[i+1] == '*') {
+			i = skipLineOrBlockComment(src, i, n)
+			continue
+		}
+		if c == '/' {
+			if end := jsRegexLiteralEnd(src, i, n, 0); end > i {
+				i = end
+				sawValue, canEndExpression = true, true
+				continue
+			}
+			canEndExpression = false // division operator
+			i++
+			continue
+		}
+		if isJSIdentByte(c) {
+			for i < n && isJSIdentByte(src[i]) {
+				i++
+			}
+			sawValue, canEndExpression = true, true
+			continue
+		}
+		switch c {
+		case '(':
+			parenDepth++
+			canEndExpression = false
+		case ')':
+			if parenDepth > 0 {
+				parenDepth--
+			}
+			sawValue, canEndExpression = true, true
+		case '[':
+			bracketDepth++
+			canEndExpression = false
+		case ']':
+			if bracketDepth > 0 {
+				bracketDepth--
+			}
+			sawValue, canEndExpression = true, true
+		case '{':
+			braceDepth++
+			canEndExpression = false
+		case '}':
+			if braceDepth == 0 {
+				return i // class 自身的闭合括号，不可吞
+			}
+			braceDepth--
+			sawValue, canEndExpression = true, true
+		case ';':
+			if parenDepth == 0 && bracketDepth == 0 && braceDepth == 0 {
+				return i + 1
+			}
+			canEndExpression = false
+		default:
+			canEndExpression = false
+		}
+		i++
+	}
+	return n
+}
+
+func looksLikeJSClassMember(src []byte, i, n int) bool {
+	if i >= n || src[i] == '}' || src[i] == '@' || src[i] == '#' {
+		return true
+	}
+	if !isJSIdentByte(src[i]) {
+		return false
+	}
+	tok, _ := readIdentAt(src, i, n)
+	switch tok {
+	case "as", "in", "instanceof", "of", "satisfies":
+		return false // 可在换行后继续前一个 initializer 的运算符/类型运算
+	}
+	return true
+}
+
+func skipJSTrivia(src []byte, i, n int) int {
+	for i < n {
+		switch src[i] {
+		case ' ', '\t', '\n', '\r':
+			i++
+			continue
+		case '/':
+			if i+1 < n && (src[i+1] == '/' || src[i+1] == '*') {
+				i = skipLineOrBlockComment(src, i, n)
+				continue
+			}
+		}
+		break
+	}
+	return i
+}
+
+// findJSCallableBody 只在匹配完可选泛型、完整参数列表和可选
+// TypeScript 返回类型后才返回正文 `{`。任一步不确定就拒绝建符号。
+func findJSCallableBody(src []byte, afterName, n int) int {
+	i := skipJSTrivia(src, afterName, n)
+	if i < n && src[i] == '<' {
+		angleEnd := matchAngle(src, i, n)
+		if angleEnd < 0 {
+			return -1
+		}
+		i = skipJSTrivia(src, angleEnd+1, n)
+	}
+	if i >= n || src[i] != '(' {
+		return -1
+	}
+	parEnd := matchParen(src, i, n)
+	if parEnd < 0 {
+		return -1
+	}
+	i = skipJSTrivia(src, parEnd+1, n)
+	if i < n && src[i] == ':' {
+		return findTSBodyAfterReturnType(src, i+1, n)
+	}
+	if i < n && src[i] == '{' {
+		return i
+	}
+	return -1
+}
+
+// findTSBodyAfterReturnType 识别返回类型边界。顶层 `{` 在类型尚待完成时
+// 是 object/mapped type，类型已完成时才是函数体。
+func findTSBodyAfterReturnType(src []byte, i, n int) int {
+	i = skipJSTrivia(src, i, n)
+	expectType := true
+	parenDepth, bracketDepth, angleDepth := 0, 0, 0
+	for i < n {
+		c := src[i]
+		if c == '"' || c == '\'' || c == '`' {
+			i = skipString(src, i, n)
+			expectType = false
+			continue
+		}
+		if c == '/' && i+1 < n && (src[i+1] == '/' || src[i+1] == '*') {
+			i = skipLineOrBlockComment(src, i, n)
+			continue
+		}
+		if c == '/' {
+			if end := jsRegexLiteralEnd(src, i, n, 0); end > i {
+				i = end
+				continue
+			}
+		}
+		if c == ' ' || c == '\t' || c == '\n' || c == '\r' {
+			i++
+			continue
+		}
+		if isJSIdentByte(c) {
+			start := i
+			for i < n && isJSIdentByte(src[i]) {
+				i++
+			}
+			switch string(src[start:i]) {
+			case "keyof", "typeof", "readonly", "infer", "new", "extends", "is", "asserts":
+				expectType = true
+			default:
+				expectType = false
+			}
+			continue
+		}
+		if c == '=' && i+1 < n && src[i+1] == '>' {
+			expectType = true
+			i += 2
+			continue
+		}
+		switch c {
+		case '(':
+			parenDepth++
+		case ')':
+			if parenDepth > 0 {
+				parenDepth--
+			}
+		case '[':
+			bracketDepth++
+		case ']':
+			if bracketDepth > 0 {
+				bracketDepth--
+			}
+			expectType = false
+		case '<':
+			angleDepth++
+		case '>':
+			if angleDepth > 0 {
+				angleDepth--
+			}
+			expectType = false
+		case '{':
+			if parenDepth > 0 || bracketDepth > 0 || angleDepth > 0 || expectType {
+				close := matchBrace(src, i, n)
+				if close < 0 {
+					return -1
+				}
+				i = close + 1
+				expectType = false
+				continue
+			}
+			return i
+		case '|', '&', '?', ':', ',', '=':
+			expectType = true
+		case ';':
+			if parenDepth == 0 && bracketDepth == 0 && angleDepth == 0 {
+				return -1
+			}
+		}
+		i++
+	}
+	return -1
+}
+
+func matchAngle(src []byte, open, n int) int {
+	depth := 0
+	for i := open; i < n; i++ {
+		c := src[i]
+		if c == '"' || c == '\'' || c == '`' {
+			i = skipString(src, i, n) - 1
+			continue
+		}
+		if c == '/' && i+1 < n && (src[i+1] == '/' || src[i+1] == '*') {
+			i = skipLineOrBlockComment(src, i, n) - 1
+			continue
+		}
+		if c == '/' {
+			if end := jsRegexLiteralEnd(src, i, n, open); end > i {
+				i = end - 1
+				continue
+			}
+		}
+		if c == '<' {
+			depth++
+		}
+		if c == '>' && (i == 0 || src[i-1] != '=') {
+			depth--
+			if depth == 0 {
+				return i
+			}
+		}
+	}
+	return -1
+}
 
 // skipString 跳过一个字符串字面量(含转义、模板字面量 ${} 近似处理),返回结束位置。
 func skipString(src []byte, i, n int) int {
@@ -501,6 +1073,12 @@ func findOpenBrace(src []byte, i, n int) int {
 			}
 			continue
 		}
+		if c == '/' {
+			if end := jsRegexLiteralEnd(src, i, n, 0); end > i {
+				i = end
+				continue
+			}
+		}
 		if c == '{' {
 			return i
 		}
@@ -536,6 +1114,12 @@ func matchBrace(src []byte, open, n int) int {
 			}
 			continue
 		}
+		if c == '/' {
+			if end := jsRegexLiteralEnd(src, i, n, open); end > i {
+				i = end
+				continue
+			}
+		}
 		if c == '{' {
 			depth++
 		}
@@ -560,6 +1144,16 @@ func matchParen(src []byte, open, n int) int {
 			i = skipString(src, i, n)
 			continue
 		}
+		if c == '/' && i+1 < n && (src[i+1] == '/' || src[i+1] == '*') {
+			i = skipLineOrBlockComment(src, i, n)
+			continue
+		}
+		if c == '/' {
+			if end := jsRegexLiteralEnd(src, i, n, open); end > i {
+				i = end
+				continue
+			}
+		}
 		if c == '(' {
 			depth++
 		}
@@ -572,34 +1166,6 @@ func matchParen(src []byte, open, n int) int {
 		i++
 	}
 	return -1
-}
-
-func skipTypeAnnotation(src []byte, i, n int) int {
-	// 从 : 起跳到 { 或 ; 或 = 或 \n(近似:类型注解可能复杂,这里粗略)。
-	depth := 0
-	for i < n {
-		c := src[i]
-		if c == '{' {
-			return i
-		}
-		if c == ';' || c == '=' {
-			return i
-		}
-		if c == '<' || c == '(' || c == '[' {
-			depth++
-		}
-		if c == '>' || c == ')' || c == ']' {
-			if depth > 0 {
-				depth--
-			}
-		}
-		if c == '\n' && depth == 0 {
-			// 行尾:可能是方法签名换行后接 {,回退找 {
-			return i
-		}
-		i++
-	}
-	return i
 }
 
 func findChar(src []byte, i, n int, ch byte) int {
@@ -623,28 +1189,6 @@ func readIdentAt(src []byte, i, n int) (string, int) {
 		}
 	}
 	return string(src[start:i]), start
-}
-
-func skipSpacesAdvance(src []byte, i *int, n int) {
-	for *i < n {
-		c := src[*i]
-		if c == ' ' || c == '\t' || c == '\n' || c == '\r' {
-			*i++
-		} else {
-			break
-		}
-	}
-}
-
-func skipSpacesRange(src []byte, i *int, hi int) {
-	for *i < hi {
-		c := src[*i]
-		if c == ' ' || c == '\t' || c == '\n' || c == '\r' {
-			*i++
-		} else {
-			break
-		}
-	}
 }
 
 // funcDeclStart 回退到声明所在行首(含可能的装饰器/注释行,近似:找最近的 \n+1)。

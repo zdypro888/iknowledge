@@ -102,8 +102,8 @@ func TestExtractSymbols(t *testing.T) {
 				if syms[i].Name != w.name || syms[i].Kind != w.kind {
 					t.Errorf("符号[%d] = (%q, %q), want (%q, %q)", i, syms[i].Name, syms[i].Kind, w.name, w.kind)
 				}
-				if syms[i].Hash == "" || syms[i].StructHash == "" {
-					t.Errorf("符号 %q 双哈希缺失", syms[i].Name)
+				if syms[i].Hash == "" || syms[i].StructHash == "" || syms[i].DocStructHash == "" {
+					t.Errorf("符号 %q 语义哈希缺失", syms[i].Name)
 				}
 			}
 		})
@@ -256,11 +256,11 @@ func TestHashMatrix(t *testing.T) {
 			wantHashSame: false, wantStructSame: false,
 		},
 		{
-			name: "搬家到别的文件(双哈希均不变)",
+			name: "搬到不同 package/import 上下文(双哈希均变)",
 			srcA: "package p\n\n// Helper 工具。\nfunc Helper() int {\n\treturn 7\n}\n",
 			srcB: "package other\n\nimport \"fmt\"\n\nfunc init() { fmt.Println() }\n\n// Helper 工具。\nfunc Helper() int {\n\treturn 7\n}\n",
 			symA: "Helper", symB: "Helper",
-			wantHashSame: true, wantStructSame: true,
+			wantHashSame: false, wantStructSame: false,
 		},
 	}
 	for _, tt := range tests {
@@ -286,6 +286,7 @@ func TestHashDeterminism(t *testing.T) {
 	}
 	for i := range s1 {
 		if s1[i].Name != s2[i].Name || s1[i].Hash != s2[i].Hash || s1[i].StructHash != s2[i].StructHash ||
+			s1[i].DocStructHash != s2[i].DocStructHash ||
 			s1[i].Start != s2[i].Start || s1[i].End != s2[i].End {
 			t.Errorf("符号[%d] 两次解析不一致:%+v vs %+v", i, s1[i], s2[i])
 		}
@@ -294,14 +295,178 @@ func TestHashDeterminism(t *testing.T) {
 
 func TestFileHash(t *testing.T) {
 	symsA := parseAll(t, "package p\n\nfunc A() {}\n\nfunc B() {}\n")
-	// import 重排/文件头注释变化不影响符号 → 文件哈希不变。
+	// import 是编译语义上下文，blank import 变化必须影响文件哈希。
 	symsB := parseAll(t, "package p\n\nimport _ \"embed\"\n\nfunc A() {}\n\nfunc B() {}\n")
-	if FileHash(symsA) != FileHash(symsB) {
-		t.Errorf("import 变化不应影响文件哈希")
+	if FileHash(symsA) == FileHash(symsB) {
+		t.Errorf("blank import 变化必须影响文件哈希")
 	}
 	symsC := parseAll(t, "package p\n\nfunc A() { _ = 1 }\n\nfunc B() {}\n")
 	if FileHash(symsA) == FileHash(symsC) {
 		t.Errorf("函数体变化必须影响文件哈希")
+	}
+}
+
+func TestGoZeroSymbolFileHashIncludesContext(t *testing.T) {
+	p := Golang{}
+	srcA := []byte("package p\n\nimport _ \"embed\"\n")
+	srcB := []byte("package p\n\nimport _ \"net/http/pprof\"\n")
+	symsA, err := p.Parse("a.go", srcA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	symsB, err := p.Parse("b.go", srcB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(symsA) != 0 || len(symsB) != 0 {
+		t.Fatalf("测试前提错误:应是零符号文件")
+	}
+	if HashFileFor(p, symsA, srcA) == HashFileFor(p, symsB, srcB) {
+		t.Fatal("零符号 Go 文件的 import 变更也必须改变文件哈希")
+	}
+	if p.HashFile(srcA) == p.HashFile(srcB) {
+		t.Fatal("Golang.HashFile 独立出口也必须覆盖零符号上下文")
+	}
+}
+
+func TestGoFileNodeHashIncludesUnreferencedNamedImports(t *testing.T) {
+	p := Golang{}
+	srcA := []byte("package p\n\nfunc Run() {}\n")
+	srcB := []byte("package p\n\nimport unused \"example.com/unused\"\n\nfunc Run() {}\n")
+	symsA, err := p.Parse("a.go", srcA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	symsB, err := p.Parse("b.go", srcB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if symsA[0].Hash != symsB[0].Hash || symsA[0].StructHash != symsB[0].StructHash {
+		t.Fatal("未被引用的 named import 不得污染符号锚")
+	}
+	if HashFileFor(p, symsA, srcA) == HashFileFor(p, symsB, srcB) {
+		t.Fatal("file 节点必须覆盖全量 import，包括未归位到符号的 named import")
+	}
+}
+
+func TestGoSemanticFileContextHashes(t *testing.T) {
+	parse := func(src string) Symbol {
+		t.Helper()
+		return findSym(t, parseAll(t, src), "Run")
+	}
+	base := `//go:build linux && amd64
+
+package p
+
+import (
+	alias "example.com/a"
+	_ "embed"
+)
+
+func Run() { alias.Call() }
+`
+	tests := []struct {
+		name string
+		src  string
+		same bool
+	}{
+		{
+			name: "import 重排免疫",
+			src: `//go:build linux && amd64
+
+package p
+
+import (
+	_ "embed"
+	alias "example.com/a"
+)
+
+func Run() { alias.Call() }
+`,
+			same: true,
+		},
+		{
+			name: "import 路径变更",
+			src:  strings.Replace(base, "example.com/a", "example.com/b", 1),
+		},
+		{
+			name: "import alias 变更",
+			src:  strings.Replace(strings.Replace(base, "alias \"example.com/a\"", "other \"example.com/a\"", 1), "alias.Call", "other.Call", 1),
+		},
+		{
+			name: "无关 named import 不污染符号",
+			src:  strings.Replace(base, "\t_ \"embed\"\n", "\t_ \"embed\"\n\tunused \"example.com/unused\"\n", 1),
+			same: true,
+		},
+		{
+			name: "blank import 变更",
+			src:  strings.Replace(base, "\t_ \"embed\"\n", "", 1),
+		},
+		{
+			name: "build constraint 变更",
+			src:  strings.Replace(base, "linux && amd64", "darwin && amd64", 1),
+		},
+		{
+			name: "package 变更",
+			src:  strings.Replace(base, "package p", "package q", 1),
+		},
+	}
+	baseSym := parse(base)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := parse(tt.src)
+			if same := got.Hash == baseSym.Hash; same != tt.same {
+				t.Errorf("Hash 相同=%v,want %v", same, tt.same)
+			}
+			if same := got.StructHash == baseSym.StructHash; same != tt.same {
+				t.Errorf("StructHash 相同=%v,want %v", same, tt.same)
+			}
+		})
+	}
+}
+
+func TestGoDefaultVersionedImportAliasContext(t *testing.T) {
+	a := findSym(t, parseAll(t, "package p\n\nimport \"gopkg.in/yaml.v3\"\n\nfunc Run() { _ = yaml.Node{} }\n"), "Run")
+	b := findSym(t, parseAll(t, "package p\n\nimport \"gopkg.in/yaml.v4\"\n\nfunc Run() { _ = yaml.Node{} }\n"), "Run")
+	if a.Hash == b.Hash || a.StructHash == b.StructHash {
+		t.Fatal("默认别名的版本化 import 路径变更必须进入符号上下文")
+	}
+}
+
+func TestGoImplicitImportWithNonBasenamePackageIsConservative(t *testing.T) {
+	// Go import 声明不记录真实 package name；这里故意让 selector 与路径末段
+	// 不同，模拟 client-go 等现实依赖。basename 猜测会把两条 import 都判成
+	// “未使用”，导致路径变化时符号三哈希完全相同。
+	a := findSym(t, parseAll(t, `package p
+
+import "example.com/client-go"
+
+func Run() { kubernetes.New() }
+`), "Run")
+	b := findSym(t, parseAll(t, `package p
+
+import "example.com/client-runtime"
+
+func Run() { kubernetes.New() }
+`), "Run")
+	if a.Hash == b.Hash || a.StructHash == b.StructHash || a.DocStructHash == b.DocStructHash {
+		t.Fatal("无法证明包名的隐式 import 必须保守进入全部符号上下文")
+	}
+}
+
+func TestGoDocStructHashGuardsRenameMigration(t *testing.T) {
+	old := findSym(t, parseAll(t, "package p\n\n// Login 验证密码。\nfunc Login() {}\n"), "Login")
+	renamed := findSym(t, parseAll(t, "package p\n\n// Authenticate 验证密码。\nfunc Authenticate() {}\n"), "Authenticate")
+	changedContract := findSym(t, parseAll(t, "package p\n\n// Authenticate 跳过密码验证。\nfunc Authenticate() {}\n"), "Authenticate")
+
+	if old.StructHash != renamed.StructHash || old.DocStructHash != renamed.DocStructHash {
+		t.Fatal("仅自身名及 doc 中同名标识符变更应可迁移")
+	}
+	if old.StructHash != changedContract.StructHash {
+		t.Fatal("旧 StructHash 仍应保持 doc 免疫语义")
+	}
+	if old.DocStructHash == changedContract.DocStructHash {
+		t.Fatal("改名同时修改 doc 契约必须被 DocStructHash 拦截")
 	}
 }
 

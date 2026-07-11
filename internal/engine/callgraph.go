@@ -3,9 +3,7 @@ package engine
 import (
 	"bytes"
 	"fmt"
-	"os"
 	"path"
-	"path/filepath"
 	"slices"
 	"sort"
 	"strings"
@@ -45,6 +43,14 @@ type fileCallsEntry struct {
 	fc      *parser.FileCalls
 }
 
+// packageKey 区分同一目录内合法并存的 production package 与 external-test
+// package（例如 package auth 与 package auth_test）。Go 的包身份不只是目录：
+// 若只按目录建声明表，两边同名 helper 会互相制造歧义并把两边的真调用边都丢掉。
+type packageKey struct {
+	dir string
+	pkg string
+}
+
 // ensureCallGraphLocked 惰性构建/增量刷新调用图。
 // R29 批次2:走 cgMu 独立锁(不再要求持 rt.mu)——它是派生值,只读文件系统+自身
 // files map,不依赖 rt.mu 保护的 cache/ix;读路径可并发刷新它而不互斥。
@@ -61,18 +67,23 @@ func (e *Engine) ensureCallGraphLocked() *callGraph {
 		return nil
 	}
 
-	cg := e.rt.cg
-	if cg == nil {
-		cg = &callGraph{files: map[string]*fileCallsEntry{}}
-		e.rt.cg = cg
-	}
+	// 已发布给读者的 callGraph 视为不可变快照。刷新必须在副本上进行:
+	// 调用方拿到返回值后不再持 cgMu,若这里原地改 edges/reverse/files,
+	// 另一个并发 Recall/Map 会与刷新形成 data race。
+	cg := cloneCallGraph(e.rt.cg)
 	changed := cg.refreshModule(repo)
 
 	alive := make(map[string]bool, len(rels))
 	for _, rel := range rels {
 		alive[rel] = true
-		st, err := os.Stat(filepath.Join(repo, filepath.FromSlash(rel)))
+		st, err := safeRepoFileInfo(repo, rel)
 		if err != nil {
+			// listSourceFiles 与这里的读取之间仍可能发生替换；安全 stat
+			// 一旦拒绝该路径，必须同时清掉旧提取结果，不能留下陈旧调用边。
+			if _, ok := cg.files[rel]; ok {
+				delete(cg.files, rel)
+				changed = true
+			}
 			continue
 		}
 		if prev := cg.files[rel]; prev != nil && prev.mtimeNS == st.ModTime().UnixNano() && prev.size == st.Size() {
@@ -80,7 +91,7 @@ func (e *Engine) ensureCallGraphLocked() *callGraph {
 		}
 		entry := &fileCallsEntry{mtimeNS: st.ModTime().UnixNano(), size: st.Size()}
 		if ex, ok := e.Reg.ForFile(rel).(parser.CallExtractor); ok {
-			src, err := os.ReadFile(filepath.Join(repo, filepath.FromSlash(rel)))
+			src, err := safeRepoRead(repo, rel)
 			if err == nil && !parser.IsGenerated(src) {
 				if fc, err := ex.FileCalls(rel, src); err == nil {
 					entry.fc = fc
@@ -101,12 +112,31 @@ func (e *Engine) ensureCallGraphLocked() *callGraph {
 	if changed || cg.edges == nil {
 		cg.resolve()
 	}
+	e.rt.cg = cg
 	return cg
+}
+
+// cloneCallGraph 建可变的下一版。fileCallsEntry 与边切片在构建后均只读,
+// 未发生变化时可共享;files map 会在增量刷新中增删,必须复制。
+func cloneCallGraph(src *callGraph) *callGraph {
+	if src == nil {
+		return &callGraph{files: map[string]*fileCallsEntry{}}
+	}
+	dst := &callGraph{
+		module: src.module, modMtime: src.modMtime, modSize: src.modSize,
+		files: make(map[string]*fileCallsEntry, len(src.files)),
+		edges: src.edges, reverse: src.reverse,
+		implsOf: src.implsOf, ifacesOf: src.ifacesOf,
+	}
+	for rel, entry := range src.files {
+		dst.files[rel] = entry
+	}
+	return dst
 }
 
 // refreshModule 按 go.mod 指纹重读模块路径;变更返回 true。
 func (cg *callGraph) refreshModule(repo string) bool {
-	st, err := os.Stat(filepath.Join(repo, "go.mod"))
+	st, err := safeRepoFileInfo(repo, "go.mod")
 	if err != nil {
 		if cg.module == "" && cg.modMtime == 0 {
 			return false
@@ -118,8 +148,11 @@ func (cg *callGraph) refreshModule(repo string) bool {
 		return false
 	}
 	cg.modMtime, cg.modSize = st.ModTime().UnixNano(), st.Size()
-	data, err := os.ReadFile(filepath.Join(repo, "go.mod"))
+	data, err := safeRepoRead(repo, "go.mod")
 	if err != nil {
+		// 安全读取失败（含 stat/open/read 间被替换）时不能继续沿用旧 module，
+		// 也不能缓存本次指纹，否则同一文件恢复可读后将永不重试。
+		cg.module, cg.modMtime, cg.modSize = "", 0, 0
 		return true
 	}
 	mod := ""
@@ -137,24 +170,32 @@ func (cg *callGraph) refreshModule(repo string) bool {
 
 // resolve 由提取结果连边(纯内存)。
 func (cg *callGraph) resolve() {
-	// 包符号表:目录 → 符号名 → 声明它的文件集(build tag 双版本会多于一个)。
-	pkgDecls := map[string]map[string][]string{} // dir → 名 → []fileRel
-	// 方法基名启发表:目录 → 基名 → 规范名集合(去重后唯一才可用)。
-	pkgMethodBase := map[string]map[string][]string{}
+	// 包符号表:(目录, package 声明名) → 符号名 → 声明它的文件集。
+	// 同目录的 package p / package p_test 必须物理隔离；同一 package 内 build
+	// tag 双版本仍会形成多声明，继续走既有“调用方文件优先，否则丢边”规则。
+	pkgDecls := map[packageKey]map[string][]string{}
+	// 方法基名启发表:(目录, package) → 基名 → 规范名集合。
+	pkgMethodBase := map[packageKey]map[string][]string{}
+	// import 只可落到目标目录唯一的可导入 package。external-test package 只有
+	// *_test.go 文件，不可被普通 import；多个非测试 package 则按歧义丢边。
+	hasNonTestFile := map[packageKey]bool{}
 	for rel, entry := range cg.files {
 		if entry.fc == nil {
 			continue
 		}
-		dir := path.Dir(rel)
-		decls := pkgDecls[dir]
+		key := packageKey{dir: path.Dir(rel), pkg: entry.fc.Package}
+		if !strings.HasSuffix(rel, "_test.go") {
+			hasNonTestFile[key] = true
+		}
+		decls := pkgDecls[key]
 		if decls == nil {
 			decls = map[string][]string{}
-			pkgDecls[dir] = decls
+			pkgDecls[key] = decls
 		}
-		mb := pkgMethodBase[dir]
+		mb := pkgMethodBase[key]
 		if mb == nil {
 			mb = map[string][]string{}
-			pkgMethodBase[dir] = mb
+			pkgMethodBase[key] = mb
 		}
 		for _, name := range entry.fc.Decls {
 			decls[name] = append(decls[name], rel)
@@ -166,9 +207,9 @@ func (cg *callGraph) resolve() {
 		}
 	}
 
-	// lookup 归位一个目录内的符号名:调用方文件优先,否则包内唯一。
-	lookup := func(dir, name, callerRel string) string {
-		sites := pkgDecls[dir][name]
+	// lookup 归位一个 package 内的符号名:调用方文件优先,否则包内唯一。
+	lookup := func(key packageKey, name, callerRel string) string {
+		sites := pkgDecls[key][name]
 		switch {
 		case len(sites) == 0:
 			return ""
@@ -182,13 +223,24 @@ func (cg *callGraph) resolve() {
 		}
 		return "" // 跨文件歧义(build tag 双版本等):宁缺毋错
 	}
+	importKey := func(dir string) (packageKey, bool) {
+		var found packageKey
+		count := 0
+		for key := range pkgDecls {
+			if key.dir == dir && hasNonTestFile[key] {
+				found = key
+				count++
+			}
+		}
+		return found, count == 1
+	}
 
 	// 接口→实现(2026-07-04,codegraph 启发的方法集匹配;AST 近似,无类型检查):
 	// 接口注册 → 仓内内嵌展开 → 全仓匹配。宁缺毋错三闸:含不可归位内嵌(仓外/约束
 	// 元素)整个接口弃;≥2 方法才严格匹配,单方法接口仅唯一实现者才认;同包同名
 	// 接口多文件声明(build tag)弃。已知低估留痕:结构体内嵌带来的方法提升 AST
 	// 看不见,漏配不误配。
-	ifaceMethodTargets := cg.resolveInterfaces(pkgDecls, lookup)
+	ifaceMethodTargets := cg.resolveInterfaces(pkgDecls, lookup, importKey)
 
 	edges := map[string][]string{}
 	reverse := map[string][]string{}
@@ -204,25 +256,27 @@ func (cg *callGraph) resolve() {
 		if entry.fc == nil {
 			continue
 		}
-		dir := path.Dir(rel)
+		key := packageKey{dir: path.Dir(rel), pkg: entry.fc.Package}
 		for caller, refs := range entry.fc.Calls {
 			from := rel + "#" + caller
 			for _, ref := range refs {
 				switch ref.Qual {
 				case "":
-					addEdge(from, lookup(dir, ref.Name, rel))
+					addEdge(from, lookup(key, ref.Name, rel))
 				default:
 					if imp, ok := entry.fc.Imports[ref.Qual]; ok {
 						if tdir := cg.moduleDir(imp); tdir != "" {
-							addEdge(from, lookup(tdir, ref.Name, rel))
+							if targetKey, ok := importKey(tdir); ok {
+								addEdge(from, lookup(targetKey, ref.Name, rel))
+							}
 						}
 						continue // import 命中但库外/未归位:丢弃,不落启发
 					}
 					// 非 import 限定名:局部变量方法调用。① 同包唯一基名启发;
 					// ② 接口分发兜底(codegraph 启发):该方法名属于仓内接口的
 					// 方法集 → 连到全部实现(扇出 ≤5,过则视为过度歧义丢弃)。
-					if cands := pkgMethodBase[dir][ref.Name]; len(cands) == 1 {
-						addEdge(from, lookup(dir, cands[0], rel))
+					if cands := pkgMethodBase[key][ref.Name]; len(cands) == 1 {
+						addEdge(from, lookup(key, cands[0], rel))
 					} else if ts := ifaceMethodTargets[ref.Name]; len(ts) >= 1 && len(ts) <= 5 {
 						for _, t := range ts {
 							addEdge(from, t)
@@ -243,31 +297,34 @@ func (cg *callGraph) resolve() {
 // resolveInterfaces 建接口→实现关系,返回"接口方法名 → 实现方法节点"分发表。
 // 输入沿用 resolve 的包符号表与归位闭包;结果写 cg.implsOf/ifacesOf。
 func (cg *callGraph) resolveInterfaces(
-	pkgDecls map[string]map[string][]string,
-	lookup func(dir, name, callerRel string) string,
+	pkgDecls map[packageKey]map[string][]string,
+	lookup func(key packageKey, name, callerRel string) string,
+	importKey func(dir string) (packageKey, bool),
 ) map[string][]string {
 	type iface struct {
-		dir, name, nodeID string
-		methods           map[string]bool
-		embeds            []parser.CallRef
-		imports           map[string]string
-		dead              bool
+		key          packageKey
+		name, nodeID string
+		methods      map[string]bool
+		embeds       []parser.CallRef
+		imports      map[string]string
+		dead         bool
 	}
 
-	// ① 注册:同包同名多文件声明(build tag)→ 弃。
-	byKey := map[string]*iface{} // dir + "\x00" + name
+	// ① 注册:同 package 同名多文件声明(build tag)→ 弃；同目录 p/p_test
+	// 是两个 package，不得互相杀死。
+	byKey := map[string]*iface{} // dir + "\x00" + package + "\x00" + name
 	for rel, entry := range cg.files {
 		if entry.fc == nil {
 			continue
 		}
-		dir := path.Dir(rel)
+		pkgKey := packageKey{dir: path.Dir(rel), pkg: entry.fc.Package}
 		for _, d := range entry.fc.Interfaces {
-			key := dir + "\x00" + d.Name
+			key := pkgKey.dir + "\x00" + pkgKey.pkg + "\x00" + d.Name
 			if prev, ok := byKey[key]; ok {
 				prev.dead = true
 				continue
 			}
-			it := &iface{dir: dir, name: d.Name, nodeID: rel + "#" + d.Name,
+			it := &iface{key: pkgKey, name: d.Name, nodeID: rel + "#" + d.Name,
 				methods: map[string]bool{}, embeds: d.Embeds, imports: entry.fc.Imports}
 			for _, m := range d.Methods {
 				it.methods[m] = true
@@ -286,23 +343,26 @@ func (cg *callGraph) resolveInterfaces(
 			}
 			var rest []parser.CallRef
 			for _, em := range it.embeds {
-				tdir := ""
+				targetKey := packageKey{}
+				targetOK := false
 				switch {
 				case em.Name == "!unresolvable":
 					it.dead = true
 				case em.Qual == "":
-					tdir = it.dir
+					targetKey, targetOK = it.key, true
 				default:
 					if imp, ok := it.imports[em.Qual]; ok {
-						tdir = cg.moduleDir(imp)
+						if tdir := cg.moduleDir(imp); tdir != "" {
+							targetKey, targetOK = importKey(tdir)
+						}
 					}
 				}
 				if it.dead {
 					break
 				}
-				target := byKey[tdir+"\x00"+em.Name]
+				target := byKey[targetKey.dir+"\x00"+targetKey.pkg+"\x00"+em.Name]
 				switch {
-				case tdir == "" || target == nil || target.dead:
+				case !targetOK || target == nil || target.dead:
 					it.dead = true
 				case len(target.embeds) > 0:
 					rest = append(rest, em) // 目标自身未展开完,下一轮再并
@@ -326,17 +386,17 @@ func (cg *callGraph) resolveInterfaces(
 	}
 
 	// ③ 类型方法集(dir → 类型名 → 方法基名集;来源是 "T.M" 形态的声明)。
-	typeMethods := map[string]map[string]map[string]bool{}
-	for dir, decls := range pkgDecls {
+	typeMethods := map[packageKey]map[string]map[string]bool{}
+	for key, decls := range pkgDecls {
 		for name := range decls {
 			t, m, ok := strings.Cut(name, ".")
 			if !ok || t == "" || m == "" {
 				continue
 			}
-			tm := typeMethods[dir]
+			tm := typeMethods[key]
 			if tm == nil {
 				tm = map[string]map[string]bool{}
-				typeMethods[dir] = tm
+				typeMethods[key] = tm
 			}
 			if tm[t] == nil {
 				tm[t] = map[string]bool{}
@@ -353,11 +413,15 @@ func (cg *callGraph) resolveInterfaces(
 		if it.dead || len(it.embeds) > 0 || len(it.methods) == 0 {
 			continue
 		}
-		var impls []string           // 实现类型节点
-		var implDirTypes [][2]string // (dir, typeName) 供方法节点归位
-		for dir, tm := range typeMethods {
+		var impls []string // 实现类型节点
+		type implTarget struct {
+			key packageKey
+			typ string
+		}
+		var implTargets []implTarget
+		for key, tm := range typeMethods {
 			for t, ms := range tm {
-				if dir == it.dir && t == it.name {
+				if key == it.key && t == it.name {
 					continue // 接口自身
 				}
 				ok := true
@@ -370,9 +434,9 @@ func (cg *callGraph) resolveInterfaces(
 				if !ok {
 					continue
 				}
-				if tn := lookup(dir, t, ""); tn != "" {
+				if tn := lookup(key, t, ""); tn != "" {
 					impls = append(impls, tn)
-					implDirTypes = append(implDirTypes, [2]string{dir, t})
+					implTargets = append(implTargets, implTarget{key: key, typ: t})
 				}
 			}
 		}
@@ -384,7 +448,7 @@ func (cg *callGraph) resolveInterfaces(
 		for i, tn := range impls {
 			ifacesOf[tn] = append(ifacesOf[tn], it.nodeID)
 			for m := range it.methods {
-				if mn := lookup(implDirTypes[i][0], implDirTypes[i][1]+"."+m, ""); mn != "" {
+				if mn := lookup(implTargets[i].key, implTargets[i].typ+"."+m, ""); mn != "" {
 					if targets[m] == nil {
 						targets[m] = map[string]bool{}
 					}

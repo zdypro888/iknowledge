@@ -52,6 +52,9 @@ type RefreshReport struct {
 func (c *Cache) Refresh() (RefreshReport, error) {
 	var rep RefreshReport
 	current := map[string]fileState{}
+	if err := c.s.checkKnowledgePath(c.s.dir); err != nil {
+		return rep, err
+	}
 
 	err := filepath.WalkDir(c.s.dir, func(path string, d os.DirEntry, err error) error {
 		if err != nil {

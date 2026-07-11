@@ -37,8 +37,8 @@ func TestDiagnoseIncludesRejectedContext(t *testing.T) {
 	e, _ := initEngine(t, map[string]string{"internal/auth/login.go": authSrc})
 	// record_change 带 rejected(曾否决的方案)。
 	if _, err := e.RecordChange(ChangeArgs{
-		Nodes:   []string{"internal/auth/login.go#Login"},
-		What:    "限流改造", Why: "防爆破",
+		Nodes: []string{"internal/auth/login.go#Login"},
+		What:  "限流改造", Why: "防爆破",
 		Rejected: []model.Rejected{{Option: "用内存队列缓冲重试", Reason: "重启丢消息"}},
 	}, "s", "codex"); err != nil {
 		t.Fatal(err)

@@ -38,6 +38,7 @@ type Session struct{ ID string }
 
 func setupGitRepo(t *testing.T) string {
 	t.Helper()
+	t.Setenv("IKNOWLEDGE_STATE_HOME", t.TempDir())
 	repo := t.TempDir()
 	for rel, content := range fixture {
 		p := filepath.Join(repo, filepath.FromSlash(rel))

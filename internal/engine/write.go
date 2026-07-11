@@ -1,11 +1,16 @@
 package engine
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"regexp"
+	"sort"
 	"strings"
+
+	"gopkg.in/yaml.v3"
 
 	"github.com/zdypro888/iknowledge/internal/index"
 	"github.com/zdypro888/iknowledge/internal/model"
@@ -54,10 +59,11 @@ func (e *Engine) Remember(a RememberArgs, sid, author string) (string, error) {
 			"给出要沉淀的内容")
 	}
 
-	ref, warns, err := e.resolveOrAnchorNodeLocked(a.Node)
+	rememberPlan, warns, err := e.planRememberNodeLocked(a.Node)
 	if err != nil {
 		return "", err
 	}
+	ref := rememberPlan.ref
 	n := ref.Node
 	if n.Status == model.StatusOrphaned {
 		return "", kbErr("NODE_ORPHANED", "节点 "+n.ID+" 的符号已消失,无锚可落",
@@ -261,8 +267,11 @@ func (e *Engine) Remember(a RememberArgs, sid, author string) (string, error) {
 	if n.Status == model.StatusUndigested && hasActiveEntries(n) {
 		n.Status = model.StatusFresh
 	}
-	if err := e.saveNodeShardLocked(ref); err != nil {
-		return "", err
+	if err := e.commitRememberNodeLocked(rememberPlan); err != nil {
+		// SaveShard 可能在 rename 已完成、目录 fsync 才报错；无论磁盘最终是
+		// before 还是 after，都重载以免本次工作副本污染后续请求。
+		reloadErr := e.reloadLocked()
+		return "", errors.Join(err, reloadErr)
 	}
 	e.markDigested(sid, n.ID)
 	if err := e.reloadLocked(); err != nil {
@@ -336,7 +345,7 @@ func (e *Engine) currentAnchorLocked(ref *index.NodeRef) curAnchor {
 	if n.Level == model.LevelDir || n.Level == model.LevelProject {
 		return curAnchor{hash: "", anchor: n.Anchor} // 无代码锚(时间+人工复核,§8.4)
 	}
-	src, err := os.ReadFile(filepath.Join(e.Store.RepoRoot(), filepath.FromSlash(file)))
+	src, err := safeRepoRead(e.Store.RepoRoot(), file)
 	if err != nil {
 		return curAnchor{missing: true, anchor: n.Anchor}
 	}
@@ -358,7 +367,7 @@ func (e *Engine) currentAnchorLocked(ref *index.NodeRef) curAnchor {
 		if syms[i].Name == symbol {
 			return curAnchor{hash: syms[i].Hash, sig: parser.Signature(syms[i]), anchor: model.Anchor{
 				File: file, Symbol: symbol,
-				Hash: syms[i].Hash, StructHash: syms[i].StructHash, Lines: syms[i].Lines,
+				Hash: syms[i].Hash, StructHash: syms[i].StructHash, DocStructHash: syms[i].DocStructHash, Lines: syms[i].Lines,
 			}}
 		}
 	}
@@ -432,8 +441,7 @@ func (e *Engine) planNewSymbolLocked(query string) (*newSymbolPlan, error) {
 		return nil, kbErr("SHARD_CONFLICT", "文件 "+file+" 的知识分片不可用:"+cerr.Error(),
 			"先人工解决 .knowledge/tree/"+file+".yaml 的合并冲突或升级 iknowledge,再写入")
 	}
-	abs := filepath.Join(e.Store.RepoRoot(), filepath.FromSlash(file))
-	src, err := os.ReadFile(abs)
+	src, err := safeRepoRead(e.Store.RepoRoot(), file)
 	if err != nil {
 		return nil, kbErr("NODE_NOT_FOUND", "文件 "+file+" 不存在",
 			"路径须相对仓库根、正斜杠;用 kb_map 确认")
@@ -462,7 +470,16 @@ func (e *Engine) planNewSymbolLocked(query string) (*newSymbolPlan, error) {
 		return nil, kbErr("NODE_NOT_FOUND", "符号 "+symbol+" 不在 "+file+" 中",
 			"用 kb_map 确认符号名(方法带接收者、同名带 ~n 序号)")
 	}
-	plan := &newSymbolPlan{node: e.nodeFromSymbol(file, *target), shardRel: "tree/" + file + ".yaml"}
+	node := e.nodeFromSymbol(file, *target)
+	// 索引会隔离跨分片重复 ID。隔离态不能被当成“新符号”重新创建或覆盖，
+	// 否则一次 remember/record_change 会悄悄改写其中一个副本。
+	for _, cs := range e.rt.cache.Shards() {
+		if cs != nil && shardHasNode(cs.Shard, node.ID) {
+			return nil, kbErr("SHARD_CONFLICT", "节点 "+node.ID+" 被重复分片隔离",
+				"先修复 kb_status 报出的重复 Node ID，再重试")
+		}
+	}
+	plan := &newSymbolPlan{node: node, shardRel: "tree/" + file + ".yaml"}
 	if cs := e.rt.cache.Shards()[plan.shardRel]; cs == nil || cs.Shard == nil {
 		plan.fileNode = &model.Node{
 			ID: file, Level: model.LevelFile,
@@ -473,12 +490,21 @@ func (e *Engine) planNewSymbolLocked(query string) (*newSymbolPlan, error) {
 	return plan, nil
 }
 
-// resolveOrAnchorNodeLocked 解析节点;不存在且符号在源码里 → 增量落锚自动建节点
-// (impl §7.3:AI 新写函数是最高频写场景,不再 NODE_NOT_FOUND 卡死)。kb_remember 用。
-func (e *Engine) resolveOrAnchorNodeLocked(query string) (*index.NodeRef, []string, error) {
+type rememberNodePlan struct {
+	ref        *index.NodeRef
+	fileEnsure *model.Node
+}
+
+// planRememberNodeLocked 只构造独立工作副本，不改缓存、不落盘。这样新符号的
+// 增量落锚也要等 entry/keyword/supersedes 全部校验通过后才与知识一起提交。
+func (e *Engine) planRememberNodeLocked(query string) (*rememberNodePlan, []string, error) {
 	id, cands := e.resolveQueryLocked(query)
 	if id != "" {
-		return e.rt.ix.Node(id), nil, nil
+		original := e.rt.ix.Node(id)
+		return &rememberNodePlan{ref: &index.NodeRef{
+			ShardRel: original.ShardRel,
+			Node:     cloneModelNode(original.Node),
+		}}, nil, nil
 	}
 	if len(cands) > 1 {
 		return nil, nil, kbErr("NODE_NOT_FOUND",
@@ -488,30 +514,35 @@ func (e *Engine) resolveOrAnchorNodeLocked(query string) (*index.NodeRef, []stri
 	if err != nil {
 		return nil, nil, err
 	}
-	shardRel := plan.shardRel
-	cs := e.rt.cache.Shards()[shardRel]
+	return &rememberNodePlan{
+		ref:        &index.NodeRef{ShardRel: plan.shardRel, Node: cloneModelNode(&plan.node)},
+		fileEnsure: cloneModelNode(plan.fileNode),
+	}, []string{"节点 " + plan.node.ID + " 为新符号增量落锚自动创建"}, nil
+}
+
+func (e *Engine) commitRememberNodeLocked(plan *rememberNodePlan) error {
+	if plan == nil || plan.ref == nil || plan.ref.Node == nil {
+		return fmt.Errorf("engine: remember 提交计划为空")
+	}
+	rel := plan.ref.ShardRel
+	cs := e.rt.cache.Shards()[rel]
 	var sh *store.Shard
+	var raw *yaml.Node
 	if cs != nil && cs.Shard != nil {
-		sh = cs.Shard
+		sh = cloneEngineShard(cs.Shard)
+		raw = cs.Raw
 	} else {
 		sh = &store.Shard{Schema: model.SchemaVersion}
-		if plan.fileNode != nil {
-			sh.Nodes = append(sh.Nodes, *plan.fileNode)
-		}
 	}
-	sh.Nodes = append(sh.Nodes, plan.node)
-	planFile, _ := model.SplitNodeID(plan.node.ID)
-	if err := e.Store.SaveShard(e.Store.ShardPathFor(planFile), sh, nil); err != nil {
-		return nil, nil, err
+	if plan.fileEnsure != nil && !shardHasNode(sh, plan.fileEnsure.ID) {
+		sh.Nodes = append(sh.Nodes, *cloneModelNode(plan.fileEnsure))
 	}
-	if err := e.reloadLocked(); err != nil {
-		return nil, nil, err
+	if existing := nodeInShard(sh, plan.ref.Node.ID); existing != nil {
+		*existing = *cloneModelNode(plan.ref.Node)
+	} else {
+		sh.Nodes = append(sh.Nodes, *cloneModelNode(plan.ref.Node))
 	}
-	ref := e.rt.ix.Node(plan.node.ID)
-	if ref == nil {
-		return nil, nil, fmt.Errorf("engine: 增量落锚后节点 %s 不可见", plan.node.ID)
-	}
-	return ref, []string{"节点 " + plan.node.ID + " 为新符号增量落锚自动创建"}, nil
+	return e.Store.SaveShard(filepath.Join(e.Store.Dir(), filepath.FromSlash(rel)), sh, raw)
 }
 
 func (e *Engine) nodeFromSymbol(file string, sym parser.Symbol) model.Node {
@@ -522,7 +553,7 @@ func (e *Engine) nodeFromSymbol(file string, sym parser.Symbol) model.Node {
 	return model.Node{
 		ID: model.SymbolNodeID(file, sym.Name), Level: level,
 		Anchor: model.Anchor{File: file, Symbol: sym.Name,
-			Hash: sym.Hash, StructHash: sym.StructHash, Lines: sym.Lines},
+			Hash: sym.Hash, StructHash: sym.StructHash, DocStructHash: sym.DocStructHash, Lines: sym.Lines},
 		Status: model.StatusFresh, // 定案:增量落锚建 fresh(impl §7.3)
 		Since:  e.now().UTC(),
 	}
@@ -542,6 +573,9 @@ type ChangeArgs struct {
 	Verified  string           `json:"verified,omitempty"`
 	Remaps    []model.Remap    `json:"remaps,omitempty"`
 	BaseHash  string           `json:"base_hash,omitempty"`
+	// adoptOrphan 仅供 kb_adopt claim 复用 RecordChange 的事务管线；外部协议
+	// 不暴露。锁内再次确认源仍为 orphaned，消除预检与提交之间的竞态。
+	adoptOrphan string
 }
 
 // RecordChange 修改代码后的变更记录:一个逻辑修改 = 一条记录。
@@ -554,6 +588,13 @@ func (e *Engine) RecordChange(a ChangeArgs, sid, author string) (string, error) 
 	}
 	e.rt.mu.Lock()
 	defer e.rt.mu.Unlock()
+	if a.adoptOrphan != "" {
+		ref := e.rt.ix.Node(a.adoptOrphan)
+		if ref == nil || ref.Node.Status != model.StatusOrphaned {
+			return "", kbErr("NODE_NOT_FOUND", a.adoptOrphan+" 不是可认领的 orphaned 节点",
+				"用 kb_status 核对孤儿列表")
+		}
+	}
 
 	if len(a.Nodes) == 0 || strings.TrimSpace(a.What) == "" || strings.TrimSpace(a.Why) == "" {
 		return "", kbErr("INVALID_ARGUMENT", "nodes/what/why 必填",
@@ -565,10 +606,18 @@ func (e *Engine) RecordChange(a ChangeArgs, sid, author string) (string, error) 
 			return "", kbErr("MISSING_REBUTTAL", "overturns 非空时 rebuttal 必填",
 				"直接回应被推翻记录的 why")
 		}
+		if e.changeIDConflictedLocked(a.Overturns) {
+			return "", kbErr("JOURNAL_CONFLICT", "change "+a.Overturns+" 存在同 ID 异内容冲突",
+				"先人工裁决 journal 冲突，不能选择随机副本 overturn")
+		}
 		target := e.rt.ix.ChangeByID(a.Overturns)
 		if target == nil {
 			return "", kbErr("OVERTURNS_NOT_FOUND", "被推翻的记录 "+a.Overturns+" 不存在",
 				"用 kb_recall(mode=history) 核对记录 ID")
+		}
+		if target.EffectsVersion > 1 {
+			return "", kbErr("SCHEMA_TOO_NEW", "change "+a.Overturns+" 的 effects_version 高于当前引擎",
+				"升级 iknowledge 后再 overturn")
 		}
 		if !e.overturnsInScopeLocked(target, a.Nodes) {
 			return "", kbErr("OVERTURNS_NOT_FOUND",
@@ -628,6 +677,19 @@ func (e *Engine) RecordChange(a ChangeArgs, sid, author string) (string, error) 
 		}
 	}
 
+	// remap 也是本次 record_change 的校验面，必须在 journal 和任何分片写入
+	// 前完成全量规划。目标可以是本次 nodes 刚规划、尚未落盘的新符号。
+	plannedNodes := map[string]*model.Node{}
+	for i := range actions {
+		if actions[i].kind == "create" && actions[i].newNode != nil {
+			plannedNodes[actions[i].newNode.ID] = actions[i].newNode
+		}
+	}
+	remapPlan, err := e.planRemapsLocked(a.Remaps, plannedNodes)
+	if err != nil {
+		return "", err
+	}
+
 	if a.BaseHash != "" && len(resolved) > 0 {
 		if ref := e.rt.ix.Node(resolved[0]); ref != nil {
 			// #40:base_hash 对 record_change 语义已反(它是改码【后】记账,现算哈希
@@ -646,7 +708,47 @@ func (e *Engine) RecordChange(a ChangeArgs, sid, author string) (string, error) 
 		}
 	}
 
-	// 【journal 先行(账本优先)】:变更是唯一真相,先落。
+	// 先为所有可能改动的分片和节点取 before 快照。RecordChange 的 journal
+	// 改为提交标记：分片全部成功后才 append；任一 Save/reload/append 失败均按
+	// 原始字节回滚。NodeEffects 同时让后续 kb_revert 可逆转重锚/create/remap。
+	affectedNodes := map[string]bool{}
+	touchedRels := map[string]bool{}
+	plannedShard := map[string]string{}
+	for _, act := range actions {
+		affectedNodes[act.id] = true
+		touchedRels[act.shardRel] = true
+		plannedShard[act.id] = act.shardRel
+		if act.fileEnsure != nil {
+			affectedNodes[act.fileEnsure.ID] = true
+			plannedShard[act.fileEnsure.ID] = act.shardRel
+		}
+	}
+	if remapPlan != nil {
+		for id := range remapPlan.removeSet {
+			affectedNodes[id] = true
+			if ref := e.rt.ix.Node(id); ref != nil {
+				touchedRels[ref.ShardRel] = true
+			}
+		}
+		for id := range remapPlan.edits {
+			affectedNodes[id] = true
+			if ref := e.rt.ix.Node(id); ref != nil {
+				touchedRels[ref.ShardRel] = true
+			} else if rel := plannedShard[id]; rel != "" {
+				touchedRels[rel] = true
+			}
+		}
+	}
+	beforeNodes := map[string]*model.Node{}
+	beforeShards := map[string]string{}
+	beforeRawNodes := map[string]string{}
+	for id := range affectedNodes {
+		if ref := e.rt.ix.Node(id); ref != nil {
+			beforeNodes[id] = cloneModelNode(ref.Node)
+			beforeShards[id] = ref.ShardRel
+			beforeRawNodes[id] = e.rawNodeYAMLLocked(id)
+		}
+	}
 	ids := map[string]bool{}
 	for _, c := range e.rt.ix.Changes() {
 		ids[c.ID] = true
@@ -660,45 +762,50 @@ func (e *Engine) RecordChange(a ChangeArgs, sid, author string) (string, error) 
 		Task: a.Task, What: a.What, Why: a.Why,
 		Rejected: a.Rejected, Overturns: a.Overturns, Rebuttal: a.Rebuttal,
 		Remaps: a.Remaps, Verified: a.Verified, Author: author,
-		Commit: gitHead(e.Store.RepoRoot()),
+		Commit: gitHead(e.Store.RepoRoot()), EffectsVersion: 1,
 	}
-	if err := e.Store.AppendChange(change); err != nil {
+	// prepared WAL 必须在首个分片写之前包含全部目标，包括最后才追加的月
+	// journal；否则进程在 append 后、commit marker 前退出会留下幽灵记录。
+	touchedRels[e.Store.JournalRelFor(change)] = true
+	tx, err := e.prepareTruthTransactionLocked(touchedRels)
+	if err != nil {
 		return "", err
 	}
+	defer e.guardTruthTransactionPanicLocked(tx)
+	rollback := func(cause error) (string, error) {
+		return "", e.rollbackTruthTransactionLocked(tx, cause)
+	}
 
-	// 【第二遍:应用节点动作并落盘】——校验已过,这里的失败只剩磁盘 IO,如实上抛。
+	// 应用节点动作到分片克隆，不提前污染当前索引快照。
 	touched := map[string]*store.Shard{} // shardRel → 待存分片(按分片合并写)
 	shardOf := func(rel string) *store.Shard {
 		if touched[rel] == nil {
 			if cs := e.rt.cache.Shards()[rel]; cs != nil {
-				touched[rel] = cs.Shard
+				touched[rel] = cloneEngineShard(cs.Shard)
 			}
 		}
 		return touched[rel]
 	}
 	for _, act := range actions {
+		sh := shardOf(act.shardRel)
 		switch act.kind {
 		case "reanchor":
-			if ref := e.rt.ix.Node(act.id); ref != nil {
-				ref.Node.Anchor = act.anchor
-				ref.Node.PendingAnchor = false
-				if ref.Node.Status == model.StatusSuspect {
-					ref.Node.Status = model.StatusFresh
+			if n := nodeInShard(sh, act.id); n != nil {
+				n.Anchor = act.anchor
+				n.PendingAnchor = false
+				if n.Status == model.StatusSuspect {
+					n.Status = model.StatusFresh
 				}
-				shardOf(act.shardRel)
 			}
 		case "orphan":
-			if ref := e.rt.ix.Node(act.id); ref != nil {
-				ref.Node.Status = model.StatusOrphaned
-				shardOf(act.shardRel)
+			if n := nodeInShard(sh, act.id); n != nil {
+				n.Status = model.StatusOrphaned
 			}
 		case "pending":
-			if ref := e.rt.ix.Node(act.id); ref != nil {
-				ref.Node.PendingAnchor = true
-				shardOf(act.shardRel)
+			if n := nodeInShard(sh, act.id); n != nil {
+				n.PendingAnchor = true
 			}
 		case "create":
-			sh := shardOf(act.shardRel)
 			if sh == nil {
 				sh = &store.Shard{Schema: model.SchemaVersion}
 				touched[act.shardRel] = sh
@@ -713,27 +820,90 @@ func (e *Engine) RecordChange(a ChangeArgs, sid, author string) (string, error) 
 			}
 		}
 	}
-	for rel, sh := range touched {
-		if err := e.Store.SaveShard(filepath.Join(e.Store.Dir(), filepath.FromSlash(rel)), sh, nil); err != nil {
-			return "", err
+	touchedOrder := make([]string, 0, len(touched))
+	for rel := range touched {
+		touchedOrder = append(touchedOrder, rel)
+	}
+	sort.Strings(touchedOrder)
+	for _, rel := range touchedOrder {
+		var err error
+		if cs := e.rt.cache.Shards()[rel]; cs != nil {
+			err = e.Store.SaveShard(filepath.Join(e.Store.Dir(), filepath.FromSlash(rel)), touched[rel], cs.Raw)
+		} else {
+			err = e.Store.SaveShard(filepath.Join(e.Store.Dir(), filepath.FromSlash(rel)), touched[rel], nil)
+		}
+		if err != nil {
+			return rollback(fmt.Errorf("record_change 保存 %s: %w", rel, err))
 		}
 	}
 	if err := e.reloadLocked(); err != nil {
-		return "", err
+		return rollback(err)
 	}
 
-	// remaps 申报式迁移(knowledge.md §12.6 第 2 层)——自身已原子。
-	if len(a.Remaps) > 0 {
-		if err := e.applyRemapsLocked(a.Remaps); err != nil {
-			return "", err
+	// 此处只执行上面已经全量校验过的 remap 计划；剩余错误只可能来自 IO。
+	if remapPlan != nil {
+		if err := e.applyRemapPlanLocked(remapPlan); err != nil {
+			return rollback(err)
 		}
 		warns = append(warns, "remaps 已迁移:条目统一降半级待确认(verified→inferred、inferred→suspect)")
 	}
-
-	e.markDigested(sid, resolved...)
 	if err := e.reloadLocked(); err != nil {
-		return "", err
+		return rollback(err)
 	}
+
+	affectedIDs := make([]string, 0, len(affectedNodes))
+	for id := range affectedNodes {
+		affectedIDs = append(affectedIDs, id)
+	}
+	sort.Strings(affectedIDs)
+	for _, id := range affectedIDs {
+		var after *model.Node
+		afterShard := ""
+		afterRaw := ""
+		if ref := e.rt.ix.Node(id); ref != nil {
+			after = cloneModelNode(ref.Node)
+			afterShard = ref.ShardRel
+			afterRaw = e.rawNodeYAMLLocked(id)
+		}
+		before := beforeNodes[id]
+		if reflect.DeepEqual(before, after) && beforeShards[id] == afterShard {
+			continue
+		}
+		change.NodeEffects = append(change.NodeEffects, model.NodeEffect{
+			Node: id, BeforeShard: beforeShards[id], AfterShard: afterShard,
+			Before: before, After: after, BeforeRaw: beforeRawNodes[id], AfterRaw: afterRaw,
+		})
+	}
+	uniqueNodes := make([]string, 0, len(change.Nodes)+len(change.NodeEffects))
+	for _, id := range change.Nodes {
+		uniqueNodes = appendUnique(uniqueNodes, id)
+	}
+	for _, effect := range change.NodeEffects {
+		uniqueNodes = appendUnique(uniqueNodes, effect.Node)
+	}
+	change.Nodes = uniqueNodes
+	if err := e.Store.AppendChange(change); err != nil {
+		committed := false
+		if changes, _, loadErr := e.Store.LoadJournal(); loadErr == nil {
+			for _, c := range changes {
+				if c.ID == change.ID {
+					committed = true
+					break
+				}
+			}
+		}
+		if !committed {
+			return rollback(fmt.Errorf("record_change 追加 journal: %w", err))
+		}
+	}
+	committed, commitErr := e.commitTruthTransactionLocked(tx)
+	if !committed {
+		return rollback(fmt.Errorf("record_change 写 committed marker: %w", commitErr))
+	}
+	if commitErr != nil {
+		return "", fmt.Errorf("record_change 已提交但 WAL 清理/重载失败(不要重试同一变更): %w", commitErr)
+	}
+	e.markDigested(sid, resolved...)
 
 	var b strings.Builder
 	fmt.Fprintf(&b, "changeId: %s\nreanchored: %v\norphaned: %v\npendingAnchor: %v\ncreated: %v",
@@ -824,6 +994,176 @@ func shardHasNode(sh *store.Shard, id string) bool {
 	return false
 }
 
+func nodeInShard(sh *store.Shard, id string) *model.Node {
+	if sh == nil {
+		return nil
+	}
+	for i := range sh.Nodes {
+		if sh.Nodes[i].ID == id {
+			return &sh.Nodes[i]
+		}
+	}
+	return nil
+}
+
+func cloneYAMLNode(in *yaml.Node) *yaml.Node {
+	if in == nil {
+		return nil
+	}
+	out := *in
+	out.Content = make([]*yaml.Node, len(in.Content))
+	for i := range in.Content {
+		out.Content[i] = cloneYAMLNode(in.Content[i])
+	}
+	return &out
+}
+
+func yamlMappingValue(node *yaml.Node, key string) *yaml.Node {
+	if node == nil {
+		return nil
+	}
+	if node.Kind == yaml.DocumentNode && len(node.Content) == 1 {
+		node = node.Content[0]
+	}
+	if node.Kind != yaml.MappingNode {
+		return nil
+	}
+	for i := 0; i+1 < len(node.Content); i += 2 {
+		if node.Content[i].Value == key {
+			return node.Content[i+1]
+		}
+	}
+	return nil
+}
+
+func yamlObjectByID(seq *yaml.Node, id string) *yaml.Node {
+	if seq == nil || seq.Kind != yaml.SequenceNode {
+		return nil
+	}
+	for _, item := range seq.Content {
+		if idNode := yamlMappingValue(item, "id"); idNode != nil && idNode.Value == id {
+			return item
+		}
+	}
+	return nil
+}
+
+func (e *Engine) rawEntryNodeLocked(nodeID, entryID string) *yaml.Node {
+	ref := e.rt.ix.Node(nodeID)
+	if ref == nil {
+		return nil
+	}
+	cs := e.rt.cache.Shards()[ref.ShardRel]
+	if cs == nil || cs.Raw == nil {
+		return nil
+	}
+	node := yamlObjectByID(yamlMappingValue(cs.Raw, "nodes"), nodeID)
+	entry := yamlObjectByID(yamlMappingValue(node, "entries"), entryID)
+	return cloneYAMLNode(entry)
+}
+
+func (e *Engine) rawNodeYAMLLocked(nodeID string) string {
+	ref := e.rt.ix.Node(nodeID)
+	if ref == nil {
+		return ""
+	}
+	cs := e.rt.cache.Shards()[ref.ShardRel]
+	if cs == nil || cs.Raw == nil {
+		return ""
+	}
+	node := yamlObjectByID(yamlMappingValue(cs.Raw, "nodes"), nodeID)
+	if node == nil {
+		return ""
+	}
+	data, err := yaml.Marshal(node)
+	if err != nil {
+		return ""
+	}
+	return string(data)
+}
+
+func injectRawEntry(raw *yaml.Node, nodeID, entryID string, entry *yaml.Node) {
+	if raw == nil || entry == nil {
+		return
+	}
+	node := yamlObjectByID(yamlMappingValue(raw, "nodes"), nodeID)
+	if node == nil {
+		return
+	}
+	entries := yamlMappingValue(node, "entries")
+	if entries == nil {
+		entries = &yaml.Node{Kind: yaml.SequenceNode, Tag: "!!seq"}
+		node.Content = append(node.Content,
+			&yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: "entries"}, entries)
+	}
+	if yamlObjectByID(entries, entryID) == nil {
+		entries.Content = append(entries.Content, cloneYAMLNode(entry))
+	}
+}
+
+func injectRawNode(raw *yaml.Node, rawNode string) {
+	if raw == nil || strings.TrimSpace(rawNode) == "" {
+		return
+	}
+	var node yaml.Node
+	if err := yaml.Unmarshal([]byte(rawNode), &node); err != nil {
+		return
+	}
+	n := &node
+	if n.Kind == yaml.DocumentNode && len(n.Content) == 1 {
+		n = n.Content[0]
+	}
+	idNode := yamlMappingValue(n, "id")
+	nodes := yamlMappingValue(raw, "nodes")
+	if idNode == nil || nodes == nil || nodes.Kind != yaml.SequenceNode || yamlObjectByID(nodes, idNode.Value) != nil {
+		return
+	}
+	nodes.Content = append(nodes.Content, cloneYAMLNode(n))
+}
+
+type knowledgeFileSnapshot struct {
+	exists bool
+	data   []byte
+}
+
+func (e *Engine) snapshotKnowledgeFiles(rels map[string]bool) (map[string]knowledgeFileSnapshot, error) {
+	out := make(map[string]knowledgeFileSnapshot, len(rels))
+	for rel := range rels {
+		data, err := e.Store.ReadKnowledgeFile(rel)
+		switch {
+		case err == nil:
+			out[rel] = knowledgeFileSnapshot{exists: true, data: data}
+		case os.IsNotExist(err):
+			out[rel] = knowledgeFileSnapshot{}
+		default:
+			return nil, fmt.Errorf("读取事务快照 %s: %w", rel, err)
+		}
+	}
+	return out, nil
+}
+
+func (e *Engine) rollbackKnowledgeSnapshots(snapshots map[string]knowledgeFileSnapshot) error {
+	rels := make([]string, 0, len(snapshots))
+	for rel := range snapshots {
+		rels = append(rels, rel)
+	}
+	sort.Sort(sort.Reverse(sort.StringSlice(rels)))
+	var errs []error
+	for _, rel := range rels {
+		snapshot := snapshots[rel]
+		if snapshot.exists {
+			if err := e.Store.WriteKnowledgeFile(rel, snapshot.data); err != nil {
+				errs = append(errs, fmt.Errorf("回滚 %s: %w", rel, err))
+			}
+			continue
+		}
+		if err := e.Store.RemoveKnowledgeFile(rel); err != nil && !os.IsNotExist(err) {
+			errs = append(errs, fmt.Errorf("删除事务中新文件 %s: %w", rel, err))
+		}
+	}
+	return errors.Join(errs...)
+}
+
 // overturnsInScopeLocked 被推翻记录必须在本次 nodes 任一节点(含血缘)历史上。
 func (e *Engine) overturnsInScopeLocked(target *model.Change, nodes []string) bool {
 	scope := map[string]bool{}
@@ -847,99 +1187,225 @@ func (e *Engine) overturnsInScopeLocked(target *model.Change, nodes []string) bo
 	return false
 }
 
-// applyRemapsLocked 按申报分派 Entries、接续血缘、降半级(定案见 model.Remap)。
-func (e *Engine) applyRemapsLocked(remaps []model.Remap) error {
-	// 第一遍:全部校验并把编辑收成计划(不 mutate)——applyRemapsLocked 要么整体成功
-	// 要么不留半迁移;校验期的任何拒收都在落盘之前(#30 半应用、#27 自毁)。
-	type edit struct {
-		addEntries []model.Entry
-		addLineage []string
-	}
-	plan := map[string]*edit{} // 现任目标节点 ID → 编辑
-	editOf := func(id string) *edit {
-		if plan[id] == nil {
-			plan[id] = &edit{}
-		}
-		return plan[id]
-	}
-	removeSet := map[string]bool{}
+type remapEdit struct {
+	addEntries []model.Entry
+	addLineage []string
+}
 
+type remapApplyPlan struct {
+	edits     map[string]*remapEdit
+	removeSet map[string]bool
+	rawMoves  []remapRawMove
+}
+
+type remapRawMove struct {
+	targetNode string
+	entryID    string
+	rawEntry   *yaml.Node
+}
+
+// planRemapsLocked 把 remaps 解析为完整、确定的执行计划，但不修改内存或磁盘。
+// plannedNodes 是同一次 RecordChange 即将创建的节点，普通调用传 nil。
+func (e *Engine) planRemapsLocked(remaps []model.Remap, plannedNodes map[string]*model.Node) (*remapApplyPlan, error) {
+	if len(remaps) == 0 {
+		return nil, nil
+	}
+	type resolvedRemap struct {
+		fromID   string
+		fromNode *model.Node
+		to       []string
+		toByName map[string]string
+		raw      model.Remap
+	}
+	resolveTarget := func(q string) (string, []string) {
+		if plannedNodes[q] != nil {
+			return q, nil
+		}
+		if id, cands := e.resolveQueryLocked(q); id != "" || len(cands) > 0 {
+			return id, cands
+		}
+		qFile, qSym := model.SplitNodeID(q)
+		var hits []string
+		for id := range plannedNodes {
+			file, sym := model.SplitNodeID(id)
+			if qSym != "" && (qFile == "" || qFile == file) && model.LooseSymbolMatch(qSym, sym) {
+				hits = append(hits, id)
+			}
+		}
+		sort.Strings(hits)
+		if len(hits) == 1 {
+			return hits[0], nil
+		}
+		return "", hits
+	}
+
+	resolved := make([]resolvedRemap, 0, len(remaps))
+	sources := map[string]bool{}
 	for _, rm := range remaps {
 		fromID := e.rt.ix.ResolveNodeID(rm.From)
-		if fromID == "" {
-			return kbErr("NODE_NOT_FOUND", "remaps.from "+rm.From+" 不存在", "核对节点 ID")
-		}
-		if len(rm.To) == 0 {
-			return kbErr("INVALID_ARGUMENT", "remaps.to 为空", "至少给一个目标节点")
-		}
 		fromRef := e.rt.ix.Node(fromID)
-		targetIDs := map[string]string{} // rm.To 原样 → 现任 ID
+		if fromID == "" || fromRef == nil {
+			return nil, kbErr("NODE_NOT_FOUND", "remaps.from "+rm.From+" 不存在", "核对节点 ID")
+		}
+		if sources[fromID] {
+			return nil, kbErr("INVALID_ARGUMENT", "remaps.from "+rm.From+" 重复申报", "每个源节点只能映射一次")
+		}
+		sources[fromID] = true
+		if len(rm.To) == 0 {
+			return nil, kbErr("INVALID_ARGUMENT", "remaps.to 为空", "至少给一个目标节点")
+		}
+		rr := resolvedRemap{fromID: fromID, fromNode: fromRef.Node, raw: rm, toByName: map[string]string{}}
+		seenTo := map[string]bool{}
 		for _, to := range rm.To {
-			toID, cands := e.resolveQueryLocked(to)
+			toID, cands := resolveTarget(to)
 			if toID == "" {
 				if len(cands) > 1 {
-					return kbErr("NODE_NOT_FOUND", "remaps.to "+to+" 有多个候选", "用完整节点 ID")
+					return nil, kbErr("NODE_NOT_FOUND", "remaps.to "+to+" 有多个候选", "用完整节点 ID")
 				}
-				return kbErr("NODE_NOT_FOUND", "remaps.to "+to+" 不存在",
-					"目标符号须已在代码中(先把目标节点列进 nodes 完成增量落锚)")
+				return nil, kbErr("NODE_NOT_FOUND", "remaps.to "+to+" 不存在",
+					"目标符号须已在代码中或列进本次 nodes 完成增量落锚")
 			}
-			// #27:from 与 to 解析到同一节点(常因 from 是目标血缘里的旧 ID)→ 自毁,拒收。
 			if toID == fromID {
-				return kbErr("NODE_NOT_FOUND", "remaps.from 与 to 解析到同一节点 "+toID+"(疑似把目标的血缘旧 ID 当 from)",
+				return nil, kbErr("NODE_NOT_FOUND", "remaps.from 与 to 解析到同一节点 "+toID+"(疑似把目标的血缘旧 ID 当 from)",
 					"from 应是被拆分/合并前的源节点,不能等于任一目标")
 			}
-			targetIDs[to] = toID
-		}
-		lineageToAdd := appendUnique(append([]string{}, fromRef.Node.Lineage...), fromID)
-		for i := range fromRef.Node.Entries {
-			en := fromRef.Node.Entries[i]
-			en.Confidence = demote(en.Confidence)
-			dstID := targetIDs[rm.To[0]]
-			if t, ok := rm.Entries[en.ID]; ok {
-				if targetIDs[t] == "" {
-					return kbErr("NODE_NOT_FOUND", "remaps.entries 目标 "+t+" 不在 to 列表", "核对映射")
-				}
-				dstID = targetIDs[t]
+			if seenTo[toID] {
+				return nil, kbErr("INVALID_ARGUMENT", "remaps.to 重复指向 "+toID, "目标节点去重后重试")
 			}
-			editOf(dstID).addEntries = append(editOf(dstID).addEntries, en)
+			seenTo[toID] = true
+			rr.to = append(rr.to, toID)
+			rr.toByName[to] = toID
+			rr.toByName[toID] = toID
 		}
-		for _, toID := range targetIDs {
-			e := editOf(toID)
-			for _, l := range lineageToAdd {
-				e.addLineage = appendUnique(e.addLineage, l)
+		resolved = append(resolved, rr)
+	}
+	for _, rr := range resolved {
+		for _, toID := range rr.to {
+			if sources[toID] {
+				return nil, kbErr("INVALID_ARGUMENT", "节点 "+toID+" 同时作为 remap 源和目标", "拆成两次明确的迁移")
 			}
 		}
-		removeSet[fromID] = true
 	}
 
-	// 第二遍:应用。in-place 改 Node(不动 shard 的 Nodes 数组),收集受影响分片。
+	plan := &remapApplyPlan{edits: map[string]*remapEdit{}, removeSet: map[string]bool{}}
+	editOf := func(id string) *remapEdit {
+		if plan.edits[id] == nil {
+			plan.edits[id] = &remapEdit{}
+		}
+		return plan.edits[id]
+	}
+	entryIDs := map[string]map[string]bool{}
+	for _, rr := range resolved {
+		for _, toID := range rr.to {
+			if entryIDs[toID] != nil {
+				continue
+			}
+			entryIDs[toID] = map[string]bool{}
+			n := plannedNodes[toID]
+			if n == nil {
+				if ref := e.rt.ix.Node(toID); ref != nil {
+					n = ref.Node
+				}
+			}
+			if n != nil {
+				for i := range n.Entries {
+					entryIDs[toID][n.Entries[i].ID] = true
+				}
+			}
+		}
+	}
+	for _, rr := range resolved {
+		knownEntries := map[string]bool{}
+		for i := range rr.fromNode.Entries {
+			knownEntries[rr.fromNode.Entries[i].ID] = true
+		}
+		for entryID, dst := range rr.raw.Entries {
+			if !knownEntries[entryID] {
+				return nil, kbErr("INVALID_ARGUMENT", "remaps.entries 引用了源节点中不存在的条目 "+entryID, "核对 entry ID")
+			}
+			if rr.toByName[dst] == "" {
+				return nil, kbErr("NODE_NOT_FOUND", "remaps.entries 目标 "+dst+" 不在 to 列表", "核对映射")
+			}
+		}
+		lineage := appendUnique(append([]string{}, rr.fromNode.Lineage...), rr.fromID)
+		for i := range rr.fromNode.Entries {
+			en := rr.fromNode.Entries[i]
+			en.Confidence = demote(en.Confidence)
+			dstID := rr.to[0]
+			if dst, ok := rr.raw.Entries[en.ID]; ok {
+				dstID = rr.toByName[dst]
+			}
+			if entryIDs[dstID][en.ID] {
+				return nil, kbErr("INVALID_ARGUMENT", "remap 后目标 "+dstID+" 出现重复条目 ID "+en.ID, "先合并/清理冲突条目")
+			}
+			entryIDs[dstID][en.ID] = true
+			editOf(dstID).addEntries = append(editOf(dstID).addEntries, en)
+			if raw := e.rawEntryNodeLocked(rr.fromID, en.ID); raw != nil {
+				plan.rawMoves = append(plan.rawMoves, remapRawMove{targetNode: dstID, entryID: en.ID, rawEntry: raw})
+			}
+		}
+		for _, toID := range rr.to {
+			for _, old := range lineage {
+				editOf(toID).addLineage = appendUnique(editOf(toID).addLineage, old)
+			}
+		}
+		plan.removeSet[rr.fromID] = true
+	}
+	return plan, nil
+}
+
+// applyRemapsLocked 供 adopt 等已有调用使用：先纯规划，再执行。
+func (e *Engine) applyRemapsLocked(remaps []model.Remap) error {
+	plan, err := e.planRemapsLocked(remaps, nil)
+	if err != nil || plan == nil {
+		return err
+	}
+	return e.applyRemapPlanLocked(plan)
+}
+
+func (e *Engine) applyRemapPlanLocked(plan *remapApplyPlan) error {
 	dirty := map[string]bool{}
-	for id, ed := range plan {
+	rawOverrides := map[string]*yaml.Node{}
+	for id, ed := range plan.edits {
 		ref := e.rt.ix.Node(id)
 		if ref == nil {
 			return kbErr("NODE_NOT_FOUND", "目标节点 "+id+" 迁移中消失", "重试")
 		}
 		ref.Node.Entries = append(ref.Node.Entries, ed.addEntries...)
-		for _, l := range ed.addLineage {
-			ref.Node.Lineage = appendUnique(ref.Node.Lineage, l)
+		for _, old := range ed.addLineage {
+			ref.Node.Lineage = appendUnique(ref.Node.Lineage, old)
 		}
 		if ref.Node.Status == model.StatusUndigested && hasActiveEntries(ref.Node) {
 			ref.Node.Status = model.StatusFresh
 		}
 		dirty[ref.ShardRel] = true
 	}
-	for id := range removeSet {
+	for id := range plan.removeSet {
 		if ref := e.rt.ix.Node(id); ref != nil {
 			dirty[ref.ShardRel] = true
 		}
 	}
-	// 每个受影响分片重建一次(删除 from 节点),整分片存一次——避免逐节点 [:0] 压缩
-	// 反复使索引指针失效(#16)。
-	return e.rewriteShardsLocked(dirty, removeSet)
+	for _, move := range plan.rawMoves {
+		ref := e.rt.ix.Node(move.targetNode)
+		if ref == nil || move.rawEntry == nil {
+			continue
+		}
+		if rawOverrides[ref.ShardRel] == nil {
+			if cs := e.rt.cache.Shards()[ref.ShardRel]; cs != nil {
+				rawOverrides[ref.ShardRel] = cloneYAMLNode(cs.Raw)
+			}
+		}
+		injectRawEntry(rawOverrides[ref.ShardRel], move.targetNode, move.entryID, move.rawEntry)
+	}
+	return e.rewriteShardsLockedWithRaw(dirty, plan.removeSet, rawOverrides)
 }
 
 // rewriteShardsLocked 把 dirty 分片按现存索引节点 + 删除集重写落盘(整分片一次)。
 func (e *Engine) rewriteShardsLocked(dirty map[string]bool, removeSet map[string]bool) error {
+	return e.rewriteShardsLockedWithRaw(dirty, removeSet, nil)
+}
+
+func (e *Engine) rewriteShardsLockedWithRaw(dirty map[string]bool, removeSet map[string]bool, rawOverrides map[string]*yaml.Node) error {
 	for rel := range dirty {
 		cs := e.rt.cache.Shards()[rel]
 		if cs == nil || cs.Shard == nil {
@@ -953,7 +1419,11 @@ func (e *Engine) rewriteShardsLocked(dirty map[string]bool, removeSet map[string
 		}
 		cs.Shard.Nodes = kept
 		path := filepath.Join(e.Store.Dir(), filepath.FromSlash(rel))
-		if err := e.Store.SaveShard(path, cs.Shard, cs.Raw); err != nil {
+		raw := cs.Raw
+		if rawOverrides[rel] != nil {
+			raw = rawOverrides[rel]
+		}
+		if err := e.Store.SaveShard(path, cs.Shard, raw); err != nil {
 			return err
 		}
 	}
@@ -1004,13 +1474,13 @@ func (e *Engine) eraDebtLocked(nodeID string) bool {
 }
 
 func gitHead(repo string) string {
-	data, err := os.ReadFile(filepath.Join(repo, ".git", "HEAD"))
+	data, err := safeRepoRead(repo, ".git/HEAD")
 	if err != nil {
 		return ""
 	}
 	head := strings.TrimSpace(string(data))
 	if refPath, ok := strings.CutPrefix(head, "ref: "); ok {
-		if data, err := os.ReadFile(filepath.Join(repo, ".git", filepath.FromSlash(refPath))); err == nil {
+		if data, err := safeRepoRead(repo, ".git/"+filepath.ToSlash(refPath)); err == nil {
 			return strings.TrimSpace(string(data))[:min(12, len(strings.TrimSpace(string(data))))]
 		}
 		return ""
@@ -1024,6 +1494,19 @@ func gitHead(repo string) string {
 type RevertArgs struct {
 	Change string `json:"change"` // 被撤销的 change ID(必填)
 	Reason string `json:"reason"` // 撤销理由(必填:留痕,后续可追溯为什么撤)
+}
+
+func (e *Engine) changeIDConflictedLocked(id string) bool {
+	if e.rt.cache == nil {
+		return false
+	}
+	_, stats := e.rt.cache.Journal()
+	for _, conflicted := range stats.ConflictIDs {
+		if conflicted == id {
+			return true
+		}
+	}
+	return false
 }
 
 // Revert 撤销一条 change。撤销本身是追加一条带 Reverts 字段的 Change(追加式不变量不破),
@@ -1051,63 +1534,184 @@ func (e *Engine) Revert(a RevertArgs, sid, author string) (string, error) {
 	}
 
 	// 找被撤销的 change。
-	var target *model.Change
-	for i := range e.rt.ix.Changes() {
-		c := e.rt.ix.Changes()[i]
-		if c.ID == a.Change {
-			target = &c
-			break
-		}
+	if e.changeIDConflictedLocked(a.Change) {
+		return "", kbErr("JOURNAL_CONFLICT", "change "+a.Change+" 存在同 ID 异内容冲突",
+			"先人工裁决 journal 冲突，不能选择随机副本 revert")
 	}
+	target := e.rt.ix.ChangeByID(a.Change)
 	if target == nil {
 		return "", kbErr("NODE_NOT_FOUND", "change "+a.Change+" 不存在", "kb_recall mode=history 确认 ID")
 	}
-	// 不可重复撤销:已有 revert 指向它。
+	if target.EffectsVersion > 1 {
+		return "", kbErr("SCHEMA_TOO_NEW", "change "+a.Change+" 的 effects_version 高于当前引擎",
+			"升级 iknowledge 后再 revert")
+	}
+	// 已有 revert 通常表示操作完成；但旧实现 journal 先行且吞 SaveShard 错误，
+	// 可能留下“已撤销”记录却没恢复分片。下面会按 before/after 状态判定：完整
+	// 恢复才报 ALREADY_REVERTED，半应用则补完而不再追加第二条 journal。
+	var existingRevert *model.Change
 	for _, c := range e.rt.ix.Changes() {
 		if c.Reverts == a.Change {
-			return "", kbErr("ALREADY_REVERTED", "change "+a.Change+" 已被 "+c.ID+" 撤销", "一条记录只能撤一次")
+			cc := c
+			existingRevert = &cc
+			break
 		}
 	}
 
-	// 反向应用副作用:遍历 target 涉及的节点,清理被它设的 SupersededBy/RefutedBy。
-	// 这是机械反推:target 的 overturns/refute 级联设的字段,清掉即恢复。
-	restored := 0
-	touched := map[string]*store.Shard{}
-	shardOf := func(rel string) *store.Shard {
-		if touched[rel] == nil {
-			if cs := e.rt.cache.Shards()[rel]; cs != nil {
-				touched[rel] = cs.Shard
-			}
+	effects := append([]model.EntryEffect(nil), target.Effects...)
+	nodeEffects := append([]model.NodeEffect(nil), target.NodeEffects...)
+	legacy := target.EffectsVersion == 0 && len(effects) == 0 && len(nodeEffects) == 0
+	if legacy {
+		effects = e.legacyEffectsLocked(target)
+		if len(effects) == 0 {
+			return "", kbErr("REVERT_UNPROVABLE", "旧 change "+target.ID+" 缺少结构化 effects，无法证明安全逆操作",
+				"人工检查 journal/git 后用新 change 明确修正；不要猜测旧状态")
 		}
-		return touched[rel]
 	}
-	for _, nodeID := range target.Nodes {
+
+	// 先验证全部 effect，再在分片克隆上反向应用。当前状态只允许等于 target.After
+	//（待恢复）或 target.Before（上次崩溃已恢复）；任何第三种状态说明有后续编辑，
+	// 必须拒绝，不能把新事实覆盖掉。
+	touched := map[string]*store.Shard{}
+	rawOverrides := map[string]*yaml.Node{}
+	originals := map[string][]byte{}
+	needRestore, alreadyRestored := 0, 0
+	seenEffects := map[string]bool{}
+
+	// record_change 的节点级副作用（重锚/create/remap）走 NodeEffects。
+	// 先对当前最终态做严格比较，再在分片克隆上删 After、放回 Before。
+	for _, effect := range nodeEffects {
+		if effect.Node == "" || seenEffects["node:"+effect.Node] {
+			return "", kbErr("REVERT_CONFLICT", "change "+target.ID+" 的 node_effects 损坏或重复:"+effect.Node, "人工检查 journal")
+		}
+		seenEffects["node:"+effect.Node] = true
+		current, currentRel, duplicate := e.findCachedNode(effect.Node)
+		if duplicate {
+			return "", kbErr("REVERT_CONFLICT", "Node ID "+effect.Node+" 在多个分片重复", "先修复重复节点")
+		}
+		matchesAfter := reflect.DeepEqual(current, effect.After) && currentRel == effect.AfterShard
+		matchesBefore := reflect.DeepEqual(current, effect.Before) && currentRel == effect.BeforeShard
+		if effect.After == nil {
+			matchesAfter = current == nil
+		}
+		if effect.Before == nil {
+			matchesBefore = current == nil
+		}
+		switch {
+		case matchesAfter:
+			needRestore++
+		case matchesBefore:
+			alreadyRestored++
+		default:
+			return "", kbErr("REVERT_CONFLICT", "节点 "+effect.Node+" 已被后续 change 修改", "先撤销后续变更；当前节点不再等于目标 change 的 after")
+		}
+		for _, rel := range []string{effect.AfterShard, effect.BeforeShard} {
+			if rel == "" || touched[rel] != nil {
+				continue
+			}
+			cs := e.rt.cache.Shards()[rel]
+			if cs == nil || cs.Shard == nil {
+				return "", kbErr("REVERT_CONFLICT", "node effect 分片不可用:"+rel, "先修复分片冲突")
+			}
+			touched[rel] = cloneEngineShard(cs.Shard)
+			rawOverrides[rel] = cloneYAMLNode(cs.Raw)
+			data, err := e.Store.ReadKnowledgeFile(rel)
+			if err != nil {
+				return "", err
+			}
+			originals[rel] = data
+		}
+	}
+	for _, effect := range nodeEffects {
+		if effect.After != nil {
+			sh := touched[effect.AfterShard]
+			kept := make([]model.Node, 0, len(sh.Nodes))
+			for i := range sh.Nodes {
+				if sh.Nodes[i].ID != effect.Node {
+					kept = append(kept, sh.Nodes[i])
+				}
+			}
+			sh.Nodes = kept
+		}
+		if effect.Before != nil {
+			sh := touched[effect.BeforeShard]
+			if n := nodeInShard(sh, effect.Node); n != nil {
+				*n = *cloneModelNode(effect.Before)
+			} else {
+				sh.Nodes = append(sh.Nodes, *cloneModelNode(effect.Before))
+			}
+			injectRawNode(rawOverrides[effect.BeforeShard], effect.BeforeRaw)
+		}
+	}
+	for _, effect := range effects {
+		if effect.Entry == "" || seenEffects[effect.Entry] {
+			return "", kbErr("REVERT_CONFLICT", "change "+target.ID+" 的 effects 损坏或重复:"+effect.Entry, "人工检查 journal")
+		}
+		seenEffects[effect.Entry] = true
+		i := strings.LastIndexByte(effect.Entry, '#')
+		if i <= 0 || i == len(effect.Entry)-1 {
+			return "", kbErr("REVERT_CONFLICT", "非法 effect entry "+effect.Entry, "人工检查 journal")
+		}
+		nodeID, entryID := effect.Entry[:i], effect.Entry[i+1:]
 		ref := e.rt.ix.Node(nodeID)
 		if ref == nil {
-			continue
+			return "", kbErr("REVERT_CONFLICT", "effect 节点已不存在:"+nodeID, "它可能已被后续 remap；先撤销后续变更")
 		}
-		n := ref.Node
-		changed := false
-		for i := range n.Entries {
-			en := &n.Entries[i]
-			// refute 级联:被 target 标 RefutedBy 的恢复(清字段,重新 Active)。
-			if en.RefutedBy == target.ID {
-				en.RefutedBy = ""
-				restored++
-				changed = true
-			}
-			// obsolete:被 target 标 RetiredBy 的恢复。
-			if en.RetiredBy == target.ID {
-				en.RetiredBy = ""
-				restored++
-				changed = true
+		current := e.entryByExactRefLocked(effect.Entry)
+		if current == nil {
+			return "", kbErr("REVERT_CONFLICT", "effect 条目已不存在:"+effect.Entry, "先撤销后续编辑")
+		}
+		state := entryState(current)
+		switch state {
+		case effect.After:
+			needRestore++
+		case effect.Before:
+			alreadyRestored++
+		default:
+			if legacy && legacyStateBetween(state, effect.Before, effect.After) {
+				needRestore++ // 兼容旧实现只清 marker、没恢复 confidence 的半应用
+			} else {
+				return "", kbErr("REVERT_CONFLICT", "条目 "+effect.Entry+" 已被后续 change 修改", "先撤销后续变更；当前状态不再等于目标 change 的 after")
 			}
 		}
-		if changed {
-			shardOf(ref.ShardRel)
+		sh := touched[ref.ShardRel]
+		if sh == nil {
+			cs := e.rt.cache.Shards()[ref.ShardRel]
+			if cs == nil || cs.Shard == nil {
+				return "", kbErr("REVERT_CONFLICT", "effect 分片不可用:"+ref.ShardRel, "先修复分片冲突")
+			}
+			sh = cloneEngineShard(cs.Shard)
+			touched[ref.ShardRel] = sh
+			rawOverrides[ref.ShardRel] = cloneYAMLNode(cs.Raw)
+			data, err := e.Store.ReadKnowledgeFile(ref.ShardRel)
+			if err != nil {
+				return "", err
+			}
+			originals[ref.ShardRel] = data
+		}
+		if en := entryInShard(sh, nodeID, entryID); en != nil {
+			applyEntryState(en, effect.Before)
+		} else {
+			return "", kbErr("REVERT_CONFLICT", "克隆分片中找不到 effect 条目 "+effect.Entry, "重试")
 		}
 	}
-	// 追加撤销记录(Reverts 指向被撤销的,Why 记理由)。
+	if existingRevert != nil && needRestore == 0 {
+		return "", kbErr("ALREADY_REVERTED", "change "+a.Change+" 已被 "+existingRevert.ID+" 撤销", "一条记录只能撤一次")
+	}
+	if existingRevert != nil && !legacy {
+		return "", kbErr("REVERT_CONFLICT", "change "+a.Change+" 已有结构化撤销 "+existingRevert.ID+"，当前状态后来又发生变化",
+			"若是撤销的撤销，请显式 revert 后一条记录；不能沿用旧撤销记录改盘")
+	}
+
+	// 先原子替换各个分片，任一失败立即把此前成功项恢复原字节；只有分片全部
+	// 成功后才追加 Reverts journal，避免形成 ALREADY_REVERTED 不可重试状态。
+	rels := make([]string, 0, len(touched))
+	for rel := range touched {
+		rels = append(rels, rel)
+	}
+	sort.Strings(rels)
+
+	// 先构造最终 journal 记录，才能在首个分片写前把目标月份也纳入 WAL。
 	chID := model.NewChangeID(e.now())
 	ids := map[string]bool{}
 	for _, c := range e.rt.ix.Changes() {
@@ -1116,24 +1720,198 @@ func (e *Engine) Revert(a RevertArgs, sid, author string) (string, error) {
 	for ids[chID] {
 		chID = model.NewChangeID(e.now())
 	}
-	revertChange := model.Change{
-		ID: chID, Nodes: target.Nodes, At: e.now().UTC(),
-		What: "撤销 " + target.ID, Why: a.Reason,
-		Reverts: target.ID, Author: author,
-		Commit: gitHead(e.Store.RepoRoot()),
+	var revertChange *model.Change
+	if existingRevert != nil {
+		chID = existingRevert.ID
+	} else {
+		reverseEffects := make([]model.EntryEffect, 0, len(effects))
+		for _, effect := range effects {
+			reverseEffects = append(reverseEffects, model.EntryEffect{Entry: effect.Entry, Before: effect.After, After: effect.Before})
+		}
+		nodes := append([]string(nil), target.Nodes...)
+		for _, effect := range effects {
+			if i := strings.LastIndexByte(effect.Entry, '#'); i > 0 {
+				nodes = appendUnique(nodes, effect.Entry[:i])
+			}
+		}
+		reverseNodeEffects := make([]model.NodeEffect, 0, len(nodeEffects))
+		for _, effect := range nodeEffects {
+			reverseNodeEffects = append(reverseNodeEffects, model.NodeEffect{
+				Node: effect.Node, BeforeShard: effect.AfterShard, AfterShard: effect.BeforeShard,
+				Before: cloneModelNode(effect.After), After: cloneModelNode(effect.Before),
+				BeforeRaw: effect.AfterRaw, AfterRaw: effect.BeforeRaw,
+			})
+			nodes = appendUnique(nodes, effect.Node)
+		}
+		change := model.Change{
+			ID: chID, Nodes: nodes, At: e.now().UTC(),
+			What: "撤销 " + target.ID, Why: a.Reason,
+			Reverts: target.ID, EffectsVersion: 1, Effects: reverseEffects, NodeEffects: reverseNodeEffects, Author: author,
+			Commit: gitHead(e.Store.RepoRoot()),
+		}
+		revertChange = &change
 	}
-	if err := e.Store.AppendChange(revertChange); err != nil {
+	txRels := make(map[string]bool, len(rels)+1)
+	for _, rel := range rels {
+		txRels[rel] = true
+	}
+	if revertChange != nil {
+		txRels[e.Store.JournalRelFor(*revertChange)] = true
+	}
+	tx, err := e.prepareTruthTransactionLocked(txRels)
+	if err != nil {
 		return "", err
 	}
-	// 落盘恢复的 entries。
-	for rel, sh := range touched {
-		if sh == nil {
-			continue
-		}
+	defer e.guardTruthTransactionPanicLocked(tx)
+	rollback := func(cause error) (string, error) {
+		return "", e.rollbackTruthTransactionLocked(tx, cause)
+	}
+
+	var saved []string
+	for _, rel := range rels {
+		cs := e.rt.cache.Shards()[rel]
 		path := filepath.Join(e.Store.Dir(), filepath.FromSlash(rel))
-		if err := e.Store.SaveShard(path, sh, e.rt.cache.Shards()[rel].Raw); err != nil {
-			e.warnOpsLocked("revert 落盘失败(下次重试):" + err.Error())
+		saved = append(saved, rel) // atomic rename 后 dir fsync 仍可能报错，attempted 也须回滚
+		raw := rawOverrides[rel]
+		if raw == nil {
+			raw = cs.Raw
+		}
+		if err := e.Store.SaveShard(path, touched[rel], raw); err != nil {
+			rbErr := e.restoreShardBytes(saved, originals)
+			return rollback(errors.Join(fmt.Errorf("revert 保存 %s: %w", rel, err), rbErr))
 		}
 	}
-	return fmt.Sprintf("ack:已撤销 %s(恢复 %d 条条目)。撤销记录 %s 已追加(journal 可追溯理由)。", target.ID, restored, chID), nil
+
+	// 追加撤销记录(Reverts 指向被撤销的,Effects 反向描述本次恢复)。
+	if revertChange != nil {
+		if err := e.Store.AppendChange(*revertChange); err != nil {
+			// fsync/Close 可能在字节已追加后报错；若 journal 已能读到同一 ID，
+			// 视为提交成功。否则恢复全部分片，让调用方可安全重试。
+			committed := false
+			if changes, _, loadErr := e.Store.LoadJournal(); loadErr == nil {
+				for _, c := range changes {
+					if c.ID == chID && c.Reverts == target.ID {
+						committed = true
+						break
+					}
+				}
+			}
+			if !committed {
+				rbErr := e.restoreShardBytes(saved, originals)
+				return rollback(errors.Join(fmt.Errorf("revert 追加 journal: %w", err), rbErr))
+			}
+		}
+	}
+	committed, commitErr := e.commitTruthTransactionLocked(tx)
+	if !committed {
+		return rollback(fmt.Errorf("revert 写 committed marker: %w", commitErr))
+	}
+	if commitErr != nil {
+		return "", fmt.Errorf("revert 已提交但 WAL 清理/重载失败(不要重试同一 change): %w", commitErr)
+	}
+	compat := ""
+	if legacy {
+		compat = "（旧 journal 无 effects，已按保守规则恢复）"
+	}
+	if existingRevert != nil {
+		return fmt.Sprintf("ack:已补完旧撤销 %s(恢复 %d 项状态)，沿用撤销记录 %s%s。", target.ID, needRestore, chID, compat), nil
+	}
+	return fmt.Sprintf("ack:已撤销 %s(恢复 %d 项状态，%d 项已处于 before)。撤销记录 %s 已追加%s。", target.ID, needRestore, alreadyRestored, chID, compat), nil
+}
+
+func legacyStateBetween(current, before, after model.EntryState) bool {
+	return (current.Confidence == before.Confidence || current.Confidence == after.Confidence) &&
+		(current.ConfirmedAt == before.ConfirmedAt || current.ConfirmedAt == after.ConfirmedAt) &&
+		(current.RefutedBy == before.RefutedBy || current.RefutedBy == after.RefutedBy) &&
+		(current.RetiredBy == before.RetiredBy || current.RetiredBy == after.RetiredBy) &&
+		(current.SupersededBy == before.SupersededBy || current.SupersededBy == after.SupersededBy)
+}
+
+func cloneEngineShard(in *store.Shard) *store.Shard {
+	out := &store.Shard{Schema: in.Schema, Nodes: make([]model.Node, len(in.Nodes))}
+	for i := range in.Nodes {
+		out.Nodes[i] = *cloneModelNode(&in.Nodes[i])
+	}
+	return out
+}
+
+func cloneModelNode(in *model.Node) *model.Node {
+	if in == nil {
+		return nil
+	}
+	out := *in
+	out.Keywords = append([]string(nil), in.Keywords...)
+	out.Lineage = append([]string(nil), in.Lineage...)
+	out.Entries = make([]model.Entry, len(in.Entries))
+	for i := range in.Entries {
+		out.Entries[i] = in.Entries[i]
+		out.Entries[i].BasedOn = append([]string(nil), in.Entries[i].BasedOn...)
+		out.Entries[i].Disputes = append([]string(nil), in.Entries[i].Disputes...)
+	}
+	return &out
+}
+
+func entryInShard(sh *store.Shard, nodeID, entryID string) *model.Entry {
+	for i := range sh.Nodes {
+		if sh.Nodes[i].ID != nodeID {
+			continue
+		}
+		for j := range sh.Nodes[i].Entries {
+			if sh.Nodes[i].Entries[j].ID == entryID {
+				return &sh.Nodes[i].Entries[j]
+			}
+		}
+	}
+	return nil
+}
+
+func (e *Engine) findCachedNode(id string) (*model.Node, string, bool) {
+	var found *model.Node
+	var rel string
+	for shardRel, cs := range e.rt.cache.Shards() {
+		if cs == nil || cs.Shard == nil {
+			continue
+		}
+		for i := range cs.Shard.Nodes {
+			if cs.Shard.Nodes[i].ID != id {
+				continue
+			}
+			if found != nil {
+				return nil, "", true
+			}
+			found = cloneModelNode(&cs.Shard.Nodes[i])
+			rel = shardRel
+		}
+	}
+	return found, rel, false
+}
+
+func (e *Engine) restoreShardBytes(saved []string, originals map[string][]byte) error {
+	var errs []error
+	for i := len(saved) - 1; i >= 0; i-- {
+		rel := saved[i]
+		if err := e.Store.WriteKnowledgeFile(rel, originals[rel]); err != nil {
+			errs = append(errs, fmt.Errorf("回滚 %s: %w", rel, err))
+		}
+	}
+	return errors.Join(errs...)
+}
+
+// legacyEffectsLocked 只恢复能从稳定 marker 精确证明 before 的旧副作用。
+// RetiredBy=target.ID 的 before 必然只是清该 marker；旧 confirm/refute 的原
+// confidence 无法从当前状态反推，尤其级联前可能本来就是 suspect，必须拒绝猜测。
+func (e *Engine) legacyEffectsLocked(target *model.Change) []model.EntryEffect {
+	var effects []model.EntryEffect
+	for nodeID, ref := range e.rt.ix.Nodes() {
+		for i := range ref.Node.Entries {
+			en := &ref.Node.Entries[i]
+			if en.RetiredBy == target.ID {
+				after := entryState(en)
+				before := after
+				before.RetiredBy = ""
+				effects = append(effects, model.EntryEffect{Entry: nodeID + "#" + en.ID, Before: before, After: after})
+			}
+		}
+	}
+	return effects
 }

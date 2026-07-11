@@ -20,8 +20,9 @@ type WIP struct {
 
 // FlowStep 是流程节点的一步,引用树节点而不复制其内容(knowledge.md §6)。
 type FlowStep struct {
-	Node string `yaml:"node"`           // 树节点 ID
-	Note string `yaml:"note,omitempty"` // 该步说明("入口"/"核心验证"…)
+	Node  string    `yaml:"node"`            // 树节点 ID
+	Note  string    `yaml:"note,omitempty"`  // 该步说明("入口"/"核心验证"…)
+	Since time.Time `yaml:"since,omitempty"` // 此引用代际；防旧 ID 被复用后反链跳到无关新节点
 }
 
 // Flow 是横向流程/主题节点(knowledge.md §6):

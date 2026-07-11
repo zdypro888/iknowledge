@@ -2,6 +2,7 @@ package index
 
 import (
 	"reflect"
+	"sync"
 	"testing"
 	"time"
 
@@ -111,6 +112,119 @@ func TestResolveEntryRef(t *testing.T) {
 	want := "internal/auth/login.go#Authenticate#e_00000003"
 	if got != want {
 		t.Errorf("ResolveEntryRef = %q, want %q", got, want)
+	}
+}
+
+func TestResolveEntryRefFindsEntryOnNonFirstSplitHeir(t *testing.T) {
+	old := "svc.go#Old"
+	first := "svc.go#AFirst"
+	second := "svc.go#ZSecond"
+	ix := Build(map[string][]model.Node{
+		"tree/svc.go.yaml": {
+			{ID: first, Lineage: []string{old}},
+			{ID: second, Lineage: []string{old}, Entries: []model.Entry{
+				{ID: "e_target", Confidence: model.ConfidenceInferred},
+			}},
+		},
+	}, nil, nil)
+	if got, want := ix.ResolveEntryRef(old+"#e_target"), second+"#e_target"; got != want {
+		t.Fatalf("拆分条目应落到实际持有它的继承者: got %q want %q", got, want)
+	}
+}
+
+func TestResolveEntryRefFollowsLineageWhenOldNodeIDWasReused(t *testing.T) {
+	old := "svc.go#Old"
+	heir := "svc.go#Renamed"
+	ix := Build(map[string][]model.Node{
+		"tree/current.yaml": {{ID: old, Entries: []model.Entry{{ID: "e_new"}}}},
+		"tree/heir.yaml": {{ID: heir, Lineage: []string{old}, Entries: []model.Entry{{
+			ID: "e_historical", Confidence: model.ConfidenceInferred,
+		}}}},
+	}, nil, nil)
+	if got, want := ix.ResolveEntryRef(old+"#e_historical"), heir+"#e_historical"; got != want {
+		t.Fatalf("旧 ID 复用后历史 entry 应沿 lineage: got %q want %q", got, want)
+	}
+	if got, want := ix.ResolveEntryRef(old+"#e_new"), old+"#e_new"; got != want {
+		t.Fatalf("现任 exact entry 应优先: got %q want %q", got, want)
+	}
+}
+
+func TestReusedNodeIDRoutesHistoricalJournalLandmineAndFlowToHeir(t *testing.T) {
+	oldID := "svc.go#Old"
+	heirID := "svc.go#Renamed"
+	oldAt := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	reusedAt := time.Date(2026, 2, 1, 0, 0, 0, 0, time.UTC)
+	newAt := time.Date(2026, 3, 1, 0, 0, 0, 0, time.UTC)
+	ix := Build(map[string][]model.Node{
+		"tree/current.yaml": {{ID: oldID, Since: reusedAt}},
+		"tree/heir.yaml":    {{ID: heirID, Since: oldAt, Lineage: []string{oldID}}},
+	}, []model.Change{
+		{ID: "chg_old", Nodes: []string{oldID}, At: oldAt, What: "old"},
+		{ID: "chg_new", Nodes: []string{oldID}, At: newAt, What: "new"},
+	}, []model.Flow{
+		{ID: "flow:old", Since: oldAt, Steps: []model.FlowStep{{Node: oldID}}},
+		{ID: "flow:new", Since: newAt, Steps: []model.FlowStep{{Node: oldID}}},
+	})
+	if got := ix.History(heirID); len(got) != 1 || got[0].ID != "chg_old" {
+		t.Fatalf("继承者历史错位:%+v", got)
+	}
+	if got := ix.History(oldID); len(got) != 1 || got[0].ID != "chg_new" {
+		t.Fatalf("复用节点历史被旧代污染:%+v", got)
+	}
+	if got := ix.LandmineScore(heirID); got != 1 {
+		t.Fatalf("旧地雷应随历史到继承者:%d", got)
+	}
+	if got := ix.LandmineScore(oldID); got != 1 {
+		t.Fatalf("复用节点只应计新代地雷:%d", got)
+	}
+	if got := ix.FlowsOf(heirID); !reflect.DeepEqual(got, []string{"flow:old"}) {
+		t.Fatalf("旧 flow 应跟随 lineage:%v", got)
+	}
+	if got := ix.FlowsOf(oldID); !reflect.DeepEqual(got, []string{"flow:new"}) {
+		t.Fatalf("新 flow 应指向复用节点:%v", got)
+	}
+}
+
+func TestDependentsCycleDoesNotReturnRoot(t *testing.T) {
+	ix := Build(nil, nil, nil)
+	ix.basedOnRev["n#a"] = []string{"n#b"}
+	ix.basedOnRev["n#b"] = []string{"n#a"}
+	if got := ix.Dependents("n#a"); !reflect.DeepEqual(got, []string{"n#b"}) {
+		t.Fatalf("依赖环不应把根自身作为 dependent:%v", got)
+	}
+}
+
+func TestDisputedByDoesNotMutatePublishedIndex(t *testing.T) {
+	ix := Build(nil, nil, nil)
+	ix.disputesRev["n#e"] = []string{"z#e", "a#e"}
+	wantInternal := append([]string(nil), ix.disputesRev["n#e"]...)
+	var wg sync.WaitGroup
+	for range 20 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			got := ix.DisputedBy("n#e")
+			if !reflect.DeepEqual(got, []string{"a#e", "z#e"}) {
+				t.Errorf("DisputedBy = %v", got)
+			}
+		}()
+	}
+	wg.Wait()
+	if !reflect.DeepEqual(ix.disputesRev["n#e"], wantInternal) {
+		t.Fatalf("读方法修改了索引内部 slice: %v", ix.disputesRev["n#e"])
+	}
+}
+
+func TestBuildIsolatesDuplicateNodeIDsAcrossShards(t *testing.T) {
+	ix := Build(map[string][]model.Node{
+		"tree/a.yaml": {{ID: "dup.go#F", Entries: []model.Entry{{ID: "e_a"}}}},
+		"tree/b.yaml": {{ID: "dup.go#F", Entries: []model.Entry{{ID: "e_b"}}}},
+	}, nil, nil)
+	if ix.Node("dup.go#F") != nil {
+		t.Fatal("跨分片重复 node ID 不应随机选一个进入索引")
+	}
+	if got := ix.DuplicateNodeIDs(); !reflect.DeepEqual(got, []string{"dup.go#F"}) {
+		t.Fatalf("DuplicateNodeIDs = %v", got)
 	}
 }
 

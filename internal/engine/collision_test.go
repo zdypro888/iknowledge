@@ -13,8 +13,8 @@ func TestRememberRejectedCollisionWarns(t *testing.T) {
 
 	// 先 record_change 一条带 rejected 的变更(否决了"用 sync.Map 缓存")。
 	_, err := e.RecordChange(ChangeArgs{
-		Nodes:   []string{"internal/auth/login.go#Login"},
-		What:    "登录限流改造", Why: "防止暴力破解",
+		Nodes: []string{"internal/auth/login.go#Login"},
+		What:  "登录限流改造", Why: "防止暴力破解",
 		Rejected: []model.Rejected{{Option: "用 sync.Map 做登录尝试计数缓存", Reason: "尺寸不可预估,长跑内存泄漏"}},
 	}, "s1", "codex")
 	if err != nil {
@@ -40,8 +40,8 @@ func TestRememberRejectedCollisionDisputesSoftensWarning(t *testing.T) {
 
 	// 先记一条 rejected。
 	if _, err := e.RecordChange(ChangeArgs{
-		Nodes:   []string{"internal/auth/login.go#Login"},
-		What:    "限流", Why: "防爆破",
+		Nodes: []string{"internal/auth/login.go#Login"},
+		What:  "限流", Why: "防爆破",
 		Rejected: []model.Rejected{{Option: "用 sync.Map 做计数缓存", Reason: "内存泄漏风险"}},
 	}, "s1", "codex"); err != nil {
 		t.Fatal(err)
@@ -71,7 +71,7 @@ func TestRememberRejectedCollisionDisputesSoftensWarning(t *testing.T) {
 	}
 
 	out, err := e.Remember(RememberArgs{
-		Node:    "internal/auth/login.go#Login",
+		Node: "internal/auth/login.go#Login",
 		Entries: []RememberEntry{{
 			Kind: "summary", Text: "用 sync.Map 做计数缓存",
 			Disputes: []string{"internal/auth/login.go#Login#" + baseEntryID},
@@ -90,8 +90,8 @@ func TestRememberRejectedCollisionDisputesSoftensWarning(t *testing.T) {
 func TestRememberRejectedNoFalsePositive(t *testing.T) {
 	e, _ := initEngine(t, map[string]string{"internal/auth/login.go": authSrc})
 	if _, err := e.RecordChange(ChangeArgs{
-		Nodes:   []string{"internal/auth/login.go#Login"},
-		What:    "限流", Why: "防爆破",
+		Nodes: []string{"internal/auth/login.go#Login"},
+		What:  "限流", Why: "防爆破",
 		Rejected: []model.Rejected{{Option: "用 Redis 做分布式锁", Reason: "过度设计"}},
 	}, "s1", "codex"); err != nil {
 		t.Fatal(err)

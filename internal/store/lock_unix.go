@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 	"syscall"
 )
 
@@ -18,10 +19,7 @@ var ErrLocked = errors.New("serve 运行中,请改用 kb_init 或先停 serve")
 // 人工直接编辑分片不受锁管(惰性重载兜住)。
 func (s *Store) AcquireWriterLock() (release func(), err error) {
 	path := filepath.Join(s.dir, "local", ".lock")
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return nil, fmt.Errorf("store: 建 local 目录: %w", err)
-	}
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o644)
+	f, err := s.openKnowledgeFile(path, os.O_CREATE|os.O_RDWR, 0o644)
 	if err != nil {
 		return nil, fmt.Errorf("store: 开锁文件: %w", err)
 	}
@@ -32,8 +30,13 @@ func (s *Store) AcquireWriterLock() (release func(), err error) {
 		}
 		return nil, fmt.Errorf("store: flock: %w", err)
 	}
+	s.setWriterLockHeld(true)
+	var once sync.Once
 	return func() {
-		syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
-		f.Close()
+		once.Do(func() {
+			s.setWriterLockHeld(false)
+			syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+			f.Close()
+		})
 	}, nil
 }

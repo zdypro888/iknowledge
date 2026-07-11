@@ -27,7 +27,7 @@ func (Java) Language() string { return "java" }
 func (Java) Extensions() []string { return []string{".java"} }
 
 func (Java) HashFile(src []byte) string {
-	h := sha256.Sum256([]byte("jv\x00file\n" + string(normalizeJS(src))))
+	h := sha256.Sum256([]byte("jv\x00file\n" + string(normalizeJava(src))))
 	return "sha256:" + hex.EncodeToString(h[:])
 }
 
@@ -80,6 +80,10 @@ func findJavaTypes(src []byte) []javaType {
 		// 跳过字符串/字符。
 		if c == '"' || c == '\'' {
 			i = skipString(src, i, n)
+			continue
+		}
+		if c == '/' && i+1 < n && (src[i+1] == '/' || src[i+1] == '*') {
+			i = skipLineOrBlockComment(src, i, n)
 			continue
 		}
 		if c == '{' {
@@ -145,6 +149,10 @@ func findJavaMethods(src []byte, tp javaType) []Symbol {
 			i = skipString(src, i, end)
 			continue
 		}
+		if c == '/' && i+1 < end && (src[i+1] == '/' || src[i+1] == '*') {
+			i = skipLineOrBlockComment(src, i, end)
+			continue
+		}
 		if c == '{' {
 			// 嵌套块(方法体、初始化块):跳到匹配的 }。
 			cb := matchBrace(src, i, end)
@@ -182,30 +190,34 @@ func findJavaMethods(src []byte, tp javaType) []Symbol {
 func scanMethodSig(src []byte, firstTok string, firstTokStart int, i *int, end int, classNm string) (Symbol, bool) {
 	saveI := *i
 	// 情况 1:firstTok 本身是方法名(构造器:UserService(...))——*i 在 firstTok 后,
-	// 检查 *i 处是否直接 ( (可能隔泛型/空白)。
-	if sym, ok := matchMethodTail(src, firstTok, firstTokStart, i, end, classNm); ok {
-		return sym, true
+	// 检查 *i 处是否直接 ( (可能隔泛型/空白)。Java 除构造器外的方法必须有
+	// 返回类型；若对任意 ident 都走此分支，字段初始化 `x = factory.create();`
+	// 会把 create/build 等调用误建成抽象方法。构造器调用 `new Type()` 也须排除。
+	if firstTok == classNm && plausibleJavaConstructor(src, firstTokStart) {
+		if sym, ok := matchMethodTail(src, firstTok, firstTokStart, i, end, classNm); ok {
+			return sym, true
+		}
 	}
 	// 情况 2:firstTok 是返回类型,下一个 ident 是方法名。
 	*i = saveI
-	skipSpacesRange(src, i, end)
+	*i = skipJavaTrivia(src, *i, end)
 	// 跳过泛型/数组。
 	if *i < end && src[*i] == '<' {
 		if gt := findChar(src, *i, end, '>'); gt > 0 {
 			*i = gt + 1
-			skipSpacesRange(src, i, end)
+			*i = skipJavaTrivia(src, *i, end)
 		}
 	}
 	for *i+1 < end && src[*i] == '[' && src[*i+1] == ']' {
 		*i += 2
-		skipSpacesRange(src, i, end)
+		*i = skipJavaTrivia(src, *i, end)
 	}
 	if *i >= end || !isAlphaJava(src[*i]) {
 		*i = saveI // 回退,不吞 token
 		return Symbol{}, false
 	}
 	next, ns := readIdentAt(src, *i, end)
-	*i = ns
+	*i = ns + len(next)
 	if sym, ok := matchMethodTail(src, next, firstTokStart, i, end, classNm); ok {
 		return sym, true
 	}
@@ -213,13 +225,43 @@ func scanMethodSig(src []byte, firstTok string, firstTokStart int, i *int, end i
 	return Symbol{}, false
 }
 
+// plausibleJavaConstructor 区分成员构造器声明与字段初始化里的 `new Type()`。
+// findJavaMethods 已跳过方法/初始化块，只需检查构造器名字之前最近的词法 token；
+// new、成员访问或赋值之后的同名调用都不是声明。
+func plausibleJavaConstructor(src []byte, nameStart int) bool {
+	last := ""
+	for i := 0; i < nameStart; {
+		c := src[i]
+		if c == '"' || c == '\'' {
+			i = skipString(src, i, nameStart)
+			last = "literal"
+			continue
+		}
+		if c == '/' && i+1 < nameStart && (src[i+1] == '/' || src[i+1] == '*') {
+			i = skipLineOrBlockComment(src, i, nameStart)
+			continue
+		}
+		if isAlphaJava(c) {
+			tok, start := readIdentAt(src, i, nameStart)
+			last = tok
+			i = start + len(tok)
+			continue
+		}
+		if c != ' ' && c != '\t' && c != '\n' && c != '\r' {
+			last = string(c)
+		}
+		i++
+	}
+	return last != "new" && last != "." && last != "=" && last != ":"
+}
+
 // matchMethodTail 从 *i 处找 (params) [throws] {body}/;——匹配则返回方法符号。
 func matchMethodTail(src []byte, name string, nameStart int, i *int, end int, classNm string) (Symbol, bool) {
-	skipSpacesRange(src, i, end)
+	*i = skipJavaTrivia(src, *i, end)
 	if *i < end && src[*i] == '<' {
 		if gt := findChar(src, *i, end, '>'); gt > 0 {
 			*i = gt + 1
-			skipSpacesRange(src, i, end)
+			*i = skipJavaTrivia(src, *i, end)
 		}
 	}
 	if *i >= end || src[*i] != '(' {
@@ -230,17 +272,25 @@ func matchMethodTail(src []byte, name string, nameStart int, i *int, end int, cl
 		return Symbol{}, false
 	}
 	*i = parEnd + 1
-	skipSpacesRange(src, i, end)
+	*i = skipJavaTrivia(src, *i, end)
 	// throws X, Y
 	if *i < end && isAlphaJava(src[*i]) {
 		if t, _ := readIdentAt(src, *i, end); t == "throws" {
 			*i += len("throws")
 			for *i < end && src[*i] != '{' && src[*i] != ';' {
+				if src[*i] == '"' || src[*i] == '\'' {
+					*i = skipString(src, *i, end)
+					continue
+				}
+				if src[*i] == '/' && *i+1 < end && (src[*i+1] == '/' || src[*i+1] == '*') {
+					*i = skipLineOrBlockComment(src, *i, end)
+					continue
+				}
 				*i++
 			}
 		}
 	}
-	skipSpacesRange(src, i, end)
+	*i = skipJavaTrivia(src, *i, end)
 	start := funcDeclStart(src, nameStart)
 	if *i < end && src[*i] == '{' {
 		cb := matchBrace(src, *i, end)
@@ -267,16 +317,30 @@ func matchMethodTail(src []byte, name string, nameStart int, i *int, end int, cl
 
 // readNextIdent 跳过空白读下一个标识符。
 func readNextIdent(src []byte, i, n int) (string, int) {
-	for i < n && (src[i] == ' ' || src[i] == '\t' || src[i] == '\n' || src[i] == '\r') {
-		i++
-	}
+	i = skipJavaTrivia(src, i, n)
 	return readIdentAt(src, i, n)
+}
+
+func skipJavaTrivia(src []byte, i, n int) int {
+	for i < n {
+		c := src[i]
+		if c == ' ' || c == '\t' || c == '\n' || c == '\r' {
+			i++
+			continue
+		}
+		if c == '/' && i+1 < n && (src[i+1] == '/' || src[i+1] == '*') {
+			i = skipLineOrBlockComment(src, i, n)
+			continue
+		}
+		break
+	}
+	return i
 }
 
 func computeHashesJava(syms []Symbol) []Symbol {
 	for i := range syms {
 		s := &syms[i]
-		norm := normalizeJS(s.Body)
+		norm := normalizeJava(s.Body)
 		structNorm := norm
 		name := s.Name
 		if dot := strings.LastIndex(name, "."); dot >= 0 {
@@ -291,6 +355,44 @@ func computeHashesJava(syms []Symbol) []Symbol {
 		s.StructHash = "sha256:" + hex.EncodeToString(sh[:])
 	}
 	return syms
+}
+
+// normalizeJava 与 JS 共用注释/字符串词法，但 Java 没有 ASI，换行和横向
+// 空白都可安全归一为空格。不能直接复用 normalizeJS：后者必须为 JS 语义
+// fail closed 保留 LineTerminator。
+func normalizeJava(src []byte) []byte {
+	var out bytes.Buffer
+	pendingSpace := false
+	flushSpace := func() {
+		if pendingSpace && out.Len() > 0 {
+			out.WriteByte(' ')
+		}
+		pendingSpace = false
+	}
+	for i, n := 0, len(src); i < n; {
+		c := src[i]
+		if c == '"' || c == '\'' {
+			flushSpace()
+			end := skipString(src, i, n)
+			out.Write(src[i:end])
+			i = end
+			continue
+		}
+		if c == '/' && i+1 < n && (src[i+1] == '/' || src[i+1] == '*') {
+			pendingSpace = true
+			i = skipLineOrBlockComment(src, i, n)
+			continue
+		}
+		if c == ' ' || c == '\t' || c == '\n' || c == '\r' {
+			pendingSpace = true
+			i++
+			continue
+		}
+		flushSpace()
+		out.WriteByte(c)
+		i++
+	}
+	return bytes.TrimSpace(out.Bytes())
 }
 
 func isAlphaJava(c byte) bool {
