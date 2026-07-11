@@ -221,3 +221,26 @@ func TestInstallUninstallScriptGuards(t *testing.T) {
 		}
 	}
 }
+
+// release workflow 在仓库内写 dist/。若它未被 git 忽略，Go 在构建输出创建后
+// 会把 vcs.modified 烙进正式二进制，令干净 tag 被误报为 +dirty。
+func TestReleaseArtifactsDoNotDirtyVersionMetadata(t *testing.T) {
+	repoRoot, err := filepath.Abs(filepath.Join("..", ".."))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ignore, err := os.ReadFile(filepath.Join(repoRoot, ".gitignore"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, line := range strings.Split(string(ignore), "\n") {
+		if strings.TrimSpace(line) == "/dist/" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatal("release 输出 dist/ 必须被 git 忽略，否则正式二进制会误报 +dirty")
+	}
+}
