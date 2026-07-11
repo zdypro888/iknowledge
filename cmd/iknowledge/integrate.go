@@ -4,7 +4,9 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -41,10 +43,20 @@ func mcpJSONHTTPSnippet(root string, port int, token string) string {
 // hooksJSONSnippet 是 Claude Code hooks 接入片段(.claude/settings.json)。
 // PostToolUse 而非设计初稿的 PreToolUse:现版 Claude Code 只有 PostToolUse 的
 // hookSpecificOutput.additionalContext 能把文本注入上下文(impl §7.1 轮 25 勘误)。
-func hooksJSONSnippet(root string) string {
-	return fmt.Sprintf(`{ "hooks": { "PostToolUse": [ {
-  "matcher": "Read|Edit|Write|MultiEdit",
-  "hooks": [ { "type": "command", "command": "iknowledge hook --repo %s" } ] } ] } }`, root)
+func hooksJSONSnippet() string {
+	// 不把 repo 路径拼进 shell command：hook 事件本身带 cwd/file_path，runHook
+	// 会向上发现 .knowledge。这样同一片段跨 POSIX shell/cmd.exe/PowerShell 安全，
+	// 也彻底消除路径中的 &、%VAR%、引号在不同 shell 下的注入/转义分歧。
+	command := "iknowledge hook"
+	payload := map[string]any{"hooks": map[string]any{"PostToolUse": []any{map[string]any{
+		"matcher": "Read|Edit|Write|MultiEdit",
+		"hooks":   []any{map[string]any{"type": "command", "command": command}},
+	}}}}
+	data, err := json.MarshalIndent(payload, "", "  ")
+	if err != nil { // 当前 payload 仅含字符串/切片/map，保留签名故这里不可达。
+		return "{}"
+	}
+	return string(data)
 }
 
 // codexTOMLSnippet 是 Codex 接入片段(~/.codex/config.toml;CLI 与桌面 App 共用;
@@ -76,6 +88,9 @@ func runSetup(args []string, out io.Writer) int {
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
+	if rejectUnexpectedArgs(fs) {
+		return 2
+	}
 	s, err := store.Open(*repo)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "错误:", err)
@@ -84,6 +99,15 @@ func runSetup(args []string, out io.Writer) int {
 	if !s.Initialized() {
 		fmt.Fprintln(os.Stderr, "错误: 库未初始化,先跑 iknowledge init --repo "+s.RepoRoot())
 		return 1
+	}
+	releaseView, viewErr := acquireRecoveredView(s)
+	if viewErr != nil {
+		if !errors.Is(viewErr, store.ErrLocked) || !verifiedLiveServe(s) {
+			fmt.Fprintln(os.Stderr, "错误: 恢复未完成事务或仓库 writer 正忙:", viewErr)
+			return 1
+		}
+	} else {
+		defer releaseView()
 	}
 	cfg, err := s.LoadConfig()
 	if err != nil {
@@ -96,7 +120,11 @@ func runSetup(args []string, out io.Writer) int {
 	}
 	root := s.RepoRoot()
 	// http 备选片段:serve --auth 已启用(token 在位)时带 headers,因此含密钥。
-	token, _ := s.LoadAuthToken()
+	token, err := s.LoadAuthToken()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "错误:", err)
+		return 1
+	}
 	authNote := ""
 	if token != "" {
 		authNote = "\n   ⚠ 已启用鉴权:http 备选片段含 token,勿提交版本库;stdio 桥无此问题(令牌自读)。"
@@ -130,7 +158,7 @@ func runSetup(args []string, out io.Writer) int {
   curl "http://127.0.0.1:%d/inject?file=<某个 .go 文件路径>"
 `, root, mcpJSONSnippet(root), mcpJSONHTTPSnippet(root, cfg.Port, token),
 		root, engine.DisciplinePrompt,
-		root, hooksJSONSnippet(root),
+		root, hooksJSONSnippet(),
 		codexTOMLSnippet(root), codexTOMLHTTPSnippet(root, cfg.Port, token),
 		root, root, cfg.Port)
 	return 0
@@ -157,6 +185,9 @@ func runHook(args []string, in io.Reader, out io.Writer) int {
 	if err := fs.Parse(args); err != nil {
 		return 0
 	}
+	if fs.NArg() != 0 {
+		return 0 // hook 非法调用也遵守静默、永不阻断宿主的契约
+	}
 	var hi hookInput
 	if err := json.NewDecoder(io.LimitReader(in, 1<<20)).Decode(&hi); err != nil {
 		return 0
@@ -182,21 +213,34 @@ func runHook(args []string, in io.Reader, out io.Writer) int {
 	if err != nil {
 		return 0
 	}
+	releaseView, viewErr := acquireRecoveredView(s)
+	if viewErr != nil && !errors.Is(viewErr, store.ErrLocked) {
+		return 0
+	}
+	if releaseView != nil {
+		defer releaseView()
+	}
 	cfg, err := s.LoadConfig()
 	if err != nil || cfg == nil {
 		return 0
 	}
 	// 本机回环,1s 足够;超时静默——宁可少注入一次,不能卡住宿主。
 	client := &http.Client{Timeout: time.Second}
-	req, err := http.NewRequest(http.MethodGet, fmt.Sprintf("http://127.0.0.1:%d/inject?file=%s&session=%s&tool=%s",
-		cfg.Port, url.QueryEscape(file), url.QueryEscape(hi.SessionID), url.QueryEscape(hi.ToolName)), nil)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	base := fmt.Sprintf("http://127.0.0.1:%d", cfg.Port)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, fmt.Sprintf("%s/inject?file=%s&session=%s&tool=%s",
+		base, url.QueryEscape(file), url.QueryEscape(hi.SessionID), url.QueryEscape(hi.ToolName)), nil)
 	if err != nil {
 		return 0
 	}
-	// serve --auth 时携带令牌(token 文件在位即带;serve 未开鉴权则忽略该头,无害)。
-	if token, _ := s.LoadAuthToken(); token != "" {
-		req.Header.Set("Authorization", "Bearer "+token)
+	// 无论业务 Bearer 是否启用，先做双向 HMAC 身份验证；否则占用可预测
+	// loopback 端口并返回 200 的无关进程可收到文件路径、session 与注入查询。
+	session, err := s.AcquireLocalAuthSession(ctx, base, "/inject", client)
+	if err != nil {
+		return 0
 	}
+	req.Header.Set("Authorization", store.LocalSessionAuthorization(session.Token))
 	resp, err := client.Do(req)
 	if err != nil {
 		return 0

@@ -20,32 +20,40 @@ type JournalStats struct {
 
 // journalPath 返回某时刻对应的月份文件路径(按 UTC 月分片,append-only)。
 func (s *Store) journalPath(c model.Change) string {
-	return filepath.Join(s.dir, "journal", c.At.UTC().Format("2006-01")+".jsonl")
+	return filepath.Join(s.dir, filepath.FromSlash(s.JournalRelFor(c)))
 }
 
-// AppendChange 往对应月份文件追加一行(O_APPEND;ID 查重是 engine 的职责)。
-// 落盘带 fsync:journal 与分片同属真相数据(local/ 下的 usage/findings 可再生,不 fsync)。
+// JournalRelFor 返回 change 所在月 journal 的 .knowledge 正斜杠相对路径，
+// 供跨文件事务在首个真相写前把目标 journal 一并纳入 before-image。
+func (s *Store) JournalRelFor(c model.Change) string {
+	return "journal/" + c.At.UTC().Format("2006-01") + ".jsonl"
+}
+
+// AppendChange 往对应月份文件追加一行(ID 查重是 engine 的职责)。月文件用
+// temp+fsync+rename 整体替换，而非裸 O_APPEND：后者写到半行时无法安全截回，
+// 会让下一次完整 JSON 粘在坏行后一起丢失。writer lock 保证跨进程单写者。
 func (s *Store) AppendChange(c model.Change) error {
 	line, err := json.Marshal(c)
 	if err != nil {
 		return fmt.Errorf("store: 编码 change: %w", err)
 	}
 	path := s.journalPath(c)
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return fmt.Errorf("store: 建 journal 目录: %w", err)
+	existing, err := s.readKnowledgeFile(path)
+	if err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("store: 读取 journal: %w", err)
 	}
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
-	if err != nil {
-		return fmt.Errorf("store: 开 journal: %w", err)
+	data := make([]byte, 0, len(existing)+len(line)+1)
+	data = append(data, existing...)
+	if len(data) > 0 && data[len(data)-1] != '\n' {
+		// 既有断电半行先与新记录隔开；读端仍会把坏行计数，但不能污染新行。
+		data = append(data, '\n')
 	}
-	defer f.Close()
-	if _, err := f.Write(append(line, '\n')); err != nil {
+	data = append(data, line...)
+	data = append(data, '\n')
+	if err := s.atomicWrite(path, data); err != nil {
 		return fmt.Errorf("store: 追加 journal: %w", err)
 	}
-	if err := f.Sync(); err != nil {
-		return fmt.Errorf("store: fsync journal: %w", err)
-	}
-	return f.Close()
+	return nil
 }
 
 // LoadJournal 加载全部变更记录并执行读端契约(impl §4 定案):
@@ -60,7 +68,7 @@ func (s *Store) LoadJournal() ([]model.Change, JournalStats, error) {
 		flagged = map[string]bool{}   // 已计入 ConflictIDs 的 ID
 	)
 	dir := filepath.Join(s.dir, "journal")
-	entries, err := os.ReadDir(dir)
+	entries, err := s.readKnowledgeDir(dir)
 	if os.IsNotExist(err) {
 		return nil, stats, nil
 	}
@@ -71,7 +79,7 @@ func (s *Store) LoadJournal() ([]model.Change, JournalStats, error) {
 		if e.IsDir() || !strings.HasSuffix(e.Name(), ".jsonl") {
 			continue
 		}
-		data, err := os.ReadFile(filepath.Join(dir, e.Name()))
+		data, err := s.readKnowledgeFile(filepath.Join(dir, e.Name()))
 		if err != nil {
 			return nil, stats, fmt.Errorf("store: 读 %s: %w", e.Name(), err)
 		}

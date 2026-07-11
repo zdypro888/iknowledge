@@ -26,9 +26,13 @@ case "$arch" in
     *) echo "错误: 不支持的架构 $arch(仅支持 amd64/arm64)" >&2; exit 1 ;;
 esac
 
+bin_name="iknowledge"
+[ "$os" = "windows" ] && bin_name="iknowledge.exe"
+
 # ---- 选择安装目录 ----
 install_dir="${IKNOWLEDGE_BIN:-$HOME/.local/bin}"
 mkdir -p "$install_dir"
+install_dir="$(cd "$install_dir" && pwd)"
 
 # ---- 下载预编译二进制 ----
 install_binary() {
@@ -40,7 +44,10 @@ install_binary() {
     fi
     asset="iknowledge-${os}-${arch}.tar.gz"
     url="https://github.com/${REPO}/releases/download/${latest_tag}/${asset}"
-    tmpdir="$(mktemp -d)"
+	if ! tmpdir="$(mktemp -d)" || [ -z "$tmpdir" ]; then
+		echo "   无法创建临时目录" >&2
+		return 1
+	fi
     trap 'rm -rf "$tmpdir"' EXIT
 
     echo "==> 下载预编译二进制 ${latest_tag}/${asset}"
@@ -49,32 +56,64 @@ install_binary() {
         return 1
     fi
 
-    # 校验 sha256(若 checksums 文件存在且含本资产)。
-    sums_url="https://github.com/${REPO}/releases/download/${latest_tag}/sha256sums.txt"
-    if curl -fsSL "$sums_url" -o "$tmpdir/sha256sums.txt" 2>/dev/null; then
-        awk -v a="$asset" '$2 == a { print }' "$tmpdir/sha256sums.txt" > "$tmpdir/$asset.sha256"
-        if [ -s "$tmpdir/$asset.sha256" ]; then
-            (cd "$tmpdir" && if command -v sha256sum >/dev/null 2>&1; then
-                sha256sum -c "$asset.sha256" 2>/dev/null || { echo "   校验失败" >&2; return 1; }
-            elif command -v shasum >/dev/null 2>&1; then
-                shasum -a 256 -c "$asset.sha256" 2>/dev/null || { echo "   校验失败" >&2; return 1; }
-            fi) || return 1
-            echo "   sha256 校验通过"
-        fi
-    fi
+	# 校验 sha256：缺 checksums、缺本资产记录、机器无校验工具均 fail closed。
+	sums_url="https://github.com/${REPO}/releases/download/${latest_tag}/sha256sums.txt"
+	if ! curl -fsSL "$sums_url" -o "$tmpdir/sha256sums.txt" 2>/dev/null; then
+		echo "   缺 sha256sums.txt，拒绝安装未校验二进制" >&2
+		return 1
+	fi
+	awk -v a="$asset" '$2 == a || $2 == "*" a { print }' "$tmpdir/sha256sums.txt" > "$tmpdir/$asset.sha256"
+	if [ ! -s "$tmpdir/$asset.sha256" ]; then
+		echo "   checksums 中缺 $asset，拒绝安装" >&2
+		return 1
+	fi
+	if command -v sha256sum >/dev/null 2>&1; then
+		(cd "$tmpdir" && sha256sum -c "$asset.sha256" >/dev/null 2>&1) || {
+			echo "   sha256 校验失败" >&2
+			return 1
+		}
+	elif command -v shasum >/dev/null 2>&1; then
+		(cd "$tmpdir" && shasum -a 256 -c "$asset.sha256" >/dev/null 2>&1) || {
+			echo "   sha256 校验失败" >&2
+			return 1
+		}
+	else
+		echo "   找不到 sha256sum/shasum，拒绝安装未校验二进制" >&2
+		return 1
+	fi
+	echo "   sha256 校验通过"
 
-    # 解压。tar 包内文件名是 iknowledge-{os}-{arch}(Windows 带 .exe)。
-    tar xzf "$tmpdir/$asset" -C "$tmpdir"
+    # 解压。先要求归档恰好只有预期的根文件，拒绝 ../、绝对路径、额外链接等。
     inner="iknowledge-${os}-${arch}"
     [ "$os" = "windows" ] && inner="$inner.exe"
+	members="$(tar tzf "$tmpdir/$asset" 2>/dev/null || true)"
+	if [ "$members" != "$inner" ]; then
+		echo "   归档成员异常，拒绝解压: $members" >&2
+		return 1
+	fi
+	if ! tar xzf "$tmpdir/$asset" -C "$tmpdir" "$inner"; then
+		echo "   解压失败" >&2
+		return 1
+	fi
     if [ ! -f "$tmpdir/$inner" ]; then
         echo "   解压后未找到 $inner" >&2
         return 1
     fi
-    bin_name="iknowledge"
-    [ "$os" = "windows" ] && bin_name="iknowledge.exe"
-    mv "$tmpdir/$inner" "$install_dir/$bin_name"
-    chmod +x "$install_dir/$bin_name"
+	# 在目标目录内 staging，再 rename 覆盖；下载/复制/chmod 任一步失败都保留旧版本。
+	stage="$(mktemp "$install_dir/.iknowledge-install.XXXXXX")" || {
+		echo "   无法在安装目录创建临时文件" >&2
+		return 1
+	}
+	if ! cp "$tmpdir/$inner" "$stage" || ! chmod +x "$stage"; then
+		rm -f "$stage"
+		echo "   设置执行权限失败" >&2
+		return 1
+	fi
+	if ! mv -f "$stage" "$install_dir/$bin_name"; then
+		rm -f "$stage"
+		echo "   原子安装二进制失败" >&2
+		return 1
+	fi
     echo "   已安装 → $install_dir/$bin_name"
 }
 
@@ -85,22 +124,24 @@ install_from_source() {
         echo "错误: 需要 Go 环境(https://go.dev/dl/),或等 Release 发布预编译包后重跑" >&2
         exit 1
     fi
-    go install "github.com/${REPO}/cmd/iknowledge@latest"
-    install_dir="$(go env GOPATH)/bin"
-    echo "   已安装 → $install_dir/iknowledge"
+	if ! GOBIN="$install_dir" go install "github.com/${REPO}/cmd/iknowledge@latest"; then
+		echo "错误: 源码构建失败" >&2
+		exit 1
+	fi
+	echo "   已安装 → $install_dir/$bin_name"
 }
 
 # ---- 主安装逻辑 ----
 BIN=""
-if install_binary; then
-    BIN="$install_dir/iknowledge"
-elif [ -n "${IKNOWLEDGE_FORCE_SOURCE:-}" ]; then
-    install_from_source
-    BIN="$install_dir/iknowledge"
+if [ -n "${IKNOWLEDGE_FORCE_SOURCE:-}" ]; then
+	install_from_source
+	BIN="$install_dir/$bin_name"
+elif install_binary; then
+	BIN="$install_dir/$bin_name"
 else
-    echo "==> 预编译包不可用,回退源码构建"
-    install_from_source
-    BIN="$install_dir/iknowledge"
+	echo "==> 预编译包不可用,回退源码构建"
+	install_from_source
+	BIN="$install_dir/$bin_name"
 fi
 
 # version 自检。
@@ -108,14 +149,37 @@ fi
 
 # ---- skill 安装 ----
 fetch_skill() {
-    dst="$1"
-    mkdir -p "$dst"
-    SELF_DIR="$(cd "$(dirname "$0")" 2>/dev/null && pwd || true)"
-    if [ -n "$SELF_DIR" ] && [ -f "$SELF_DIR/skills/kb-bootstrap/SKILL.md" ]; then
-        cp "$SELF_DIR/skills/kb-bootstrap/SKILL.md" "$dst/SKILL.md"
+	dst="$1"
+	mkdir -p "$dst"
+	stage_skill="$(mktemp "$dst/.SKILL.md.XXXXXX")" || {
+		echo "错误: 无法创建 skill 临时文件" >&2
+		return 1
+	}
+	SELF_DIR=""
+	# curl | sh 时 $0 通常是 sh，绝不能把当前工作目录误认成安装器目录。
+	# 只有确实从名为 install.sh 的本地文件启动时才允许复用同仓 skill。
+	case "$0" in
+		install.sh|*/install.sh)
+			if [ -f "$0" ]; then
+				SELF_DIR="$(cd "$(dirname "$0")" 2>/dev/null && pwd || true)"
+			fi
+			;;
+	esac
+	if [ -n "$SELF_DIR" ] && [ -f "$SELF_DIR/skills/kb-bootstrap/SKILL.md" ]; then
+        if ! cp "$SELF_DIR/skills/kb-bootstrap/SKILL.md" "$stage_skill"; then
+			rm -f "$stage_skill"
+			return 1
+		fi
     else
-        curl -fsSL "$SKILL_URL" -o "$dst/SKILL.md"
+		if ! curl -fsSL "$SKILL_URL" -o "$stage_skill"; then
+			rm -f "$stage_skill"
+			return 1
+		fi
     fi
+	if ! mv -f "$stage_skill" "$dst/SKILL.md"; then
+		rm -f "$stage_skill"
+		return 1
+	fi
 }
 
 echo "==> 安装 kb-bootstrap skill(Claude Code)"
@@ -129,21 +193,33 @@ else
     echo "==> 未检测到 Codex($CODEX_DIR 不存在),跳过"
 fi
 
-# ---- PATH 可解析性(stdio 桥需要裸命令) ----
+# ---- PATH 可解析性与旧版 shadow 检查(stdio/hook 需要裸命令) ----
 # stdio 桥由 MCP 客户端直接 spawn(GUI 启动的客户端 PATH 常没有 ~/.local/bin),
 # 尽力软链进 /usr/local/bin 保证裸命令可解析;不行则明确提示。
-if ! command -v iknowledge >/dev/null 2>&1; then
+resolved_bin="$(command -v iknowledge 2>/dev/null || true)"
+if [ -z "$resolved_bin" ]; then
     if [ -w /usr/local/bin ] || ln -sf "$BIN" /usr/local/bin/iknowledge 2>/dev/null; then
         ln -sf "$BIN" /usr/local/bin/iknowledge 2>/dev/null || true
     fi
-    if command -v iknowledge >/dev/null 2>&1 || [ -x /usr/local/bin/iknowledge ]; then
-        echo "==> 已软链 /usr/local/bin/iknowledge(MCP stdio 桥需要裸命令可解析)"
-    else
-        echo "提示: iknowledge 不在 PATH——请执行(MCP stdio 桥依赖它):"
-        echo "  sudo ln -sf \"$BIN\" /usr/local/bin/iknowledge"
-        echo "(或让 AI 接入时在 .mcp.json 里用绝对路径 $BIN,skill 会自动这么做)"
-    fi
+	resolved_bin="$(command -v iknowledge 2>/dev/null || true)"
 fi
+if [ -z "$resolved_bin" ]; then
+	echo "错误: 新二进制已安装到 ${BIN}，但 iknowledge 仍不在 PATH；stdio/hook 无法可靠启动。" >&2
+	if [ "$os" = "windows" ]; then
+		echo "请把 $install_dir 加入当前用户 PATH 后重跑安装器。" >&2
+	else
+		echo "请把 $install_dir 加入 PATH，或执行: sudo ln -sf \"$BIN\" /usr/local/bin/iknowledge" >&2
+	fi
+	exit 1
+fi
+# 不能只看 command -v 成功：旧 /usr/local/bin 可能 shadow 新 ~/.local/bin，
+# 让用户以为安全更新已生效、实际 MCP 仍跑旧漏洞版本。cmp 同时兼容真实文件与 symlink。
+if ! cmp -s "$resolved_bin" "$BIN"; then
+	echo "错误: PATH 中的 iknowledge ($resolved_bin) 不是刚安装的 ${BIN}。" >&2
+	echo "请移除/更新旧 shadow，确保 command -v iknowledge 指向新二进制后重跑。" >&2
+	exit 1
+fi
+echo "==> PATH 校验通过: $resolved_bin"
 
 echo ""
 echo "完成。现在进入任意项目,对 Claude Code 或 Codex 说:"

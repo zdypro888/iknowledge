@@ -3,6 +3,7 @@ package engine
 import (
 	"os"
 	"path/filepath"
+	goruntime "runtime"
 	"strings"
 	"testing"
 	"time"
@@ -11,9 +12,71 @@ import (
 	"github.com/zdypro888/iknowledge/internal/store"
 )
 
+func TestInitRejectsSourceSymlinkOutsideRepository(t *testing.T) {
+	if goruntime.GOOS == "windows" {
+		t.Skip("Windows symlink 需要额外权限")
+	}
+	e, repo := newRepo(t, nil)
+	outside := filepath.Join(t.TempDir(), "private.go")
+	secret := `package private
+const APISecret = "TOP_SECRET_MUST_NOT_BE_INDEXED"
+`
+	if err := os.WriteFile(outside, []byte(secret), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, filepath.Join(repo, "leak.go")); err != nil {
+		t.Fatal(err)
+	}
+	rep, err := e.Init(InitOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rep.Files != 0 {
+		t.Fatalf("仓外 symlink 不应进入源码清单:%+v", rep)
+	}
+	if _, err := safeRepoRead(repo, "leak.go"); err == nil {
+		t.Fatal("统一源码读取必须拒绝最终 symlink")
+	}
+	if _, err := os.Stat(e.Store.ShardPathFor("leak.go")); !os.IsNotExist(err) {
+		t.Fatalf("仓外源码不应生成知识分片:%v", err)
+	}
+}
+
+func TestInitRecoversPreparedConfigBeforeBuildingRegistry(t *testing.T) {
+	e, _ := newRepo(t, map[string]string{"a.go": "package a\n"})
+	if _, err := e.Init(InitOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	before, err := e.Store.ReadKnowledgeFile("config.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.Store.PrepareTruthTransaction([]string{"config.yaml"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.Store.WriteKnowledgeFile("config.yaml", []byte("schema: 1\nport: 18001\nextensions: [.foo]\n")); err != nil {
+		t.Fatal(err)
+	}
+	fresh := New(e.Store) // 构造时故意观察到半事务 .foo 配置。
+	if fresh.Reg.ForFile("x.foo") == nil {
+		t.Fatal("测试前置无效:registry 未观察到半事务 config")
+	}
+	if _, err := fresh.Init(InitOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	after, err := fresh.Store.ReadKnowledgeFile("config.yaml")
+	if err != nil || string(after) != string(before) {
+		t.Fatalf("init 未先恢复 config before-image:after=%q err=%v", after, err)
+	}
+	if fresh.Reg.ForFile("x.foo") != nil {
+		t.Fatal("init 恢复后仍沿用半事务 parser registry")
+	}
+}
+
 // newRepo 建一个临时仓库(无 git,走 WalkDir 回退;git 路径由 e2e 覆盖)。
 func newRepo(t *testing.T, files map[string]string) (*Engine, string) {
 	t.Helper()
+	t.Setenv("IKNOWLEDGE_STATE_HOME", t.TempDir())
 	repo := t.TempDir()
 	writeFiles(t, repo, files)
 	s, err := store.Open(repo)
@@ -216,6 +279,73 @@ func TestRenameMigration(t *testing.T) {
 	}
 	if _, exists := nodes["auth/login.go#Login"]; exists {
 		t.Error("旧 ID 节点应随迁移消失")
+	}
+}
+
+func TestRenameWithContractDocChangeMigratesAsSuspect(t *testing.T) {
+	e, repo := newRepo(t, map[string]string{"auth/login.go": loginSrc})
+	if _, err := e.Init(InitOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	digest(t, e, "auth/login.go", "auth/login.go#Login", "调用方必须传明文")
+	old := loadNodes(t, e, "auth/login.go")["auth/login.go#Login"]
+
+	changed := strings.ReplaceAll(loginSrc, "Login", "Authenticate")
+	changed = strings.Replace(changed, "pass 传明文", "pass 传预哈希值", 1)
+	writeFiles(t, repo, map[string]string{"auth/login.go": changed})
+	rep, err := e.Init(InitOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rep.Migrated != 1 || rep.Suspected != 1 {
+		t.Fatalf("改名+契约变更应保留迁移但待重验: %s", rep.Text())
+	}
+	n := loadNodes(t, e, "auth/login.go")["auth/login.go#Authenticate"]
+	if n.Status != model.StatusSuspect || len(n.Entries) != 1 {
+		t.Fatalf("迁移知识应保留并降 suspect: %+v", n)
+	}
+	if n.Anchor.Hash != old.Anchor.Hash {
+		t.Fatal("suspect 迁移必须保留旧 Hash 基线，不能提前重锚")
+	}
+	if n.Anchor.DocStructHash == "" || n.Anchor.DocStructHash == old.Anchor.DocStructHash {
+		t.Fatal("目标 DocStructHash 应记录新契约且与旧护栏失配")
+	}
+	// 再跑 init 不能因 ID 已稳定就把 suspect 洗回 fresh。
+	if _, err := e.Init(InitOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if again := loadNodes(t, e, "auth/login.go")["auth/login.go#Authenticate"]; again.Status != model.StatusSuspect || again.Anchor.Hash != old.Anchor.Hash {
+		t.Fatalf("二次 init 错误洗白迁移: %+v", again)
+	}
+}
+
+func TestLegacyRenameWithoutDocGuardIsConservativelySuspect(t *testing.T) {
+	e, repo := newRepo(t, map[string]string{"auth/login.go": loginSrc})
+	if _, err := e.Init(InitOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	digest(t, e, "auth/login.go", "auth/login.go#Login", "旧库知识")
+	path := e.Store.ShardPathFor("auth/login.go")
+	sh, raw, err := e.Store.LoadShard(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := range sh.Nodes {
+		if sh.Nodes[i].ID == "auth/login.go#Login" {
+			sh.Nodes[i].Anchor.DocStructHash = "" // 模拟轮 34 前的存量分片
+		}
+	}
+	if err := e.Store.SaveShard(path, sh, raw); err != nil {
+		t.Fatal(err)
+	}
+	writeFiles(t, repo, map[string]string{"auth/login.go": strings.ReplaceAll(loginSrc, "Login", "Authenticate")})
+	rep, err := e.Init(InitOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	n := loadNodes(t, e, "auth/login.go")["auth/login.go#Authenticate"]
+	if rep.Migrated != 1 || n.Status != model.StatusSuspect || len(n.Entries) != 1 {
+		t.Fatalf("缺迁移护栏的旧库只能保守迁移: report=%s node=%+v", rep.Text(), n)
 	}
 }
 

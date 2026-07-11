@@ -2,8 +2,6 @@ package engine
 
 import (
 	"fmt"
-	"os"
-	"path/filepath"
 	"slices"
 	"strings"
 	"sync"
@@ -25,9 +23,12 @@ type runtime struct {
 	mu    sync.RWMutex
 	cache *store.Cache
 	ix    *index.Index
-	wips  []model.WIP
-	flows []model.Flow
-	warns []string // flows 等加载告警(每次 reload 重算)
+	// truthTxActive 只在 rt.mu 写锁下访问。事务中途的内部 reload 必须跳过
+	// 崩溃恢复；新进程/下次请求则在加载缓存前恢复仓外 prepared WAL。
+	truthTxActive bool
+	wips          []model.WIP
+	flows         []model.Flow
+	warns         []string // flows 等加载告警(每次 reload 重算)
 	// opsWarns 运行期落盘失败等运营告警(R2-C1):原先混在 warns 里,
 	// 每次 Sync 被 LoadFlows 的结果整体覆盖,kb_status(入口先 Sync)永远看不到。
 	// 有界去重,进程存续期保留。
@@ -114,8 +115,7 @@ func (e *Engine) parseFailedCached() int {
 	files, err := e.cachedSourceFiles()
 	if err == nil {
 		for _, rel := range files {
-			abs := filepath.Join(e.Store.RepoRoot(), filepath.FromSlash(rel))
-			st, err := os.Stat(abs)
+			st, err := safeRepoFileInfo(e.Store.RepoRoot(), rel)
 			if err != nil {
 				continue
 			}
@@ -126,7 +126,7 @@ func (e *Engine) parseFailedCached() int {
 				}
 				continue
 			}
-			src, err := os.ReadFile(abs)
+			src, err := safeRepoRead(e.Store.RepoRoot(), rel)
 			if err != nil || parser.IsGenerated(src) {
 				continue
 			}
@@ -275,10 +275,26 @@ func (e *Engine) Sync() error {
 
 // reloadLocked 前提:已持锁。
 func (e *Engine) reloadLocked() error {
+	if !e.rt.truthTxActive {
+		recovered, err := e.Store.RecoverTruthTransactionWithStatus()
+		if recovered {
+			e.rt.cache = nil // 不能拿半应用文件的 mtime/size 快照解释已恢复原字节
+			cfg, cfgErr := e.Store.LoadConfig()
+			if cfgErr != nil {
+				return fmt.Errorf("恢复事务后重读 config: %w", cfgErr)
+			}
+			e.Reg = registryForConfig(cfg)
+		}
+		if err != nil {
+			return fmt.Errorf("恢复崩溃事务: %w", err)
+		}
+	}
 	if e.rt.cache == nil {
 		e.rt.cache = store.NewCache(e.Store)
 		e.rt.sessionMu.Lock()
-		e.rt.sessions = map[string]*sessionLedger{}
+		if e.rt.sessions == nil {
+			e.rt.sessions = map[string]*sessionLedger{}
+		}
 		e.rt.sessionMu.Unlock()
 	}
 	if _, err := e.rt.cache.Refresh(); err != nil {
@@ -307,6 +323,9 @@ func (e *Engine) reloadLocked() error {
 		healthy[rel] = cs.Shard.Nodes
 	}
 	e.rt.ix = index.Build(healthy, changes, flows)
+	for _, id := range e.rt.ix.DuplicateNodeIDs() {
+		e.rt.warns = append(e.rt.warns, "重复 node ID 已隔离:"+id+"(检查多个 tree 分片/import remap)")
+	}
 	// R29 批次2:读路径状态对账预算(从 reconcileOnReadLocked 外移)。写锁内做,
 	// 使读路径变纯读——失配降 suspect、pending_anchor 补全、回到锚定恢复 fresh。
 	// 只对有活跃知识且 fresh/suspect/pending 的节点做,成本受限。
@@ -335,9 +354,10 @@ func (e *Engine) warnOpsLocked(msg string) {
 // 的比对基线,代价低,回收更激进。
 const ledgerTTL = 2 * time.Hour
 
-// ledger 取(或建)会话台账;sid 为空(匿名连接)返回 nil——台账类功能退化关闭。
-// R29 批次2:走 sessionMu 独立锁(不再要求持 rt.mu)。
-func (e *Engine) ledger(sid string) *sessionLedger {
+// ledgerSnapshot 取(或建)会话台账的只读快照;sid 为空(匿名连接)返回 nil。
+// sessionLedger 内含 map,绝不能把裸指针带出 sessionMu——Inject 与 Recall 都持
+// rt.mu.RLock,同一会话可以并发进入;锁外遍历 reads 会与 recordRead 写 map 竞态。
+func (e *Engine) ledgerSnapshot(sid string) map[string]readRecord {
 	if sid == "" {
 		return nil
 	}
@@ -350,7 +370,11 @@ func (e *Engine) ledger(sid string) *sessionLedger {
 		e.rt.sessions[sid] = l
 	}
 	l.lastActive = e.now()
-	return l
+	out := make(map[string]readRecord, len(l.reads))
+	for id, rec := range l.reads {
+		out[id] = rec
+	}
+	return out
 }
 
 // evictStaleSessionsLocked 回收空闲超过 TTL 的会话台账。前提:已持 sessionMu。

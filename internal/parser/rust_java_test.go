@@ -1,6 +1,9 @@
 package parser
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 // ---- Rust 解析器回归(R29-续)----
 
@@ -64,6 +67,66 @@ impl<T: Clone> Repository<T> for UserService {
 	// impl 块内方法应有 Class.method 规范名
 	if names["UserService.find_user"] != "method" {
 		t.Errorf("应提取 UserService.find_user 方法,got %v", names)
+	}
+	if names["UserService.save"] != "method" || names["Repository.save"] != "" {
+		t.Errorf("trait impl 方法必须归位真实实现类型,got %v", names)
+	}
+}
+
+func TestRustGenericTraitImplUsesSelfType(t *testing.T) {
+	src := []byte(`impl<T: Clone> Repository<Vec<T>> for crate::UserService<T> where T: Send {
+    fn save(&self, item: T) { consume(item); }
+}`)
+	syms, _ := Rust{}.Parse("svc.rs", src)
+	if len(syms) != 1 || syms[0].Name != "UserService.save" || syms[0].Kind != "method" {
+		t.Fatalf("复杂 trait impl 归位错误: %+v", syms)
+	}
+}
+
+func TestRustScanSkipsLineAndBlockComments(t *testing.T) {
+	src := []byte(`
+// fn line_fake() {}
+/* struct BlockFake {}
+   fn block_fake() {}
+   /* fn nested_fake() {} */
+*/
+struct Real {}
+impl Real {
+    // fn method_fake(&self) {}
+    /* fn method_block_fake(&self) {} */
+    fn actual(&self) {}
+}`)
+	syms, _ := Rust{}.Parse("real.rs", src)
+	names := map[string]bool{}
+	for _, s := range syms {
+		names[s.Name] = true
+	}
+	if !names["Real"] || !names["Real.actual"] || names["line_fake"] || names["BlockFake"] ||
+		names["block_fake"] || names["nested_fake"] || names["Real.method_fake"] || names["Real.method_block_fake"] {
+		t.Fatalf("注释不得建 Rust 符号: %v", names)
+	}
+}
+
+func TestRustLifetimesAndNestedCommentsDoNotBreakBoundaries(t *testing.T) {
+	src := []byte(`fn borrow<'a>(value: &'a str) -> &'a str {
+    /* outer { /* nested } */ still outer } */
+    value
+}`)
+	syms, _ := Rust{}.Parse("borrow.rs", src)
+	if len(syms) != 1 || syms[0].Name != "borrow" || !strings.Contains(string(syms[0].Body), "value\n") {
+		t.Fatalf("lifetime/嵌套注释破坏 Rust 符号边界: %+v", syms)
+	}
+}
+
+func TestRustLifetimeHashStillIgnoresFormattingAndComments(t *testing.T) {
+	a, _ := Rust{}.Parse("a.rs", []byte(`fn borrow<'a>(value: &'a str) -> &'a str { value }`))
+	b, _ := Rust{}.Parse("a.rs", []byte(`// note
+fn borrow<'a>(value: &'a str) -> &'a str {
+    /* nested /* note */ comment */
+    value
+}`))
+	if len(a) != 1 || len(b) != 1 || a[0].Hash != b[0].Hash {
+		t.Fatalf("lifetime 不得破坏 Rust 格式/注释哈希免疫: %+v / %+v", a, b)
 	}
 }
 
@@ -172,6 +235,66 @@ int add(int a, int b) {
 	}
 	if m1.Hash != m2.Hash {
 		t.Errorf("格式/注释变更后哈希应稳定:%q vs %q", m1.Hash, m2.Hash)
+	}
+}
+
+func TestJavaScanSkipsLineAndBlockComments(t *testing.T) {
+	src := []byte(`
+// class LineGhost { void nope() {} }
+/* class BlockGhost { void fake() {} } */
+class Real {
+    // void lineFake() {}
+    /* void blockFake() {} */
+    String text = "void stringFake() {}";
+    void actual() {}
+}`)
+	syms, _ := Java{}.Parse("Real.java", src)
+	names := map[string]bool{}
+	for _, s := range syms {
+		names[s.Name] = true
+	}
+	if !names["Real"] || !names["Real.actual"] || names["LineGhost"] || names["BlockGhost"] ||
+		names["Real.lineFake"] || names["Real.blockFake"] || names["Real.stringFake"] {
+		t.Fatalf("注释/字符串不得建 Java 符号: %v", names)
+	}
+}
+
+func TestJavaMethodSignatureCommentsDoNotBecomeBody(t *testing.T) {
+	src := []byte(`class Real {
+    void actual() throws IOException /* { not a body } */ {
+        work();
+    }
+}`)
+	syms, _ := Java{}.Parse("Real.java", src)
+	for _, s := range syms {
+		if s.Name == "Real.actual" && strings.Contains(string(s.Body), "work()") {
+			return
+		}
+	}
+	t.Fatalf("签名注释中的大括号不得冒充方法体: %+v", syms)
+}
+
+func TestJavaFieldInitializerCallsAreNotMethods(t *testing.T) {
+	src := []byte(`class Demo {
+    Object value = factory.create();
+    Runnable task = build();
+    Demo copy = new Demo();
+
+    Demo() {}
+    void real() {}
+}`)
+	syms, _ := Java{}.Parse("Demo.java", src)
+	names := map[string]bool{}
+	for _, sym := range syms {
+		names[sym.Name] = true
+	}
+	if !names["Demo"] || !names["Demo.Demo"] || !names["Demo.real"] {
+		t.Fatalf("真实 type/构造器/方法应提取: %v", names)
+	}
+	for _, fake := range []string{"Demo.create", "Demo.build", "Demo.factory"} {
+		if names[fake] {
+			t.Fatalf("字段初始化调用不得冒充方法 %s: %v", fake, names)
+		}
 	}
 }
 

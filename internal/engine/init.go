@@ -28,14 +28,22 @@ type Engine struct {
 	scoutAddr string
 	// rt 是 serve 期的内存态(缓存/索引/台账/作业),见 runtime.go。
 	rt runtime
+	// afterImportTruthWrite 仅供崩溃恢复测试在某次真相 rename 后模拟进程猝死。
+	// 生产构造永为 nil；普通 error 不走此钩子，仍在当次调用内主动 rollback。
+	afterImportTruthWrite func(string) error
 }
 
 // New 建引擎。多语言注册(2026-07-04):专职解析器(Go/Python)先注册,
 // config.yaml 的 extensions 白名单再挂通用文件级插件(已占用的扩展名忽略,
 // 专职插件永远优先);config 读取尽力而为——没有 config 时纯 Go 行为不变。
 func New(s *store.Store) *Engine {
+	cfg, _ := s.LoadConfig()
+	return &Engine{Store: s, Reg: registryForConfig(cfg), now: time.Now}
+}
+
+func registryForConfig(cfg *store.Config) *parser.Registry {
 	reg := parser.NewRegistry()
-	if cfg, err := s.LoadConfig(); err == nil && cfg != nil && len(cfg.Extensions) > 0 {
+	if cfg != nil && len(cfg.Extensions) > 0 {
 		var free []string
 		for _, ext := range cfg.Extensions {
 			ext = strings.TrimSpace(ext)
@@ -53,7 +61,7 @@ func New(s *store.Store) *Engine {
 			reg.Register(parser.NewGeneric(free))
 		}
 	}
-	return &Engine{Store: s, Reg: reg, now: time.Now}
+	return reg
 }
 
 // InitOptions 对应 kb_init / CLI init 的入参(impl §7.3)。
@@ -109,8 +117,8 @@ type reconcile struct {
 	// fileHashByRel 解析期缓存的文件级锚定哈希(HashFileFor:插件自定义优先,
 	// 缺省符号级联;src 不驻留,故在解析现场算)。
 	fileHashByRel map[string]string
-	newByID   map[string]symRef
-	newStruct map[string][]string // StructHash → 未被 ID 命中的新符号 ID 列表
+	newByID       map[string]symRef
+	newStruct     map[string][]string // StructHash → 未被 ID 命中的新符号 ID 列表
 
 	// 结果:每个源文件的最终节点集(nil 值表示该分片应删除)。
 	out      map[string][]model.Node
@@ -140,6 +148,15 @@ func (e *Engine) Init(opts InitOptions) (*InitReport, error) {
 
 func (e *Engine) initLocked(opts InitOptions) (*InitReport, error) {
 	s := e.Store
+	if !e.rt.truthTxActive {
+		recovered, err := s.RecoverTruthTransactionWithStatus()
+		if err != nil {
+			return nil, fmt.Errorf("init 前恢复未完成事务: %w", err)
+		}
+		if recovered {
+			e.rt.cache = nil
+		}
+	}
 	if err := s.EnsureLayout(); err != nil {
 		return nil, err
 	}
@@ -147,6 +164,7 @@ func (e *Engine) initLocked(opts InitOptions) (*InitReport, error) {
 	if err != nil {
 		return nil, err
 	}
+	e.Reg = registryForConfig(cfg)
 	if err := s.EnsureGitFiles(); err != nil { // impl §6 第 6 步
 		return nil, err
 	}
@@ -154,16 +172,16 @@ func (e *Engine) initLocked(opts InitOptions) (*InitReport, error) {
 	rep := &InitReport{}
 	rc := &reconcile{
 		e: e, report: rep, now: e.now().UTC(),
-		oldShards: map[string]*loadedShard{},
-		oldByID:   map[string]*model.Node{},
-		oldStruct: map[string]int{},
+		oldShards:     map[string]*loadedShard{},
+		oldByID:       map[string]*model.Node{},
+		oldStruct:     map[string]int{},
 		symsByRel:     map[string][]parser.Symbol{},
 		fileHashByRel: map[string]string{},
-		newByID:   map[string]symRef{},
-		newStruct: map[string][]string{},
-		out:       map[string][]model.Node{},
-		skipRel:   map[string]bool{},
-		migrated:  map[string]bool{},
+		newByID:       map[string]symRef{},
+		newStruct:     map[string][]string{},
+		out:           map[string][]model.Node{},
+		skipRel:       map[string]bool{},
+		migrated:      map[string]bool{},
 	}
 
 	if err := rc.scanSources(cfg); err != nil {
@@ -207,8 +225,7 @@ func (rc *reconcile) scanSources(cfg *store.Config) error {
 		}
 		lowerSeen[strings.ToLower(rel)] = rel
 
-		abs := filepath.Join(rc.e.Store.RepoRoot(), filepath.FromSlash(rel))
-		src, err := os.ReadFile(abs)
+		src, err := safeRepoRead(rc.e.Store.RepoRoot(), rel)
 		if err != nil {
 			return fmt.Errorf("engine: 读 %s: %w", rel, err)
 		}
@@ -342,7 +359,7 @@ func (rc *reconcile) buildFileNodes(rel string, opts InitOptions) []model.Node {
 		}
 		anchor := model.Anchor{
 			File: rel, Symbol: sym.Name,
-			Hash: sym.Hash, StructHash: sym.StructHash, Lines: sym.Lines,
+			Hash: sym.Hash, StructHash: sym.StructHash, DocStructHash: sym.DocStructHash, Lines: sym.Lines,
 		}
 		nodes = append(nodes, rc.reconcileNode(model.SymbolNodeID(rel, sym.Name), level, anchor, opts))
 	}
@@ -425,12 +442,30 @@ func (rc *reconcile) tryMigrate(old *model.Node) bool {
 		migrated := *old
 		migrated.ID = targetID
 		migrated.Level = nodes[i].Level
-		migrated.Anchor = nodes[i].Anchor // 重新落锚到新位置
+		newAnchor := nodes[i].Anchor
+		docGuardOK := old.Anchor.DocStructHash != "" && newAnchor.DocStructHash != "" &&
+			old.Anchor.DocStructHash == newAnchor.DocStructHash
+		if docGuardOK || len(old.Entries) == 0 {
+			migrated.Anchor = newAnchor // 纯改名/搬家已被 doc 护栏证明，可直接重锚
+		} else {
+			// StructHash 只证明“代码骨架像同一实体”，不能证明迁移时没顺手改
+			// 契约 doc。保留旧 Hash 作为知识基线，同时把位置/迁移哈希更新到新实体；
+			// 下一次 init 仍会失配，直到显式 verify/reanchor，不能自动洗回 fresh。
+			migrated.Anchor.File = newAnchor.File
+			migrated.Anchor.Symbol = newAnchor.Symbol
+			migrated.Anchor.StructHash = newAnchor.StructHash
+			migrated.Anchor.DocStructHash = newAnchor.DocStructHash
+			migrated.Anchor.Lines = newAnchor.Lines
+			migrated.Status = model.StatusSuspect
+			rc.report.Suspected++
+			rc.report.Warnings = append(rc.report.Warnings,
+				"迁移已保留但需重验:"+old.ID+" → "+targetID+"(doc 护栏缺失或失配)")
+		}
 		// 血缘:全链 flat 集合,旧 ID 追加、去重(knowledge.md §12.6)。
 		migrated.Lineage = appendUnique(append([]string{}, old.Lineage...), old.ID)
-		if migrated.Status == model.StatusOrphaned || migrated.Status == model.StatusSuspect {
+		if docGuardOK && (migrated.Status == model.StatusOrphaned || migrated.Status == model.StatusSuspect) {
 			// 结构等同的代码在新位置找到了:孤儿回归;suspect 语义按旧锚已不可判,
-			// 保守保留 suspect 需要旧锚,而迁移必换锚——故按知识有无回归。
+			// DocStructHash 又证明契约说明不变,故按知识有无回归。
 			migrated.Status = statusForKnowledge(&migrated)
 		}
 		rc.out[ref.rel][i] = migrated
@@ -476,7 +511,11 @@ func (rc *reconcile) writeShards(opts InitOptions) error {
 		orphans := rc.out[rel] // matchAndMigrate 只会往消失文件追加孤儿
 		path := s.ShardPathFor(rel)
 		if len(orphans) == 0 {
-			if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+			shardRel, relErr := filepath.Rel(s.Dir(), path)
+			if relErr != nil {
+				return relErr
+			}
+			if err := s.RemoveKnowledgeFile(filepath.ToSlash(shardRel)); err != nil && !os.IsNotExist(err) {
 				return fmt.Errorf("engine: 删空分片 %s: %w", rel, err)
 			}
 			continue
@@ -606,7 +645,11 @@ func (rc *reconcile) reapDeadDirShards(liveDirs map[string]bool) error {
 			}
 		}
 		if !keep {
-			if err := os.Remove(p); err != nil && !os.IsNotExist(err) {
+			shardRel, relErr := filepath.Rel(s.Dir(), p)
+			if relErr != nil {
+				return relErr
+			}
+			if err := s.RemoveKnowledgeFile(filepath.ToSlash(shardRel)); err != nil && !os.IsNotExist(err) {
 				return fmt.Errorf("engine: 删死目录壳 %s: %w", rel, err)
 			}
 			return nil

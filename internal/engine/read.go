@@ -2,7 +2,6 @@ package engine
 
 import (
 	"fmt"
-	"os"
 	"path"
 	"path/filepath"
 	"sort"
@@ -1260,7 +1259,7 @@ func (e *Engine) reconcileOnReadLocked(ref *index.NodeRef) autoInfo {
 	if n.Level == model.LevelDir || n.Level == model.LevelProject {
 		return autoInfo{curHash: n.Anchor.Hash}
 	}
-	src, err := os.ReadFile(filepath.Join(e.Store.RepoRoot(), filepath.FromSlash(file)))
+	src, err := safeRepoRead(e.Store.RepoRoot(), file)
 	if err != nil {
 		// 源文件读不到(已删):orphaned 语义由对账处理;这里如实返回旧锚。
 		return autoInfo{curHash: n.Anchor.Hash}
@@ -1355,7 +1354,7 @@ func (e *Engine) reconcileAllLocked() {
 		if !ok {
 			pp = &parsed{}
 			fileCache[file] = pp
-			src, err := os.ReadFile(filepath.Join(repo, filepath.FromSlash(file)))
+			src, err := safeRepoRead(repo, file)
 			if err != nil {
 				continue
 			}
@@ -1382,6 +1381,7 @@ func (e *Engine) reconcileAllLocked() {
 					if n.PendingAnchor {
 						n.Anchor.Hash = pp.syms[i].Hash
 						n.Anchor.StructHash = pp.syms[i].StructHash
+						n.Anchor.DocStructHash = pp.syms[i].DocStructHash
 						n.Anchor.Lines = pp.syms[i].Lines
 						n.PendingAnchor = false
 						dirty[ref.ShardRel] = true
@@ -1453,16 +1453,15 @@ func (e *Engine) Inject(file, sid, tool string) (string, error) {
 
 	var parts []string
 	var nodeIDs []string
+	reads := e.ledgerSnapshot(sid)
 
 	// 过时警报置顶(§9.2)。R29 批次3:用 fileNodes 索引免扫全表。
 	for _, id := range e.rt.ix.FileNodes(file) {
 		nodeIDs = append(nodeIDs, id)
-		if l := e.ledger(sid); l != nil {
-			if prev, ok := l.reads[id]; ok {
-				cur := e.rt.ix.Node(id).Node.Anchor.Hash
-				if prev.Hash != "" && cur != "" && prev.Hash != cur {
-					parts = append(parts, e.staleAlert(id, prev))
-				}
+		if prev, ok := reads[id]; ok {
+			cur := e.rt.ix.Node(id).Node.Anchor.Hash
+			if prev.Hash != "" && cur != "" && prev.Hash != cur {
+				parts = append(parts, e.staleAlert(id, prev))
 			}
 		}
 	}

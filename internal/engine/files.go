@@ -2,7 +2,9 @@ package engine
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path"
@@ -11,6 +13,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/zdypro888/iknowledge/internal/model"
 	"github.com/zdypro888/iknowledge/internal/parser"
 	"github.com/zdypro888/iknowledge/internal/store"
 )
@@ -39,13 +42,82 @@ func listSourceFiles(repo string, reg *parser.Registry, cfg *store.Config) ([]st
 			continue
 		}
 		// ls-files 会列出 index 里有、工作区已删的文件——以工作区为准。
-		if st, err := os.Stat(filepath.Join(repo, filepath.FromSlash(rel))); err != nil || st.IsDir() {
+		if st, err := safeRepoFileInfo(repo, rel); err != nil || !st.Mode().IsRegular() {
 			continue
 		}
 		out = append(out, rel)
 	}
 	sort.Strings(out)
 	return out, nil
+}
+
+// safeRepoPathInfo 把仓库根本身解析为物理路径（允许用户从 symlink 根打开），
+// 但拒绝根以下任一 symlink/非目录中间组件。源码路径来自可提交的 git index，
+// 不能让恶意仓库用 tracked symlink 读取仓外文件。
+func safeRepoPathInfo(repo, rel string) (string, os.FileInfo, error) {
+	clean, ok := model.SafeRel(filepath.ToSlash(rel))
+	if !ok {
+		return "", nil, fmt.Errorf("非法仓库相对路径 %q", rel)
+	}
+	root, err := filepath.EvalSymlinks(repo)
+	if err != nil {
+		return "", nil, err
+	}
+	root, err = filepath.Abs(root)
+	if err != nil {
+		return "", nil, err
+	}
+	cur := root
+	parts := strings.Split(clean, "/")
+	var info os.FileInfo
+	for i, part := range parts {
+		cur = filepath.Join(cur, filepath.FromSlash(part))
+		info, err = os.Lstat(cur)
+		if err != nil {
+			return "", nil, err
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			return "", nil, fmt.Errorf("仓库路径包含 symlink:%s", clean)
+		}
+		if i < len(parts)-1 && !info.IsDir() {
+			return "", nil, fmt.Errorf("仓库路径中间组件不是目录:%s", clean)
+		}
+	}
+	return cur, info, nil
+}
+
+func safeRepoFileInfo(repo, rel string) (os.FileInfo, error) {
+	_, info, err := safeRepoPathInfo(repo, rel)
+	return info, err
+}
+
+func safeRepoRead(repo, rel string) ([]byte, error) {
+	path, before, err := safeRepoPathInfo(repo, rel)
+	if err != nil {
+		return nil, err
+	}
+	if !before.Mode().IsRegular() {
+		return nil, fmt.Errorf("仓库路径不是普通文件:%s", rel)
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	opened, statErr := f.Stat()
+	if statErr != nil || !opened.Mode().IsRegular() || !os.SameFile(before, opened) {
+		_ = f.Close()
+		if statErr != nil {
+			return nil, statErr
+		}
+		return nil, fmt.Errorf("仓库文件在打开期间被替换:%s", rel)
+	}
+	data, readErr := io.ReadAll(f)
+	closeErr := f.Close()
+	_, after, afterErr := safeRepoPathInfo(repo, rel)
+	if afterErr == nil && !os.SameFile(opened, after) {
+		afterErr = fmt.Errorf("仓库文件在读取期间被替换:%s", rel)
+	}
+	return data, errors.Join(readErr, closeErr, afterErr)
 }
 
 // gitChangeCounts 统计近 since 内每文件的提交触碰次数(热区排序的频率因子,
