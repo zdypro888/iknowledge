@@ -1,4 +1,5 @@
 /iknowledge
+/dist/
 *.test
 *.out
 .DS_Store
