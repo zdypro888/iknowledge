@@ -23,11 +23,19 @@ import (
 
 // Export 把 .knowledge/ 的 tree+journal+flows+topics+config 打包成 tar.gz 写入 w。
 // 前提:已 EnsureRuntime(不用持锁——只读文件系统)。
-func (e *Engine) Export(w io.Writer) error {
+func (e *Engine) Export(w io.Writer) (err error) {
 	gz := gzip.NewWriter(w)
-	defer gz.Close()
+	defer func() {
+		if closeErr := gz.Close(); err == nil {
+			err = closeErr
+		}
+	}()
 	tw := tar.NewWriter(gz)
-	defer tw.Close()
+	defer func() {
+		if closeErr := tw.Close(); err == nil {
+			err = closeErr
+		}
+	}()
 
 	dir := e.Store.Dir()
 	// MANIFEST:导出元数据(时间、schema、来源仓)。
@@ -38,9 +46,9 @@ func (e *Engine) Export(w io.Writer) error {
 	}
 
 	// 收集 tree/ journal/ flows/ topics/ config.yaml(排除 local/ wip/)。
-	return filepath.WalkDir(dir, func(path string, d os.DirEntry, err error) error {
-		if err != nil {
-			return err
+	err = filepath.WalkDir(dir, func(path string, d os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
 		}
 		if d.IsDir() {
 			name := d.Name()
@@ -64,6 +72,7 @@ func (e *Engine) Export(w io.Writer) error {
 		}
 		return writeTarFile(tw, relSlash, data)
 	})
+	return err
 }
 
 const maxImportEntryBytes = 16 << 20
@@ -82,21 +91,23 @@ type ImportReport struct {
 	Scanned    int
 	Imported   int
 	Skipped    int
+	Redacted   int
 	Bytes      int64
 	BackupPath string
 	Entries    []ImportEntry
 }
 
 type ImportEntry struct {
-	Name   string
-	Action string // import | skip
-	Reason string
-	Bytes  int64
+	Name     string
+	Action   string // import | skip
+	Reason   string
+	Bytes    int64
+	Redacted int
 }
 
 func (r ImportReport) Text() string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "导入报告: scanned=%d importable=%d skipped=%d bytes=%d", r.Scanned, r.Imported, r.Skipped, r.Bytes)
+	fmt.Fprintf(&b, "导入报告: scanned=%d importable=%d skipped=%d redacted=%d bytes=%d", r.Scanned, r.Imported, r.Skipped, r.Redacted, r.Bytes)
 	if r.BackupPath != "" {
 		fmt.Fprintf(&b, "\n备份: %s", r.BackupPath)
 	}
@@ -106,7 +117,11 @@ func (r ImportReport) Text() string {
 	}
 	for _, ent := range shown {
 		if ent.Action == "import" {
-			fmt.Fprintf(&b, "\n  + %s (%d bytes)", ent.Name, ent.Bytes)
+			fmt.Fprintf(&b, "\n  + %s (%d bytes", ent.Name, ent.Bytes)
+			if ent.Redacted > 0 {
+				fmt.Fprintf(&b, ", 脱敏 %d 处", ent.Redacted)
+			}
+			b.WriteString(")")
 		} else {
 			fmt.Fprintf(&b, "\n  - %s (%s)", ent.Name, ent.Reason)
 		}
@@ -133,7 +148,7 @@ func (e *Engine) ImportWithOptions(r io.Reader, opts ImportOptions) (ImportRepor
 	if err != nil {
 		return rep, fmt.Errorf("解压失败(不是有效的 .kbundle?):%w", err)
 	}
-	defer gz.Close()
+	defer func() { _ = gz.Close() }() // gzip reader close has no actionable recovery path
 	limit := opts.MaxEntryBytes
 	if limit <= 0 {
 		limit = maxImportEntryBytes
@@ -186,9 +201,14 @@ func (e *Engine) ImportWithOptions(r io.Reader, opts ImportOptions) (ImportRepor
 		if len(opts.PathRemap) > 0 && (strings.HasPrefix(clean, "tree/") || strings.HasPrefix(clean, "journal/")) {
 			data = remapBytes(data, opts.PathRemap)
 		}
+		// bundle 来自仓库外部,不能依赖当前版本的 Go 结构标签。对可导入的
+		// YAML/JSONL 原文统一清理,确保 dry-run 与真实写入给出相同报告。
+		redacted, redaction := RedactText(string(data))
+		data = []byte(redacted)
 		rep.Imported++
+		rep.Redacted += redaction.Count
 		rep.Bytes += int64(len(data))
-		rep.Entries = append(rep.Entries, ImportEntry{Name: clean, Action: "import", Bytes: int64(len(data))})
+		rep.Entries = append(rep.Entries, ImportEntry{Name: clean, Action: "import", Bytes: int64(len(data)), Redacted: redaction.Count})
 		if opts.DryRun {
 			continue
 		}

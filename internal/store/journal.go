@@ -38,14 +38,18 @@ func (s *Store) AppendChange(c model.Change) error {
 	if err != nil {
 		return fmt.Errorf("store: 开 journal: %w", err)
 	}
-	defer f.Close()
 	if _, err := f.Write(append(line, '\n')); err != nil {
+		_ = f.Close()
 		return fmt.Errorf("store: 追加 journal: %w", err)
 	}
 	if err := f.Sync(); err != nil {
+		_ = f.Close()
 		return fmt.Errorf("store: fsync journal: %w", err)
 	}
-	return f.Close()
+	if err := f.Close(); err != nil {
+		return fmt.Errorf("store: 关闭 journal: %w", err)
+	}
+	return nil
 }
 
 // LoadJournal 加载全部变更记录并执行读端契约(impl §4 定案):

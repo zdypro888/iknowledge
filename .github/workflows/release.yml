@@ -23,13 +23,13 @@ jobs:
       - run: go vet ./...
       - run: go test -race ./...
 
-      # cross-compile 6 个目标:darwin/linux × amd64/arm64 + windows amd64。
+      # cross-compile 6 个目标:darwin/linux/windows × amd64/arm64。
       # CGO_DISABLED=1:纯 Go(yaml.v3 是纯 Go),静态二进制跨机可跑。
       # -trimpath -ldflags="-s -w":去路径/去符号表,体积小且 reproducible。
       - name: Build binaries
         run: |
           VERSION="${GITHUB_REF_NAME:-dev}"
-          LDFLAGS="-s -w"
+          LDFLAGS="-s -w -X github.com/zdypro888/iknowledge/internal/buildinfo.Version=${VERSION}"
           build_one() {
             os="$1"; arch="$2"; ext="$3"
             target="iknowledge-${os}-${arch}"

@@ -8,20 +8,20 @@ import "time"
 // WIP 是任务态层的一份台账(knowledge.md §7):与知识层严格分离,
 // 存 .knowledge/wip/<owner>.yaml,git 排除,求即时不求持久。
 type WIP struct {
-	Task     string    `yaml:"task"`               // 任务一句话(含 issue 引用)
-	Intent   string    `yaml:"intent,omitempty"`   // 意图
-	Plan     []string  `yaml:"plan,omitempty"`     // 计划步骤
-	Done     []string  `yaml:"done,omitempty"`     // 已完成
-	Todo     []string  `yaml:"todo,omitempty"`     // 待办
-	Touching []string  `yaml:"touching,omitempty"` // 声明"正在动谁"(节点 ID 列表)
-	Owner    string    `yaml:"owner"`              // 谁的任务(author 同源:clientInfo 推导)
+	Task     string    `yaml:"task" redact:"true"`             // 任务一句话(含 issue 引用)
+	Intent   string    `yaml:"intent,omitempty" redact:"true"` // 意图
+	Plan     []string  `yaml:"plan,omitempty" redact:"true"`   // 计划步骤
+	Done     []string  `yaml:"done,omitempty" redact:"true"`   // 已完成
+	Todo     []string  `yaml:"todo,omitempty" redact:"true"`   // 待办
+	Touching []string  `yaml:"touching,omitempty"`             // 声明"正在动谁"(节点 ID 列表)
+	Owner    string    `yaml:"owner"`                          // 谁的任务(author 同源:clientInfo 推导)
 	Updated  time.Time `yaml:"updated"`
 }
 
 // FlowStep 是流程节点的一步,引用树节点而不复制其内容(knowledge.md §6)。
 type FlowStep struct {
-	Node string `yaml:"node"`           // 树节点 ID
-	Note string `yaml:"note,omitempty"` // 该步说明("入口"/"核心验证"…)
+	Node string `yaml:"node"`                         // 树节点 ID
+	Note string `yaml:"note,omitempty" redact:"true"` // 该步说明("入口"/"核心验证"…)
 }
 
 // Flow 是横向流程/主题节点(knowledge.md §6):
@@ -29,10 +29,10 @@ type FlowStep struct {
 // 树节点的反向链接(被哪些流程引用)不落盘,由 index 现算——与 auto 同哲学,防腐。
 type Flow struct {
 	ID           string     `yaml:"id"`
-	Title        string     `yaml:"title"`
-	Steps        []FlowStep `yaml:"steps,omitempty"`        // 主题节点可为空
-	Conventions  []string   `yaml:"conventions,omitempty"`  // 全局约定/横切关注点
-	Troubleshoot string     `yaml:"troubleshoot,omitempty"` // 排障入口说明
+	Title        string     `yaml:"title" redact:"true"`
+	Steps        []FlowStep `yaml:"steps,omitempty"`                      // 主题节点可为空
+	Conventions  []string   `yaml:"conventions,omitempty" redact:"true"`  // 全局约定/横切关注点
+	Troubleshoot string     `yaml:"troubleshoot,omitempty" redact:"true"` // 排障入口说明
 	Deprecated   bool       `yaml:"deprecated,omitempty"`
 	Since        time.Time  `yaml:"since"`
 	Author       string     `yaml:"author,omitempty"`
@@ -50,11 +50,11 @@ type FlowShard struct {
 // 蒸馏物已经 kb_remember/kb_task 落库,findings 本身是会话产物)。
 type Findings struct {
 	Job        string    `json:"job"`
-	Question   string    `json:"question"`
-	Conclusion string    `json:"conclusion"`
+	Question   string    `json:"question" redact:"true"`
+	Conclusion string    `json:"conclusion" redact:"true"`
 	Locations  []string  `json:"locations,omitempty"` // 节点 ID 指针
-	Plan       string    `json:"plan,omitempty"`
-	Risks      string    `json:"risks,omitempty"`
+	Plan       string    `json:"plan,omitempty" redact:"true"`
+	Risks      string    `json:"risks,omitempty" redact:"true"`
 	At         time.Time `json:"at"`
 	Author     string    `json:"author,omitempty"`
 }

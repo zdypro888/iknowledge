@@ -70,18 +70,39 @@ func TestAuthGuard(t *testing.T) {
 			if tc.header != "" {
 				req.Header.Set("Authorization", tc.header)
 			}
+			challenge := strings.Repeat("c", 64)
+			req.Header.Set(AuthChallengeHeader, challenge)
 			resp, err := http.DefaultClient.Do(req)
 			if err != nil {
 				t.Fatal(err)
 			}
-			defer resp.Body.Close()
+			t.Cleanup(func() { _ = resp.Body.Close() })
 			if resp.StatusCode != tc.want {
 				t.Errorf("状态码 = %d, want %d", resp.StatusCode, tc.want)
 			}
 			if tc.want == http.StatusUnauthorized && resp.Header.Get("WWW-Authenticate") == "" {
 				t.Error("401 应带 WWW-Authenticate 头(RFC 6750)")
 			}
+			if got := resp.Header.Get(AuthFingerprintHeader); got != AuthFingerprint(tok) {
+				t.Errorf("auth 服务指纹=%q,want %q", got, AuthFingerprint(tok))
+			}
+			if got := resp.Header.Get(AuthProofHeader); !VerifyAuthProof(tok, challenge, got) {
+				t.Errorf("auth 服务 HMAC 证明无效:%q", got)
+			}
 		})
+	}
+}
+
+func TestAuthProofIsNonceBound(t *testing.T) {
+	token := strings.Repeat("d", 64)
+	a := strings.Repeat("a", 64)
+	b := strings.Repeat("b", 64)
+	proof := AuthProof(token, a)
+	if !VerifyAuthProof(token, a, proof) {
+		t.Fatal("正确 challenge 的证明未通过")
+	}
+	if VerifyAuthProof(token, b, proof) || VerifyAuthProof(strings.Repeat("e", 64), a, proof) {
+		t.Fatal("证明不得跨 challenge 或 token 重放")
 	}
 }
 
@@ -115,9 +136,57 @@ func TestEnsureAuthTokenIdempotent(t *testing.T) {
 		if perm := fi.Mode().Perm(); perm != 0o600 {
 			t.Errorf("token 权限 = %o, want 600", perm)
 		}
+		if err := os.Chmod(filepath.Join(repo, ".knowledge", "local", "token"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if tok, err := s.LoadAuthToken(); err == nil || tok != "" {
+			t.Fatalf("权限过宽的 token 必须 fail closed,got %q/%v", tok, err)
+		}
+		if _, err := s.EnsureAuthToken(); err != nil {
+			t.Fatal(err)
+		}
+		fi, err = os.Stat(filepath.Join(repo, ".knowledge", "local", "token"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if fi.Mode().Perm() != 0o600 {
+			t.Errorf("既有 token 权限未收紧:mode=%v", fi.Mode().Perm())
+		}
 	}
 	got, err := s.LoadAuthToken()
 	if err != nil || got != t1 {
 		t.Errorf("LoadAuthToken = %q/%v, want %q", got, err, t1)
+	}
+}
+
+func TestLoadAuthTokenFailsClosedOnCorruption(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		body string
+	}{
+		{"empty", "\n"},
+		{"short", "deadbeef\n"},
+		{"non-hex", strings.Repeat("z", 64) + "\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			repo := t.TempDir()
+			s, err := store.Open(repo)
+			if err != nil {
+				t.Fatal(err)
+			}
+			path := filepath.Join(repo, ".knowledge", "local", "token")
+			if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(path, []byte(tc.body), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if tok, err := s.LoadAuthToken(); err == nil || tok != "" {
+				t.Fatalf("损坏 token 必须 fail closed,got %q/%v", tok, err)
+			}
+			if tok, err := s.EnsureAuthToken(); err == nil || tok != "" {
+				t.Fatalf("损坏 token 不得被静默覆盖,got %q/%v", tok, err)
+			}
+		})
 	}
 }

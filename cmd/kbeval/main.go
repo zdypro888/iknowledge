@@ -17,6 +17,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -125,7 +126,7 @@ func runSeed(args []string) int {
 		fmt.Fprintln(os.Stderr, "错误:", err)
 		return 1
 	}
-	defer os.Remove(cfgPath)
+	defer func() { _ = os.Remove(cfgPath) }()
 	res, err := driveSession(*repo, cfgPath, seedPrompt, *model, time.Duration(*timeout)*time.Second)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "错误:", err)
@@ -180,14 +181,14 @@ func runTasks(args []string) int {
 			fmt.Fprintln(os.Stderr, "错误(A 组需要 serve 运行中):", err)
 			return 1
 		}
-		defer os.Remove(cfgA)
+		defer func() { _ = os.Remove(cfgA) }()
 	}
 	cfgB, err := mcpConfigEmpty()
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "错误:", err)
 		return 1
 	}
-	defer os.Remove(cfgB)
+	defer func() { _ = os.Remove(cfgB) }()
 
 	for _, t := range tf.Tasks {
 		if len(onlySet) > 0 && !onlySet[t.ID] {
@@ -213,7 +214,9 @@ func runTasks(args []string) int {
 				// 单会话失败不中断全程:落 .err.txt 继续;重跑 run 自动补缺
 				//(跳过判据只认 .json)。
 				fmt.Fprintln(os.Stderr, "  失败(继续下一个):", err)
-				os.WriteFile(filepath.Join(*outDir, t.ID+"-"+m+".err.txt"), []byte(err.Error()), 0o644)
+				if writeErr := os.WriteFile(filepath.Join(*outDir, t.ID+"-"+m+".err.txt"), []byte(err.Error()), 0o644); writeErr != nil {
+					fmt.Fprintln(os.Stderr, "  写失败记录也失败:", writeErr)
+				}
 				continue
 			}
 			res.Task, res.Kind, res.Mode = t.ID, t.Kind, m
@@ -344,8 +347,18 @@ func driveSession(repo, mcpCfg, prompt, model string, timeout time.Duration) (*r
 	if err != nil {
 		return nil, err
 	}
-	defer ptmx.Close()
+	defer func() { _ = ptmx.Close() }()
 	defer pty.KillGroup(cmd)
+	writePTY := func(data []byte) error {
+		n, err := ptmx.Write(data)
+		if err != nil {
+			return err
+		}
+		if n != len(data) {
+			return io.ErrShortWrite
+		}
+		return nil
+	}
 	buf := newRingBuf(6 << 20) // 全量输出环形缓冲:遥测块 + 活动符号都从这里判
 	go func() {
 		b := make([]byte, 32<<10)
@@ -364,13 +377,17 @@ func driveSession(repo, mcpCfg, prompt, model string, timeout time.Duration) (*r
 	time.Sleep(10 * time.Second)
 	// 多行提示词必须括号粘贴包裹:裸 \n 会被 TUI 当回车键逐行提交(实测排障定案);
 	// 停 2s 再单发回车(粘贴突发去抖,aibridge 同法)。
-	submit := func() {
-		ptmx.Write([]byte(bracketedPaste(prompt)))
+	submit := func() error {
+		if err := writePTY([]byte(bracketedPaste(prompt))); err != nil {
+			return err
+		}
 		time.Sleep(2 * time.Second)
-		ptmx.Write([]byte("\r"))
+		return writePTY([]byte("\r"))
 	}
 	mark := buf.len()
-	submit()
+	if err := submit(); err != nil {
+		return nil, fmt.Errorf("提交提示词:%w", err)
+	}
 
 	// 阶段一:确认回合启动——提交点之后出现 spinner/响应符号(✻✶✳✽⏺ 只在
 	// 回合运行/回答时出现,欢迎屏没有;字节流速会被输入框回显假触发,弃用)。
@@ -387,10 +404,14 @@ func driveSession(repo, mcpCfg, prompt, model string, timeout time.Duration) (*r
 		if time.Now().After(nextResend) && resends < 2 {
 			resends++
 			nextResend = time.Now().Add(25 * time.Second)
-			ptmx.Write([]byte("\r")) // 收掉可能的弹窗
+			if err := writePTY([]byte("\r")); err != nil { // 收掉可能的弹窗
+				return nil, fmt.Errorf("关闭启动弹窗:%w", err)
+			}
 			time.Sleep(3 * time.Second)
 			mark = buf.len()
-			submit()
+			if err := submit(); err != nil {
+				return nil, fmt.Errorf("重投提示词:%w", err)
+			}
 		}
 	}
 	if !started {
@@ -421,17 +442,23 @@ func driveSession(repo, mcpCfg, prompt, model string, timeout time.Duration) (*r
 	// 阶段三:优雅退出——OTEL console 导出主要在进程退出时 flush(实测:周期导出
 	// 在 TUI 下不可靠),硬杀=计量丢失,必须把退出确认走完。
 	// 会话若开过后台任务,/exit 会弹"Exit anyway?"确认框(默认项即退出)——补回车确认。
-	ptmx.Write([]byte("/exit"))
+	if err := writePTY([]byte("/exit")); err != nil {
+		return nil, fmt.Errorf("发送退出命令:%w", err)
+	}
 	time.Sleep(1 * time.Second)
-	ptmx.Write([]byte("\r"))
+	if err := writePTY([]byte("\r")); err != nil {
+		return nil, fmt.Errorf("提交退出命令:%w", err)
+	}
 	exited := make(chan struct{})
-	go func() { cmd.Wait(); close(exited) }()
+	go func() { _ = cmd.Wait(); close(exited) }()
 	for i := 0; i < 3; i++ { // 最多补 3 次确认回车,每次等 8s
 		select {
 		case <-exited:
 			i = 3
 		case <-time.After(8 * time.Second):
-			ptmx.Write([]byte("\r"))
+			if err := writePTY([]byte("\r")); err != nil {
+				return nil, fmt.Errorf("确认退出:%w", err)
+			}
 		}
 	}
 	select {
@@ -458,7 +485,9 @@ func driveSession(repo, mcpCfg, prompt, model string, timeout time.Duration) (*r
 	if res.Total == 0 {
 		// 全量剥净缓冲落盘,便于事后排障(遥测缺失的会话钱已花,现场必须留)。
 		dump := filepath.Join(os.TempDir(), fmt.Sprintf("kbeval-debug-%d.txt", start.Unix()))
-		os.WriteFile(dump, clean, 0o644)
+		if err := os.WriteFile(dump, clean, 0o644); err != nil {
+			return nil, fmt.Errorf("遥测未捕获 token 计数,且写排障现场失败:%w", err)
+		}
 		return nil, fmt.Errorf("遥测未捕获 token 计数(缓冲 %d 字节;剥净现场 %s;屏尾:%s)",
 			buf.len(), dump, buf.tailClean(300))
 	}
@@ -604,8 +633,9 @@ func tallyCost(clean []byte) float64 {
 	total := 0.0
 	for _, m := range costValueRe.FindAllStringSubmatch(block, -1) {
 		var v float64
-		fmt.Sscanf(m[1], "%f", &v)
-		total += v
+		if _, err := fmt.Sscanf(m[1], "%f", &v); err == nil {
+			total += v
+		}
 	}
 	return total
 }
@@ -669,24 +699,33 @@ func mcpConfigA(repo string) (string, error) {
 	if tok, err := os.ReadFile(filepath.Join(absRepo, ".knowledge", "local", "token")); err == nil && len(tok) > 0 {
 		entry["headers"] = map[string]string{"Authorization": "Bearer " + strings.TrimSpace(string(tok))}
 	}
-	blob, _ := json.Marshal(map[string]any{"mcpServers": map[string]any{"knowledge": entry}})
-	f, err := os.CreateTemp("", "kbeval-mcp-a-*.json")
+	blob, err := json.Marshal(map[string]any{"mcpServers": map[string]any{"knowledge": entry}})
 	if err != nil {
 		return "", err
 	}
-	f.Write(blob)
-	f.Close()
-	return f.Name(), nil
+	return writeTempConfig("kbeval-mcp-a-*.json", blob)
 }
 
 func mcpConfigEmpty() (string, error) {
-	f, err := os.CreateTemp("", "kbeval-mcp-b-*.json")
+	return writeTempConfig("kbeval-mcp-b-*.json", []byte(`{"mcpServers":{}}`))
+}
+
+func writeTempConfig(pattern string, blob []byte) (string, error) {
+	f, err := os.CreateTemp("", pattern)
 	if err != nil {
 		return "", err
 	}
-	f.WriteString(`{"mcpServers":{}}`)
-	f.Close()
-	return f.Name(), nil
+	name := f.Name()
+	if _, err := f.Write(blob); err != nil {
+		_ = f.Close()
+		_ = os.Remove(name)
+		return "", err
+	}
+	if err := f.Close(); err != nil {
+		_ = os.Remove(name)
+		return "", err
+	}
+	return name, nil
 }
 
 func firstLine(s string) string {

@@ -18,16 +18,16 @@ func open() (*os.File, string, error) {
 		return nil, "", err
 	}
 	if err := ioctl(ptmx.Fd(), tiocptygrant, 0); err != nil {
-		ptmx.Close()
+		_ = ptmx.Close()
 		return nil, "", err
 	}
 	if err := ioctl(ptmx.Fd(), tiocptyunlk, 0); err != nil {
-		ptmx.Close()
+		_ = ptmx.Close()
 		return nil, "", err
 	}
 	var name [128]byte
 	if err := ioctl(ptmx.Fd(), tiocptygname, uintptr(unsafe.Pointer(&name[0]))); err != nil {
-		ptmx.Close()
+		_ = ptmx.Close()
 		return nil, "", err
 	}
 	n := 0

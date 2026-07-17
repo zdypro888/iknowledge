@@ -18,7 +18,7 @@ import (
 // RememberEntry 是一条待写入的知识。
 type RememberEntry struct {
 	Kind    string   `json:"kind"`
-	Text    string   `json:"text"`
+	Text    string   `json:"text" redact:"true"`
 	BasedOn []string `json:"based_on,omitempty"`
 	// Disputes 矛盾声明(knowledge.md §12.4):本条与既有条目冲突且写入方无法自裁
 	// (证据在代码之外等)时登记待裁决,防静默共存;能自裁的直接 kb_verify refute,不用它。
@@ -29,13 +29,15 @@ type RememberEntry struct {
 type RememberArgs struct {
 	Node       string          `json:"node"`
 	Entries    []RememberEntry `json:"entries,omitempty"`
-	Keywords   []string        `json:"keywords,omitempty"`
+	Keywords   []string        `json:"keywords,omitempty" redact:"true"`
 	Supersedes []string        `json:"supersedes,omitempty"`
 	BaseHash   string          `json:"base_hash,omitempty"`
 }
 
 // Remember 沉淀/更新知识条目。
-func (e *Engine) Remember(a RememberArgs, sid, author string) (string, error) {
+func (e *Engine) Remember(a RememberArgs, sid, author string) (out string, err error) {
+	redaction := RedactSecrets(&a)
+	defer appendRedactionNotice(&out, &err, redaction)
 	if err := e.requireInit(); err != nil {
 		return "", err
 	}
@@ -533,19 +535,21 @@ func (e *Engine) nodeFromSymbol(file string, sym parser.Symbol) model.Node {
 // ChangeArgs 是 kb_record_change 入参。
 type ChangeArgs struct {
 	Nodes     []string         `json:"nodes"`
-	What      string           `json:"what"`
-	Why       string           `json:"why"`
-	Task      string           `json:"task,omitempty"`
+	What      string           `json:"what" redact:"true"`
+	Why       string           `json:"why" redact:"true"`
+	Task      string           `json:"task,omitempty" redact:"true"`
 	Rejected  []model.Rejected `json:"rejected,omitempty"`
 	Overturns string           `json:"overturns,omitempty"`
-	Rebuttal  string           `json:"rebuttal,omitempty"`
-	Verified  string           `json:"verified,omitempty"`
+	Rebuttal  string           `json:"rebuttal,omitempty" redact:"true"`
+	Verified  string           `json:"verified,omitempty" redact:"true"`
 	Remaps    []model.Remap    `json:"remaps,omitempty"`
 	BaseHash  string           `json:"base_hash,omitempty"`
 }
 
 // RecordChange 修改代码后的变更记录:一个逻辑修改 = 一条记录。
-func (e *Engine) RecordChange(a ChangeArgs, sid, author string) (string, error) {
+func (e *Engine) RecordChange(a ChangeArgs, sid, author string) (out string, err error) {
+	redaction := RedactSecrets(&a)
+	defer appendRedactionNotice(&out, &err, redaction)
 	if err := e.requireInit(); err != nil {
 		return "", err
 	}
@@ -1022,8 +1026,8 @@ func gitHead(repo string) string {
 
 // RevertArgs 是 kb_revert 入参。
 type RevertArgs struct {
-	Change string `json:"change"` // 被撤销的 change ID(必填)
-	Reason string `json:"reason"` // 撤销理由(必填:留痕,后续可追溯为什么撤)
+	Change string `json:"change"`               // 被撤销的 change ID(必填)
+	Reason string `json:"reason" redact:"true"` // 撤销理由(必填:留痕,后续可追溯为什么撤)
 }
 
 // Revert 撤销一条 change。撤销本身是追加一条带 Reverts 字段的 Change(追加式不变量不破),
@@ -1034,7 +1038,9 @@ type RevertArgs struct {
 //
 // 只能撤销最近一条针对同一目标的记录(已被后续 change 再次修改的不可逆撤)。
 // 不碰源码(铁律二),只改 .knowledge/。
-func (e *Engine) Revert(a RevertArgs, sid, author string) (string, error) {
+func (e *Engine) Revert(a RevertArgs, sid, author string) (out string, err error) {
+	redaction := RedactSecrets(&a)
+	defer appendRedactionNotice(&out, &err, redaction)
 	if strings.TrimSpace(a.Change) == "" {
 		return "", kbErr("INVALID_PARAMS", "缺 change(被撤销的记录 ID)", "用 kb_recall mode=history 取 change ID")
 	}

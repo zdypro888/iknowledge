@@ -155,6 +155,7 @@ func (e *Engine) Status() (string, error) {
 	// 使用日志汇总(impl §7.6:数据裁决的采集底)。
 	if recs, err := e.Store.LoadUsage(); err == nil && len(recs) > 0 {
 		var recalls, hits, staleN, changes, remembers, undigestedHits int
+		var prechecks, precheckWarnings, precheckBlocked int
 		for _, r := range recs {
 			switch r.Tool {
 			case "kb_recall":
@@ -176,12 +177,21 @@ func (e *Engine) Status() (string, error) {
 				if r.OK {
 					remembers++
 				}
+			case "cli_precheck":
+				prechecks++
+				precheckWarnings += r.Warnings
+				if r.Blocked {
+					precheckBlocked++
+				}
 			}
 		}
 		fmt.Fprintf(&b, "使用日志: recall %d 次(命中率 %.0f%%,undigested 命中 %d,空手 %d)| remember %d | record_change %d | 读取时对账发现未记账变更 %d\n",
 			recalls, pct(hits, recalls), undigestedHits, recalls-hits, remembers, changes, staleN)
 		if staleN > 0 && changes*10 < staleN*10 { // 展示记账遵守率信号
 			fmt.Fprintf(&b, "⚠ 记账遵守率信号:未记账变更事件 %d vs 记账 %d\n", staleN, changes)
+		}
+		if prechecks > 0 {
+			fmt.Fprintf(&b, "提交预检: %d 次 | 实际告警 %d | strict 阻断 %d\n", prechecks, precheckWarnings, precheckBlocked)
 		}
 	}
 

@@ -15,12 +15,12 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
-	"runtime/debug"
 	"sort"
 	"strings"
 	"syscall"
 	"time"
 
+	"github.com/zdypro888/iknowledge/internal/buildinfo"
 	"github.com/zdypro888/iknowledge/internal/engine"
 	"github.com/zdypro888/iknowledge/internal/mcpserv"
 	"github.com/zdypro888/iknowledge/internal/store"
@@ -36,7 +36,9 @@ const usage = `iknowledge——AI 代码知识库(MCP 服务)
   iknowledge status --repo <path> [--prompt]                   库状态;--prompt 打印纪律提示词
   iknowledge doctor --repo <path> [--deploy] [--strict]        自检:初始化/配置/parser/维护欠账/PATH 部署
   iknowledge maintain --repo <path> [--plan]                   打印维护欠账清单/路线(只读;取用/销账走 MCP kb_maintain)
-  iknowledge setup  --repo <path>                              打印接入三件套(.mcp.json/纪律段/hook),只打印不代写
+  iknowledge brief --repo <path> [--budget 1200]               一屏项目简报(WIP/风险/近期决策/维护债)
+  iknowledge precheck --repo <path> [--working] [--strict]     提交前检查已知否决/腐烂/矛盾/记账;缺省仅告警
+  iknowledge setup  --repo <path>                              打印 MCP/纪律/hook/pre-commit 接入片段,只打印不代写
   iknowledge hook   [--repo <path>]                            宿主 hook 桥(Claude Code PostToolUse):注入所触文件的知识
   iknowledge export  --repo <path> [-o file.kbundle]           导出知识为 .kbundle(tar.gz;备份/迁移;缺省输出 stdout)
   iknowledge import  --repo <path> -i file.kbundle [--dry-run] [--backup] [--remap from=to]  导入 .kbundle(跨仓迁移用 --remap 重映射路径前缀)
@@ -65,6 +67,10 @@ func run(args []string) int {
 		return runDoctor(args[1:], os.Stdout)
 	case "maintain":
 		return runMaintain(args[1:], os.Stdout)
+	case "brief":
+		return runBrief(args[1:], os.Stdout)
+	case "precheck":
+		return runPrecheck(args[1:], os.Stdout)
 	case "setup":
 		return runSetup(args[1:], os.Stdout)
 	case "export":
@@ -118,7 +124,7 @@ func runServe(args []string) int {
 	cleanup := func() {
 		for _, u := range units {
 			if u.ln != nil {
-				u.ln.Close()
+				_ = u.ln.Close() // best-effort cleanup; startup errors are reported separately
 			}
 		}
 	}
@@ -258,20 +264,8 @@ func runServe(args []string) int {
 // runVersion 版本自报(运维排障:确认在跑哪个构建)。全部取构建元数据,
 // 不维护手写版本常量——发布忘更新的散落硬编码比没有版本号更误导。
 func runVersion() int {
-	version, revision, dirty := "(devel)", "", false
-	if bi, ok := debug.ReadBuildInfo(); ok {
-		if bi.Main.Version != "" {
-			version = bi.Main.Version
-		}
-		for _, s := range bi.Settings {
-			switch s.Key {
-			case "vcs.revision":
-				revision = s.Value
-			case "vcs.modified":
-				dirty = s.Value == "true"
-			}
-		}
-	}
+	info := buildinfo.Read()
+	version, revision, dirty := info.Version, info.Revision, info.Dirty
 	if len(revision) > 12 {
 		revision = revision[:12]
 	}
@@ -330,12 +324,18 @@ func runDoctor(args []string, w io.Writer) int {
 		fmt.Fprintln(os.Stderr, "错误:", err)
 		return 1
 	}
-	fmt.Fprintln(w, rep.Text())
+	if _, err := fmt.Fprintln(w, rep.Text()); err != nil {
+		fmt.Fprintln(os.Stderr, "错误: 写 doctor 输出:", err)
+		return 1
+	}
 	warnings := len(rep.Warnings)
 	if *deploy {
 		text, n := deployDoctorText()
 		if text != "" {
-			fmt.Fprintln(w, text)
+			if _, err := fmt.Fprintln(w, text); err != nil {
+				fmt.Fprintln(os.Stderr, "错误: 写 doctor 输出:", err)
+				return 1
+			}
 		}
 		warnings += n
 	}
@@ -410,7 +410,10 @@ func runMaintain(args []string, w io.Writer) int {
 			fmt.Fprintln(os.Stderr, "错误:", err)
 			return 1
 		}
-		fmt.Fprintln(w, brief)
+		if _, err := fmt.Fprintln(w, brief); err != nil {
+			fmt.Fprintln(os.Stderr, "错误: 写 maintain 输出:", err)
+			return 1
+		}
 		return 0
 	}
 	debts, err := engine.New(s).Debts()
@@ -419,16 +422,28 @@ func runMaintain(args []string, w io.Writer) int {
 		return 1
 	}
 	if len(debts) == 0 {
-		fmt.Fprintln(w, "无维护欠账。")
+		if _, err := fmt.Fprintln(w, "无维护欠账。"); err != nil {
+			fmt.Fprintln(os.Stderr, "错误: 写 maintain 输出:", err)
+			return 1
+		}
 		return 0
 	}
 	if *plan {
-		fmt.Fprintln(w, renderMaintainPlan(debts))
+		if _, err := fmt.Fprintln(w, renderMaintainPlan(debts)); err != nil {
+			fmt.Fprintln(os.Stderr, "错误: 写 maintain 输出:", err)
+			return 1
+		}
 		return 0
 	}
-	fmt.Fprintf(w, "维护欠账 %d 条(清账走 MCP:kb_maintain next → 处理 → complete/dismiss):\n", len(debts))
+	if _, err := fmt.Fprintf(w, "维护欠账 %d 条(清账走 MCP:kb_maintain next → 处理 → complete/dismiss):\n", len(debts)); err != nil {
+		fmt.Fprintln(os.Stderr, "错误: 写 maintain 输出:", err)
+		return 1
+	}
 	for _, d := range debts {
-		fmt.Fprintf(w, "- %s [%s] %s\n  %s\n", d.ID, d.Kind, d.Node, d.Desc)
+		if _, err := fmt.Fprintf(w, "- %s [%s] %s\n  %s\n", d.ID, d.Kind, d.Node, d.Desc); err != nil {
+			fmt.Fprintln(os.Stderr, "错误: 写 maintain 输出:", err)
+			return 1
+		}
 	}
 	return 0
 }
@@ -485,18 +500,28 @@ func runExport(args []string) int {
 		return 1
 	}
 	var w io.Writer = os.Stdout
+	var outFile *os.File
 	if *out != "" {
 		f, err := os.Create(*out)
 		if err != nil {
 			fmt.Fprintln(os.Stderr, "错误:", err)
 			return 1
 		}
-		defer f.Close()
+		outFile = f
 		w = f
 	}
 	if err := e.Export(w); err != nil {
+		if outFile != nil {
+			_ = outFile.Close()
+		}
 		fmt.Fprintln(os.Stderr, "错误:", err)
 		return 1
+	}
+	if outFile != nil {
+		if err := outFile.Close(); err != nil {
+			fmt.Fprintln(os.Stderr, "错误: 关闭导出文件:", err)
+			return 1
+		}
 	}
 	fmt.Fprintf(os.Stderr, "导出完成 → %s\n", outDesc(*out))
 	return 0
@@ -536,13 +561,14 @@ func runImport(args []string) int {
 		}
 	}
 	var r io.Reader = os.Stdin
+	var inFile *os.File
 	if *in != "" {
 		f, err := os.Open(*in)
 		if err != nil {
 			fmt.Fprintln(os.Stderr, "错误:", err)
 			return 1
 		}
-		defer f.Close()
+		inFile = f
 		r = f
 	}
 	if !*dryRun {
@@ -560,6 +586,11 @@ func runImport(args []string) int {
 		Backup:        *backup,
 		MaxEntryBytes: int64(*maxEntryMB) << 20,
 	})
+	if inFile != nil {
+		if closeErr := inFile.Close(); err == nil && closeErr != nil {
+			err = fmt.Errorf("关闭导入文件:%w", closeErr)
+		}
+	}
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "错误:", err)
 		return 1

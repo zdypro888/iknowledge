@@ -3,7 +3,9 @@
 package mcpserv
 
 import (
+	"crypto/hmac"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
@@ -17,13 +19,58 @@ import (
 	"sync"
 	"time"
 
+	"github.com/zdypro888/iknowledge/internal/buildinfo"
 	"github.com/zdypro888/iknowledge/internal/engine"
 )
 
 const protocolVersion = "2025-06-18"
+const maxRPCBodyBytes = 4 << 20
 
-// Version 是 serverInfo.version。
-const Version = "0.2.0"
+// AuthFingerprintHeader 是 256-bit 随机 token 的 SHA-256,仅供实例诊断与
+// 排除误连,不可单独作持钥证明(值可被读取后重放);实际预认证见 nonce-HMAC 头。
+const AuthFingerprintHeader = "X-Iknowledge-Auth-SHA256"
+
+// AuthChallengeHeader/AuthProofHeader 构成发送 Bearer 前的 nonce-HMAC 证明。
+// 静态指纹可被读取后重放,只能诊断实例;随机挑战证明当前监听者此刻持有 token。
+const (
+	AuthChallengeHeader = "X-Iknowledge-Auth-Challenge"
+	AuthProofHeader     = "X-Iknowledge-Auth-Proof"
+)
+
+func AuthFingerprint(token string) string {
+	sum := sha256.Sum256([]byte(token))
+	return hex.EncodeToString(sum[:])
+}
+
+func NewAuthChallenge() (string, error) {
+	b := make([]byte, 32)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(b), nil
+}
+
+func AuthProof(token, challenge string) string {
+	mac := hmac.New(sha256.New, []byte(token))
+	_, _ = mac.Write([]byte(challenge)) // hash.Hash writes never fail
+	return hex.EncodeToString(mac.Sum(nil))
+}
+
+func VerifyAuthProof(token, challenge, proof string) bool {
+	want := AuthProof(token, challenge)
+	return hmac.Equal([]byte(proof), []byte(want))
+}
+
+func validAuthChallenge(challenge string) bool {
+	b, err := hex.DecodeString(challenge)
+	return err == nil && len(b) == 32
+}
+
+// serverVersion 与 CLI version 同源取 Go 构建元数据:发布安装显示模块标签,
+// 本地构建显示 (devel),避免功能已前进但 MCP 仍伪报旧版本常量。
+func serverVersion() string {
+	return buildinfo.Read().Version
+}
 
 // Server 是一个仓库的 MCP 服务。
 type Server struct {
@@ -43,31 +90,13 @@ type session struct {
 
 // sessionTTL 是 MCP 会话的空闲上限(R2-D2:原先 sessions 只增不清,长跑 serve
 // 内存无界增长;engine 侧台账早有 2h TTL,这里不对称)。过期会话按规范返回 404,
-// 客户端自动重新 initialize——与服务端重启后的自愈路径完全相同。
+// 客户端自动重新 initialize——与服务端重启后的自愈路径完全相同。回收在会话
+// 访问/initialize 时机会性执行;容量另有 10000 硬上限,无需常驻清扫 goroutine。
 const sessionTTL = 24 * time.Hour
 
 // New 建服务。
 func New(e *engine.Engine) *Server {
-	s := &Server{E: e, sessions: map[string]*session{}}
-	// R29-E7.6:后台 goroutine 每 10min 回收过期 session(handleInitialize 原先只
-	// 机会性回收——大量 initialize 但不再发请求的场景会积累过期会话)。cap 10000
-	// 防恶意刷 initialize 耗内存(超限返 503)。
-	go s.reapSessions()
-	return s
-}
-
-func (s *Server) reapSessions() {
-	t := time.NewTicker(10 * time.Minute)
-	defer t.Stop()
-	for range t.C {
-		s.mu.Lock()
-		for id, sess := range s.sessions {
-			if time.Since(sess.lastSeen) > sessionTTL {
-				delete(s.sessions, id)
-			}
-		}
-		s.mu.Unlock()
-	}
+	return &Server{E: e, sessions: map[string]*session{}}
 }
 
 // Handler 返回完整路由(impl §7.1):
@@ -107,12 +136,19 @@ func (s *Server) authGuard(next http.Handler) http.Handler {
 	if s.AuthToken == "" {
 		return next
 	}
-	want := []byte("Bearer " + s.AuthToken)
+	wantHash := sha256.Sum256([]byte("Bearer " + s.AuthToken))
+	fingerprint := AuthFingerprint(s.AuthToken)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		got := []byte(r.Header.Get("Authorization"))
-		// R29-S1.3:删 len 预检——它泄露 token 长度,否定了 ConstantTimeCompare 的常数时间性。
-		// subtle.ConstantTimeCompare 自身安全处理不等长(对较长输入恒定时间返回 0)。
-		if subtle.ConstantTimeCompare(got, want) != 1 {
+		// 静态指纹用于诊断;客户端只有在下面的 nonce-HMAC 证明通过后才发送
+		// Bearer。它仍不是抵御主动实时转发代理的通道绑定。
+		w.Header().Set(AuthFingerprintHeader, fingerprint)
+		if challenge := r.Header.Get(AuthChallengeHeader); validAuthChallenge(challenge) {
+			w.Header().Set(AuthProofHeader, AuthProof(s.AuthToken, challenge))
+		}
+		// 先哈希成固定宽度再常数时间比较,避免 subtle.ConstantTimeCompare 对不等长
+		// 输入提前返回。Authorization 长度本身不是秘密,但注释与实现都不虚称。
+		gotHash := sha256.Sum256([]byte(r.Header.Get("Authorization")))
+		if subtle.ConstantTimeCompare(gotHash[:], wantHash[:]) != 1 {
 			w.Header().Set("WWW-Authenticate", `Bearer realm="iknowledge"`)
 			http.Error(w, "unauthorized: serve 以 --auth 启动,需 Authorization: Bearer <.knowledge/local/token>", http.StatusUnauthorized)
 			return
@@ -183,10 +219,22 @@ func (s *Server) serveRPC(w http.ResponseWriter, r *http.Request, role string) {
 		}
 	}
 
-	body, _ := io.ReadAll(io.LimitReader(r.Body, 4<<20))
+	body, err := io.ReadAll(io.LimitReader(r.Body, maxRPCBodyBytes+1))
+	if err != nil {
+		http.Error(w, "read request body failed", http.StatusBadRequest)
+		return
+	}
+	if len(body) > maxRPCBodyBytes {
+		http.Error(w, "request body exceeds 4 MiB", http.StatusRequestEntityTooLarge)
+		return
+	}
 	var req rpcRequest
-	if err := json.Unmarshal(body, &req); err != nil {
+	if !json.Valid(body) {
 		writeRPCError(w, nil, -32700, "parse error")
+		return
+	}
+	if err := json.Unmarshal(body, &req); err != nil || req.JSONRPC != "2.0" || strings.TrimSpace(req.Method) == "" {
+		writeRPCError(w, req.ID, -32600, "invalid request")
 		return
 	}
 
@@ -198,8 +246,9 @@ func (s *Server) serveRPC(w http.ResponseWriter, r *http.Request, role string) {
 		return
 	}
 
-	// 通知(无 id)→ 202 无体。
-	if len(req.ID) == 0 || string(req.ID) == "null" {
+	// 通知是“完全没有 id 字段”的合法请求 → 202 无体。显式 id:null 虽不推荐,
+	// 仍是请求而非通知,必须返回 id:null 的响应(JSON-RPC 2.0 §4.1)。
+	if len(req.ID) == 0 {
 		w.WriteHeader(http.StatusAccepted)
 		return
 	}
@@ -270,7 +319,7 @@ func (s *Server) handleInitialize(w http.ResponseWriter, req rpcRequest) {
 	writeRPCResult(w, req.ID, map[string]any{
 		"protocolVersion": protocolVersion,
 		"capabilities":    map[string]any{"tools": map[string]any{"listChanged": true}},
-		"serverInfo":      map[string]any{"name": "knowledge", "version": Version},
+		"serverInfo":      map[string]any{"name": "knowledge", "version": serverVersion()},
 		"repoRoot":        s.E.Store.RepoRoot(),
 		"instructions":    engine.InitializeInstructions,
 	})
@@ -557,7 +606,7 @@ func writeReadOnly(w http.ResponseWriter, out string, err error) {
 		return
 	}
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-	io.WriteString(w, out)
+	_, _ = io.WriteString(w, out) // response is already committed; no recovery path remains
 }
 
 func (s *Server) serveInject(w http.ResponseWriter, r *http.Request) {
@@ -590,7 +639,7 @@ func (s *Server) serveInject(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-	io.WriteString(w, text)
+	_, _ = io.WriteString(w, text) // response is already committed; no recovery path remains
 }
 
 func writeToolResult(w http.ResponseWriter, id json.RawMessage, text string, isErr bool) {

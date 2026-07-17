@@ -22,10 +22,10 @@ func Start(cmd *exec.Cmd) (*os.File, error) {
 	}
 	slave, err := os.OpenFile(slaveName, os.O_RDWR, 0)
 	if err != nil {
-		ptmx.Close()
+		_ = ptmx.Close()
 		return nil, err
 	}
-	defer slave.Close()
+	defer func() { _ = slave.Close() }()
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = slave, slave, slave
 	if cmd.SysProcAttr == nil {
 		cmd.SysProcAttr = &syscall.SysProcAttr{}
@@ -33,7 +33,7 @@ func Start(cmd *exec.Cmd) (*os.File, error) {
 	cmd.SysProcAttr.Setsid = true
 	cmd.SysProcAttr.Setctty = true // Ctty 缺省 0 = 子进程的 stdin(即 slave)
 	if err := cmd.Start(); err != nil {
-		ptmx.Close()
+		_ = ptmx.Close()
 		return nil, err
 	}
 	return ptmx, nil
@@ -42,10 +42,13 @@ func Start(cmd *exec.Cmd) (*os.File, error) {
 // KillGroup 杀掉 cmd 所在的整个进程组(Setsid 后子进程自成组;
 // shell 包装的命令只杀 shell 会留孤儿)。
 func KillGroup(cmd *exec.Cmd) {
-	if cmd.Process == nil {
+	// Cmd.Wait 会并发写 ProcessState,这里不能读取它。Process 与 Pid 在 Start
+	// 成功后保持不变；进程组已经消失时 kill(2) 返回 ESRCH,按清理语义忽略。
+	process := cmd.Process
+	if process == nil {
 		return
 	}
-	syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+	_ = syscall.Kill(-process.Pid, syscall.SIGKILL) // KillGroup is deliberately best-effort
 }
 
 // ioctl 是平台文件里三步握手的公共出口。

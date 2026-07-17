@@ -71,7 +71,7 @@ func scanJSTS(src []byte) []Symbol {
 			} else if c == '/' && i+1 < n && src[i+1] == '*' {
 				// 多行注释。
 				i += 2
-				for i+1 < n && !(src[i] == '*' && src[i+1] == '/') {
+				for i+1 < n && (src[i] != '*' || src[i+1] != '/') {
 					i++
 				}
 				i += 2
@@ -395,7 +395,7 @@ func computeHashes(syms []Symbol) []Symbol {
 		norm := normalizeJS(s.Body)
 		// StructHash:自身名换占位符(改名免疫)。对 method,名是 "Class.method",
 		// 换最后一段;对 func/type,换整个名。近似:把 body 里的名字做字符串替换。
-		structNorm := norm
+		var structNorm []byte
 		if dot := strings.LastIndex(s.Name, "."); dot >= 0 {
 			structNorm = bytes.ReplaceAll(norm, []byte(s.Name[dot+1:]), []byte("_$SELF$_"))
 		} else {
@@ -425,7 +425,7 @@ func normalizeJS(src []byte) []byte {
 		}
 		if c == '/' && i+1 < n && src[i+1] == '*' {
 			i += 2
-			for i+1 < n && !(src[i] == '*' && src[i+1] == '/') {
+			for i+1 < n && (src[i] != '*' || src[i+1] != '/') {
 				i++
 			}
 			i += 2
@@ -494,7 +494,7 @@ func findOpenBrace(src []byte, i, n int) int {
 				}
 			} else {
 				i += 2
-				for i+1 < n && !(src[i] == '*' && src[i+1] == '/') {
+				for i+1 < n && (src[i] != '*' || src[i+1] != '/') {
 					i++
 				}
 				i += 2
@@ -529,7 +529,7 @@ func matchBrace(src []byte, open, n int) int {
 				}
 			} else {
 				i += 2
-				for i+1 < n && !(src[i] == '*' && src[i+1] == '/') {
+				for i+1 < n && (src[i] != '*' || src[i+1] != '/') {
 					i++
 				}
 				i += 2

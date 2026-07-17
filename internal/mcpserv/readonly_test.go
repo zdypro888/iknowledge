@@ -17,8 +17,14 @@ func TestReadOnlyEndpoints(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		defer resp.Body.Close()
-		body, _ := io.ReadAll(resp.Body)
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			_ = resp.Body.Close()
+			t.Fatal(err)
+		}
+		if err := resp.Body.Close(); err != nil {
+			t.Fatal(err)
+		}
 		return resp.StatusCode, string(body)
 	}
 
@@ -39,7 +45,9 @@ func TestReadOnlyEndpoints(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	resp.Body.Close()
+	if err := resp.Body.Close(); err != nil {
+		t.Fatal(err)
+	}
 	if resp.StatusCode != http.StatusMethodNotAllowed {
 		t.Errorf("POST /recall 应 405,got %d", resp.StatusCode)
 	}

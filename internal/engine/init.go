@@ -109,8 +109,8 @@ type reconcile struct {
 	// fileHashByRel 解析期缓存的文件级锚定哈希(HashFileFor:插件自定义优先,
 	// 缺省符号级联;src 不驻留,故在解析现场算)。
 	fileHashByRel map[string]string
-	newByID   map[string]symRef
-	newStruct map[string][]string // StructHash → 未被 ID 命中的新符号 ID 列表
+	newByID       map[string]symRef
+	newStruct     map[string][]string // StructHash → 未被 ID 命中的新符号 ID 列表
 
 	// 结果:每个源文件的最终节点集(nil 值表示该分片应删除)。
 	out      map[string][]model.Node
@@ -154,16 +154,16 @@ func (e *Engine) initLocked(opts InitOptions) (*InitReport, error) {
 	rep := &InitReport{}
 	rc := &reconcile{
 		e: e, report: rep, now: e.now().UTC(),
-		oldShards: map[string]*loadedShard{},
-		oldByID:   map[string]*model.Node{},
-		oldStruct: map[string]int{},
+		oldShards:     map[string]*loadedShard{},
+		oldByID:       map[string]*model.Node{},
+		oldStruct:     map[string]int{},
 		symsByRel:     map[string][]parser.Symbol{},
 		fileHashByRel: map[string]string{},
-		newByID:   map[string]symRef{},
-		newStruct: map[string][]string{},
-		out:       map[string][]model.Node{},
-		skipRel:   map[string]bool{},
-		migrated:  map[string]bool{},
+		newByID:       map[string]symRef{},
+		newStruct:     map[string][]string{},
+		out:           map[string][]model.Node{},
+		skipRel:       map[string]bool{},
+		migrated:      map[string]bool{},
 	}
 
 	if err := rc.scanSources(cfg); err != nil {

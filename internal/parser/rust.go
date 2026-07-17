@@ -38,7 +38,7 @@ func (Rust) Parse(path string, src []byte) ([]Symbol, error) {
 func scanRust(src []byte) []Symbol {
 	var syms []Symbol
 	i, n := 0, len(src)
-	depth := 0 // {} 深度
+	depth := 0     // {} 深度
 	implType := "" // 当前 impl 块的类型名(depth=1 时)
 
 	skipWSRust := func() {
@@ -52,7 +52,7 @@ func scanRust(src []byte) []Symbol {
 				}
 			} else if c == '/' && i+1 < n && src[i+1] == '*' {
 				i += 2
-				for i+1 < n && !(src[i] == '*' && src[i+1] == '/') {
+				for i+1 < n && (src[i] != '*' || src[i+1] != '/') {
 					i++
 				}
 				i += 2

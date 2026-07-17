@@ -47,8 +47,8 @@ scout_timeout_seconds: 30
 		t.Fatal(err)
 	}
 	srv := &http.Server{Handler: mcpserv.New(e).Handler()}
-	go srv.Serve(ln)
-	t.Cleanup(func() { srv.Close() })
+	go func() { _ = srv.Serve(ln) }()
+	t.Cleanup(func() { _ = srv.Close() })
 	e.SetScoutAddr(fmt.Sprintf("127.0.0.1:%d", port))
 
 	out, err := e.Investigate(engine.InvestigateArgs{Question: "支付回调偶发超时的原因在哪"}, "sid-self", "claude-code")
@@ -117,8 +117,12 @@ func TestScoutHelperProcess(t *testing.T) {
 		t.Fatal(err)
 	}
 	sid := resp.Header.Get("Mcp-Session-Id")
-	io.Copy(io.Discard, resp.Body)
-	resp.Body.Close()
+	if _, err := io.Copy(io.Discard, resp.Body); err != nil {
+		t.Fatal(err)
+	}
+	if err := resp.Body.Close(); err != nil {
+		t.Fatal(err)
+	}
 
 	call := fmt.Sprintf(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"kb_submit_findings","arguments":{"job":%q,"conclusion":"回调超时来自网关重试风暴","locations":["internal/auth/login.go#Login"],"plan":"给回调处理加幂等键","risks":"重试窗口内的重复入账"}}}`, job)
 	resp, err = post(sid, call)
@@ -126,8 +130,12 @@ func TestScoutHelperProcess(t *testing.T) {
 		t.Fatal(err)
 	}
 	var buf bytes.Buffer
-	io.Copy(&buf, resp.Body)
-	resp.Body.Close()
+	if _, err := io.Copy(&buf, resp.Body); err != nil {
+		t.Fatal(err)
+	}
+	if err := resp.Body.Close(); err != nil {
+		t.Fatal(err)
+	}
 	if !strings.Contains(buf.String(), "ack") {
 		t.Fatalf("交卷失败:%s", buf.String())
 	}

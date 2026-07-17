@@ -171,8 +171,8 @@ func (s *Store) AppendFindings(f model.Findings) error {
 	if err != nil {
 		return err
 	}
-	defer fh.Close()
 	if _, err := fh.Write(append(line, '\n')); err != nil {
+		_ = fh.Close()
 		return err
 	}
 	return fh.Close()
@@ -199,9 +199,11 @@ func (s *Store) DismissDebt(id string) error {
 	if err != nil {
 		return err
 	}
-	defer f.Close()
-	_, err = f.WriteString(id + "\n")
-	return err
+	if _, err := f.WriteString(id + "\n"); err != nil {
+		_ = f.Close()
+		return err
+	}
+	return f.Close()
 }
 
 // LoadDismissedDebts 读已消解欠账 ID 集合。
@@ -224,19 +226,21 @@ func (s *Store) LoadDismissedDebts() (map[string]bool, error) {
 
 // ---- 使用日志(impl §7.6,local 本地态) ----
 
-// UsageRecord 是一次 tools/call 的日志行。
+// UsageRecord 是一次 MCP tools/call 或本地观测命令的日志行。
 type UsageRecord struct {
 	At      string `json:"at"`
 	Session string `json:"session,omitempty"`
 	Tool    string `json:"tool"`
 	// Source 调用来源:空=MCP 工具调用;"http"=子代理只读腿(统计口径区分,
 	// 数据裁决时能看出只读腿的实际使用量)。
-	Source string `json:"source,omitempty"`
+	Source    string `json:"source,omitempty"`
 	OK        bool   `json:"ok"`
 	ErrCode   string `json:"errCode,omitempty"`
 	Hit       bool   `json:"hit,omitempty"`       // recall/map 是否命中
 	HitStatus string `json:"hitStatus,omitempty"` // 命中节点状态(undigested 命中率数据源)
 	Stale     bool   `json:"stale,omitempty"`     // recall 读取时对账发现失配(未记账变更事件)
+	Warnings  int    `json:"warnings,omitempty"`  // precheck 实际发现的告警总数
+	Blocked   bool   `json:"blocked,omitempty"`   // strict precheck 是否据此拒绝提交
 	MS        int64  `json:"ms"`
 }
 
@@ -254,8 +258,8 @@ func (s *Store) AppendUsage(month string, rec UsageRecord) {
 	if err != nil {
 		return
 	}
-	defer fh.Close()
-	fh.Write(append(line, '\n'))
+	_, _ = fh.Write(append(line, '\n')) // usage telemetry is explicitly best-effort
+	_ = fh.Close()
 }
 
 // LoadUsage 读全部使用日志(kb_status 汇总用)。

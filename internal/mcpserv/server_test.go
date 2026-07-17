@@ -4,12 +4,14 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/zdypro888/iknowledge/internal/engine"
 	"github.com/zdypro888/iknowledge/internal/store"
@@ -65,9 +67,14 @@ func call(t *testing.T, url, sid, method string, params any) (*rpcOut, *http.Res
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer resp.Body.Close()
 	var out rpcOut
-	_ = json.NewDecoder(resp.Body).Decode(&out)
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		_ = resp.Body.Close()
+		t.Fatal(err)
+	}
+	if err := resp.Body.Close(); err != nil {
+		t.Fatal(err)
+	}
 	return &out, resp
 }
 
@@ -89,13 +96,19 @@ func initialize(t *testing.T, url string) string {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer resp.Body.Close()
 	sid := resp.Header.Get("Mcp-Session-Id")
 	if sid == "" {
+		_ = resp.Body.Close()
 		t.Fatal("initialize 未返回 Mcp-Session-Id 头")
 	}
 	var out rpcOut
-	_ = json.NewDecoder(resp.Body).Decode(&out)
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		_ = resp.Body.Close()
+		t.Fatal(err)
+	}
+	if err := resp.Body.Close(); err != nil {
+		t.Fatal(err)
+	}
 	if out.Result["protocolVersion"] != "2025-06-18" {
 		t.Fatalf("protocolVersion 错:%+v", out.Result)
 	}
@@ -104,6 +117,10 @@ func initialize(t *testing.T, url string) string {
 	}
 	if _, ok := out.Result["repoRoot"]; !ok {
 		t.Error("initialize 缺 repoRoot(连错仓库防护)")
+	}
+	serverInfo, ok := out.Result["serverInfo"].(map[string]any)
+	if !ok || serverInfo["version"] != serverVersion() {
+		t.Errorf("serverInfo.version 未取构建元数据:%+v", out.Result["serverInfo"])
 	}
 	return sid
 }
@@ -125,7 +142,9 @@ func TestProtocolBasics(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		resp.Body.Close()
+		if err := resp.Body.Close(); err != nil {
+			t.Fatal(err)
+		}
 		if resp.StatusCode != http.StatusAccepted {
 			t.Errorf("通知应 202,got %d", resp.StatusCode)
 		}
@@ -137,7 +156,9 @@ func TestProtocolBasics(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		resp.Body.Close()
+		if err := resp.Body.Close(); err != nil {
+			t.Fatal(err)
+		}
 		if resp.StatusCode != http.StatusNotFound {
 			t.Errorf("未知会话应 404(客户端据此自动重连),got %d", resp.StatusCode)
 		}
@@ -156,7 +177,9 @@ func TestProtocolBasics(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		resp.Body.Close()
+		if err := resp.Body.Close(); err != nil {
+			t.Fatal(err)
+		}
 		if resp.StatusCode != http.StatusPermanentRedirect {
 			t.Errorf("/mcp 应 308,got %d", resp.StatusCode)
 		}
@@ -170,6 +193,85 @@ func TestProtocolBasics(t *testing.T) {
 			t.Errorf("未知方法应 -32601:%+v", out.Error)
 		}
 	})
+}
+
+func TestInvalidJSONRPCGetsProtocolError(t *testing.T) {
+	ts, _ := newTestServer(t)
+	endpoint := ts.URL + "/mcp/main"
+	cases := []struct {
+		name string
+		body string
+		code int
+	}{
+		{"syntax", "{broken", -32700},
+		{"empty-object", `{}`, -32600},
+		{"null", `null`, -32600},
+		{"array", `[]`, -32600},
+		{"wrong-version", `{"jsonrpc":"1.0","id":1,"method":"ping"}`, -32600},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			resp, err := http.Post(endpoint, "application/json", strings.NewReader(tc.body))
+			if err != nil {
+				t.Fatal(err)
+			}
+			var out rpcOut
+			if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+				_ = resp.Body.Close()
+				t.Fatal(err)
+			}
+			if err := resp.Body.Close(); err != nil {
+				t.Fatal(err)
+			}
+			if out.Error == nil || out.Error.Code != tc.code {
+				t.Fatalf("协议错误=%+v,want %d", out.Error, tc.code)
+			}
+		})
+	}
+
+	resp, err := http.Post(endpoint, "application/json", strings.NewReader(`{"jsonrpc":"2.0","id":null,"method":"ping"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var raw map[string]json.RawMessage
+	if err := json.NewDecoder(resp.Body).Decode(&raw); err != nil {
+		_ = resp.Body.Close()
+		t.Fatal(err)
+	}
+	if err := resp.Body.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if id, ok := raw["id"]; !ok || string(id) != "null" {
+		t.Fatalf("id:null 请求未返回响应:%s", id)
+	}
+}
+
+func TestRPCBodyLimitRejectsInsteadOfTruncating(t *testing.T) {
+	ts, _ := newTestServer(t)
+	body := `{"jsonrpc":"2.0","id":1,"method":"ping"}` + strings.Repeat(" ", maxRPCBodyBytes)
+	resp, err := http.Post(ts.URL+"/mcp/main", "application/json", strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := resp.Body.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if resp.StatusCode != http.StatusRequestEntityTooLarge {
+		t.Fatalf("超限请求状态=%d,want 413", resp.StatusCode)
+	}
+}
+
+func TestExpiredSessionIsReapedOnAccess(t *testing.T) {
+	srv := New(nil)
+	srv.sessions["expired"] = &session{author: "old", lastSeen: time.Now().Add(-sessionTTL - time.Minute)}
+	if srv.sessionExists("expired") {
+		t.Fatal("过期 session 不应继续有效")
+	}
+	srv.mu.Lock()
+	defer srv.mu.Unlock()
+	if len(srv.sessions) != 0 {
+		t.Fatalf("过期 session 未机会性回收:%v", srv.sessions)
+	}
 }
 
 func TestWrongRepoGuard(t *testing.T) {
@@ -304,11 +406,16 @@ func TestFullAgentLoop(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	body := make([]byte, 8192)
-	n, _ := resp.Body.Read(body)
-	resp.Body.Close()
-	if resp.StatusCode != 200 || !strings.Contains(string(body[:n]), "不要在调用方加密") {
-		t.Fatalf("inject: %d %s", resp.StatusCode, body[:n])
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		_ = resp.Body.Close()
+		t.Fatal(err)
+	}
+	if err := resp.Body.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if resp.StatusCode != 200 || !strings.Contains(string(body), "不要在调用方加密") {
+		t.Fatalf("inject: %d %s", resp.StatusCode, body)
 	}
 }
 
@@ -338,9 +445,14 @@ func TestInvalidJSON(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer resp.Body.Close()
 	var out rpcOut
-	_ = json.NewDecoder(resp.Body).Decode(&out)
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		_ = resp.Body.Close()
+		t.Fatal(err)
+	}
+	if err := resp.Body.Close(); err != nil {
+		t.Fatal(err)
+	}
 	if out.Error == nil || out.Error.Code != -32700 {
 		t.Errorf("坏 JSON 应 -32700:%+v", out.Error)
 	}

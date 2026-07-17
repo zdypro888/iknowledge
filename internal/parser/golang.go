@@ -79,7 +79,7 @@ func (Golang) Parse(path string, src []byte) ([]Symbol, error) {
 func FileHash(syms []Symbol) string {
 	h := sha256.New()
 	for _, s := range syms {
-		fmt.Fprintf(h, "%s\n", s.Hash)
+		_, _ = fmt.Fprintf(h, "%s\n", s.Hash) // hash.Hash writes never return an error
 	}
 	return "sha256:" + hex.EncodeToString(h.Sum(nil))
 }
