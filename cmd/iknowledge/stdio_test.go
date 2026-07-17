@@ -127,6 +127,25 @@ func TestServeCommandArgs(t *testing.T) {
 	}
 }
 
+// TestServeUpAvoidsExpensiveStatus 回归:完整 /status 在大仓会超过 800ms,
+// 就绪探针必须走不触发状态统计的 MCP method gate。
+func TestServeUpAvoidsExpensiveStatus(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/status":
+			w.WriteHeader(http.StatusServiceUnavailable)
+		case "/mcp/main":
+			w.WriteHeader(http.StatusMethodNotAllowed)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer ts.Close()
+	if !serveUp(ts.URL, "") {
+		t.Fatal("应通过轻量 /mcp/main method gate 判定服务就绪")
+	}
+}
+
 func TestServeUpDoesNotLeakTokenToUnauthenticatedPort(t *testing.T) {
 	token := strings.Repeat("a", 64)
 	gotAuthorization := ""
@@ -150,7 +169,7 @@ func TestServeUpDoesNotLeakTokenToUnauthenticatedPort(t *testing.T) {
 	redirectAuth := ""
 	redirector := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		redirectAuth = r.Header.Get("Authorization")
-		http.Redirect(w, r, real.URL+"/status", http.StatusTemporaryRedirect)
+		http.Redirect(w, r, real.URL+"/mcp/main", http.StatusTemporaryRedirect)
 	}))
 	defer redirector.Close()
 	up := serveUp(redirector.URL, token)

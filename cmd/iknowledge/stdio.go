@@ -111,7 +111,10 @@ func serveUp(base, token string) bool {
 		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
 	}
 	request := func(auth, challenge string) (*http.Response, error) {
-		req, err := http.NewRequest(http.MethodGet, base+"/status", nil)
+		// /status 会实时计算完整知识健康报告,大仓可超过探针的 800ms 超时。
+		// GET /mcp/main 在鉴权后立即返回 405,既经过同一安全中间件,又不触发
+		// 状态统计或任何业务读写,适合作为常数时间的进程就绪探针。
+		req, err := http.NewRequest(http.MethodGet, base+"/mcp/main", nil)
 		if err != nil {
 			return nil, err
 		}
@@ -141,7 +144,7 @@ func serveUp(base, token string) bool {
 		return false
 	}
 	if token == "" {
-		return probe.StatusCode == http.StatusOK
+		return probe.StatusCode == http.StatusMethodNotAllowed
 	}
 	want := mcpserv.AuthFingerprint(token)
 	if probe.StatusCode != http.StatusUnauthorized {
@@ -157,7 +160,7 @@ func serveUp(base, token string) bool {
 	if err != nil {
 		return false
 	}
-	ok := resp.StatusCode == http.StatusOK && resp.Header.Get(mcpserv.AuthFingerprintHeader) == want
+	ok := resp.StatusCode == http.StatusMethodNotAllowed && resp.Header.Get(mcpserv.AuthFingerprintHeader) == want
 	return discardAndClose(resp) && ok
 }
 
