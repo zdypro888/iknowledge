@@ -45,7 +45,7 @@ for candidate in /usr/local/bin/iknowledge /usr/local/bin/iknowledge.exe \
 done
 rm -f "$installed_bin"
 
-echo "==> 移除用户私有 auth/scout 状态"
+echo "==> 移除用户私有 auth/scout/semantic 状态"
 if [ -n "${IKNOWLEDGE_STATE_HOME:-}" ]; then
 	state_dir="$IKNOWLEDGE_STATE_HOME"
 elif [ "$platform" = "windows" ]; then
@@ -63,12 +63,20 @@ case "$state_dir" in
 	/*|[A-Za-z]:[\\/]*) ;;
 	*) echo "错误: 状态目录必须是绝对路径，拒绝删除 $state_dir" >&2; exit 1 ;;
 esac
-# override 目录可能还承载调用方自己的文件。逐仓只删 auth/scout；若发现崩溃
+# override 目录可能还承载调用方自己的文件。逐仓只删本工具的 auth/scout/semantic；若发现崩溃
 # 恢复 WAL 必须保留，避免“先 taskkill、再卸载”把半事务的唯一恢复依据抹掉。
-if [ -d "$state_dir/repos" ]; then
+if [ -L "$state_dir" ]; then
+	echo "警告: 状态根目录是符号链接，已拒绝跟随并跳过: $state_dir" >&2
+elif [ -L "$state_dir/repos" ]; then
+	echo "警告: 状态 repos 是符号链接，已拒绝跟随并跳过: $state_dir/repos" >&2
+elif [ -d "$state_dir/repos" ]; then
 	for repo_state in "$state_dir"/repos/*; do
+		if [ -L "$repo_state" ]; then
+			echo "警告: 仓库状态是符号链接，已拒绝跟随并跳过: $repo_state" >&2
+			continue
+		fi
 		[ -d "$repo_state" ] || continue
-		rm -f "$repo_state/auth-token" "$repo_state/local-identity" "$repo_state/scout-trust-v1"
+		rm -f "$repo_state/auth-token" "$repo_state/local-identity" "$repo_state/scout-trust-v1" "$repo_state/semantic-config-v1.json"
 		if [ -e "$repo_state/transaction-v1.json" ] || [ -e "$repo_state/transaction-v1.commit" ]; then
 			echo "   保留待恢复事务状态: $repo_state"
 			continue

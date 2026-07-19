@@ -316,3 +316,46 @@ func TestPrivateStateDoesNotChmodTrustedRoot(t *testing.T) {
 		t.Fatalf("不得擅自 chmod 用户选择的根: mode=%o", info.Mode().Perm())
 	}
 }
+
+func TestSemanticConfigLivesOutsideRepository(t *testing.T) {
+	stateHome := t.TempDir()
+	t.Setenv(stateHomeEnv, stateHome)
+	s := newStore(t)
+	data := []byte("{\"enabled\":true,\"endpoint\":\"http://127.0.0.1:11434/v1\"}\n")
+	if err := s.WriteSemanticConfig(data); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.LoadSemanticConfig()
+	if err != nil || string(got) != string(data) {
+		t.Fatalf("semantic 配置往返失败: %q/%v", got, err)
+	}
+	large := []byte(strings.Repeat("x", 8<<10))
+	if err := s.WriteSemanticConfig(large); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := s.LoadSemanticConfig(); err != nil || string(got) != string(large) {
+		t.Fatalf("超过通用私有态 4KiB 的 semantic 配置应按专用上限往返: len=%d err=%v", len(got), err)
+	}
+	path, err := s.SemanticConfigFile()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.HasPrefix(filepath.Clean(path), filepath.Clean(s.Dir())+string(filepath.Separator)) {
+		t.Fatalf("semantic provider 配置不得进入仓库: %s", path)
+	}
+	if runtime.GOOS != "windows" {
+		info, err := os.Stat(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if info.Mode().Perm() != 0o600 {
+			t.Fatalf("semantic 配置权限=%o, want 600", info.Mode().Perm())
+		}
+	}
+	if err := s.RemoveSemanticConfig(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.LoadSemanticConfig(); !os.IsNotExist(err) {
+		t.Fatalf("删除后仍可读取 semantic 配置: %v", err)
+	}
+}

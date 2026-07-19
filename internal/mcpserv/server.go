@@ -3,6 +3,7 @@
 package mcpserv
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
@@ -438,7 +439,7 @@ func (s *Server) serveRPC(w http.ResponseWriter, r *http.Request, role string) {
 	case "tools/list":
 		writeRPCResult(w, req.ID, map[string]any{"tools": toolDefs(role)})
 	case "tools/call":
-		s.handleToolCall(w, req, role, sid)
+		s.handleToolCall(r.Context(), w, req, role, sid)
 	default:
 		writeRPCError(w, req.ID, -32601, "method not found: "+req.Method)
 	}
@@ -512,7 +513,7 @@ func (s *Server) author(sid string) string {
 }
 
 // handleToolCall 分发 + 使用日志(impl §7.6)。
-func (s *Server) handleToolCall(w http.ResponseWriter, req rpcRequest, role, sid string) {
+func (s *Server) handleToolCall(ctx context.Context, w http.ResponseWriter, req rpcRequest, role, sid string) {
 	var p struct {
 		Name      string          `json:"name"`
 		Arguments json.RawMessage `json:"arguments"`
@@ -527,7 +528,7 @@ func (s *Server) handleToolCall(w http.ResponseWriter, req rpcRequest, role, sid
 	}
 
 	start := time.Now()
-	text, meta, err := s.dispatch(p.Name, p.Arguments, sid)
+	text, meta, err := s.dispatch(ctx, p.Name, p.Arguments, sid)
 	rec := engine.UsageRecord{
 		At: time.Now().UTC().Format(time.RFC3339), Session: sid, Tool: p.Name,
 		OK: err == nil, Hit: meta.Hit, HitStatus: meta.HitStatus, Stale: meta.Stale,
@@ -552,7 +553,7 @@ func (s *Server) handleToolCall(w http.ResponseWriter, req rpcRequest, role, sid
 func monthNow() string { return time.Now().UTC().Format("2006-01") }
 
 // dispatch 把工具名路由到 engine;author 由会话推导(不接受 AI 自报,impl §7.1)。
-func (s *Server) dispatch(name string, args json.RawMessage, sid string) (string, engine.ReadMeta, error) {
+func (s *Server) dispatch(ctx context.Context, name string, args json.RawMessage, sid string) (string, engine.ReadMeta, error) {
 	author := s.author(sid)
 	var meta engine.ReadMeta
 	un := func(v any) error {
@@ -601,7 +602,7 @@ func (s *Server) dispatch(name string, args json.RawMessage, sid string) (string
 		if err := un(&a); err != nil {
 			return "", meta, kbInvalid(err)
 		}
-		text, m, err := s.E.Recall(engine.RecallArgs{Query: a.Query, Mode: a.Mode, Limit: a.Limit, Before: a.Before}, sid)
+		text, m, err := s.E.RecallContext(ctx, engine.RecallArgs{Query: a.Query, Mode: a.Mode, Limit: a.Limit, Before: a.Before}, sid)
 		return text, m, err
 
 	case "kb_diagnose":
@@ -725,11 +726,11 @@ func (s *Server) serveRecall(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	limit, _ := strconv.Atoi(q.Get("limit"))
-	if limit <= 0 || limit > 200 {
-		limit = 200 // R29-E7.5:钳制,防 ?limit=999999999 拖累
+	if limit > 100 {
+		limit = 100 // 上限与 Engine 一致；缺失/非法/<=0 保持 0，由 Engine 使用默认 5
 	}
 	started := time.Now()
-	out, meta, err := s.E.Recall(engine.RecallArgs{
+	out, meta, err := s.E.RecallContext(r.Context(), engine.RecallArgs{
 		Query: q.Get("q"), Mode: q.Get("mode"), Limit: limit, Before: q.Get("before"),
 	}, q.Get("session"))
 	s.logReadOnly("kb_recall", q.Get("session"), meta, err, started)

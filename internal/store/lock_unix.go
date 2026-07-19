@@ -40,3 +40,27 @@ func (s *Store) AcquireWriterLock() (release func(), err error) {
 		})
 	}, nil
 }
+
+// AcquireSemanticLock 串行跨进程 semantic rebuild/clear；它与 serve writer
+// lock 独立，因此运行中的服务不阻止显式重建。
+func (s *Store) AcquireSemanticLock() (release func(), err error) {
+	path := filepath.Join(s.dir, "local", ".semantic.lock")
+	f, err := s.openKnowledgeFile(path, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return nil, fmt.Errorf("store: 开 semantic 锁文件: %w", err)
+	}
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		f.Close()
+		if errors.Is(err, syscall.EWOULDBLOCK) || errors.Is(err, syscall.EAGAIN) {
+			return nil, ErrSemanticLocked
+		}
+		return nil, fmt.Errorf("store: semantic flock: %w", err)
+	}
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+			_ = f.Close()
+		})
+	}, nil
+}

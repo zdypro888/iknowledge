@@ -28,6 +28,9 @@ type Engine struct {
 	scoutAddr string
 	// rt 是 serve 期的内存态(缓存/索引/台账/作业),见 runtime.go。
 	rt runtime
+	// semantic 是可删除重建的向量派生态，使用独立小锁；网络 embedding 与
+	// 大文件解码绝不占用 rt.mu。
+	semantic semanticRuntime
 	// afterImportTruthWrite 仅供崩溃恢复测试在某次真相 rename 后模拟进程猝死。
 	// 生产构造永为 nil；普通 error 不走此钩子，仍在当次调用内主动 rollback。
 	afterImportTruthWrite func(string) error

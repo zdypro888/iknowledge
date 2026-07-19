@@ -8,6 +8,7 @@ package store
 import (
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -23,6 +24,9 @@ const KnowledgeDir = ".knowledge"
 // 知识库允许仓库根本身经 symlink 打开，但从 .knowledge 起一律不跟随链接：
 // 否则恶意仓库可把 tree/local/journal 指到仓外，突破“只写 .knowledge”边界。
 var ErrSymlinkPath = errors.New("knowledge 路径包含符号链接")
+
+// ErrSemanticLocked 表示另一个进程正在提交/清理同仓语义派生 generation。
+var ErrSemanticLocked = errors.New("semantic rebuild/clear 正在运行，请稍后重试")
 
 // Store 是一个仓库的 .knowledge/ 存取器。
 type Store struct {
@@ -112,6 +116,24 @@ func (s *Store) WritePrivateKnowledgeFile(rel string, data []byte) error {
 	return s.atomicWriteMode(target, data, 0o600)
 }
 
+// WritePrivateKnowledgeFileStream 与 WritePrivateKnowledgeFile 采用相同的
+// temp+fsync+rename 原子提交和 0600 权限，但让调用方直接向临时文件流式编码。
+// 大型派生缓存不能先拼成完整 []byte，否则重建时会额外占用一整份内存。
+func (s *Store) WritePrivateKnowledgeFileStream(rel string, write func(io.Writer) error) error {
+	return s.WritePrivateKnowledgeFileStreamChecked(rel, write, nil)
+}
+
+// WritePrivateKnowledgeFileStreamChecked 与流式写相同，但在临时文件已完整
+// fsync、尚未替换旧文件时执行 beforeCommit。校验失败会删除临时文件并保留
+// 旧 generation，供需要乐观 source/settings 校验的派生缓存使用。
+func (s *Store) WritePrivateKnowledgeFileStreamChecked(rel string, write func(io.Writer) error, beforeCommit func() error) error {
+	target, err := s.knowledgePath(rel)
+	if err != nil {
+		return err
+	}
+	return s.atomicWriteStreamModeChecked(target, 0o600, write, beforeCommit)
+}
+
 // ReadKnowledgeFile 安全读取 .knowledge 内的相对路径；与写入口共用同一套
 // 词法边界和 symlink 拒绝规则，供本地信任凭据等小文件使用。
 func (s *Store) ReadKnowledgeFile(rel string) ([]byte, error) {
@@ -120,6 +142,37 @@ func (s *Store) ReadKnowledgeFile(rel string) ([]byte, error) {
 		return nil, err
 	}
 	return s.readKnowledgeFile(target)
+}
+
+// OpenKnowledgeFileRead 安全打开 .knowledge 内的普通文件供有界流式解码。
+// 调用方负责 Close；解析前仍应自行设置文件大小与记录数量上限。
+func (s *Store) OpenKnowledgeFileRead(rel string) (*os.File, error) {
+	target, err := s.knowledgePath(rel)
+	if err != nil {
+		return nil, err
+	}
+	if err := s.checkKnowledgePath(target); err != nil {
+		return nil, err
+	}
+	f, err := os.Open(target)
+	if err != nil {
+		return nil, err
+	}
+	info, statErr := f.Stat()
+	if statErr != nil {
+		_ = f.Close()
+		return nil, statErr
+	}
+	if !info.Mode().IsRegular() {
+		_ = f.Close()
+		return nil, fmt.Errorf("store: knowledge 目标必须是普通文件: %s", target)
+	}
+	// 打开后再检查一次父链，缩小校验与打开之间被替换的竞态窗口。
+	if err := s.checkKnowledgePath(target); err != nil {
+		_ = f.Close()
+		return nil, err
+	}
+	return f, nil
 }
 
 // CreateKnowledgeFile 安全创建/截断 .knowledge 内文件，供需要流式写入的
@@ -292,8 +345,22 @@ func (s *Store) atomicWrite(path string, data []byte) error {
 }
 
 func (s *Store) atomicWriteMode(path string, data []byte, perm os.FileMode) error {
+	return s.atomicWriteStreamMode(path, perm, func(w io.Writer) error {
+		_, err := w.Write(data)
+		return err
+	})
+}
+
+func (s *Store) atomicWriteStreamMode(path string, perm os.FileMode, write func(io.Writer) error) error {
+	return s.atomicWriteStreamModeChecked(path, perm, write, nil)
+}
+
+func (s *Store) atomicWriteStreamModeChecked(path string, perm os.FileMode, write func(io.Writer) error, beforeCommit func() error) error {
 	if path == "" {
 		return fmt.Errorf("store: 拒绝写空路径(疑似不安全的节点 ID/文件路径,铁律二)")
+	}
+	if write == nil {
+		return fmt.Errorf("store: 拒绝空的流式写入函数")
 	}
 	dir := filepath.Dir(path)
 	if err := s.ensureKnowledgeDir(dir, 0o755); err != nil {
@@ -307,7 +374,7 @@ func (s *Store) atomicWriteMode(path string, data []byte, perm os.FileMode) erro
 		return fmt.Errorf("store: 建临时文件: %w", err)
 	}
 	tmpName := tmp.Name()
-	if _, err := tmp.Write(data); err != nil {
+	if err := write(tmp); err != nil {
 		tmp.Close()
 		os.Remove(tmpName)
 		return fmt.Errorf("store: 写临时文件: %w", err)
@@ -335,6 +402,22 @@ func (s *Store) atomicWriteMode(path string, data []byte, perm os.FileMode) erro
 	if err := s.checkKnowledgePath(path); err != nil {
 		os.Remove(tmpName)
 		return err
+	}
+	if beforeCommit != nil {
+		if err := beforeCommit(); err != nil {
+			os.Remove(tmpName)
+			return fmt.Errorf("store: 提交前校验: %w", err)
+		}
+		// callback 可执行较长的 generation 对账；其间父链可能被替换，
+		// rename 紧前必须重做 confinement/symlink 校验。
+		if err := s.checkKnowledgePath(dir); err != nil {
+			os.Remove(tmpName)
+			return err
+		}
+		if err := s.checkKnowledgePath(path); err != nil {
+			os.Remove(tmpName)
+			return err
+		}
 	}
 	if err := os.Rename(tmpName, path); err != nil {
 		os.Remove(tmpName)

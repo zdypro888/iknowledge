@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"context"
 	"fmt"
 	"path"
 	"path/filepath"
@@ -11,6 +12,7 @@ import (
 	"github.com/zdypro888/iknowledge/internal/index"
 	"github.com/zdypro888/iknowledge/internal/model"
 	"github.com/zdypro888/iknowledge/internal/parser"
+	"github.com/zdypro888/iknowledge/internal/vector"
 )
 
 // KBError 是业务拒绝(impl §7.4):工具结果 isError:true,
@@ -678,39 +680,56 @@ type RecallArgs struct {
 	Before string // history 翻页
 }
 
-// Recall 查知识(impl §7.3 全行为)。
+// Recall 查知识(impl §7.3 全行为)。非 HTTP 调用沿用背景 context；服务端应调用
+// RecallContext，把客户端取消与请求截止时间传到可能发生的语义查询。
 func (e *Engine) Recall(a RecallArgs, sid string) (string, ReadMeta, error) {
+	return e.RecallContext(context.Background(), a, sid)
+}
+
+// RecallContext 是带取消语义的 recall 入口。
+func (e *Engine) RecallContext(ctx context.Context, a RecallArgs, sid string) (string, ReadMeta, error) {
+	if ctx == nil {
+		return "", ReadMeta{}, fmt.Errorf("recall: nil context")
+	}
+	if err := ctx.Err(); err != nil {
+		return "", ReadMeta{}, err
+	}
 	if err := e.requireInit(); err != nil {
 		return "", ReadMeta{}, err
 	}
 	if err := e.Sync(); err != nil {
 		return "", ReadMeta{}, err
 	}
-	// R29 批次2:Recall 改用读锁——reconcileOnReadLocked 状态对账已搬进
-	// reconcileAllLocked(reloadLocked 内,写锁),recordRead 走 sessionMu 独立锁,
-	// recallNodeLocked 其余全是纯读。多会话 recall 可并发。
-	e.rt.mu.RLock()
-	defer e.rt.mu.RUnlock()
-
 	if a.Mode == "" {
 		a.Mode = "usage"
 	}
 	if a.Limit <= 0 {
 		a.Limit = 5
 	}
+	if a.Limit > 100 {
+		a.Limit = 100
+	}
+
+	// 精确解析与关键词候选只读当前 generation。语义 provider 调用必须在主
+	// runtime 锁外；拿到候选后再回锁校验当前 source hash 并渲染。
+	e.rt.mu.RLock()
 
 	// flow 模式且 query 直指流程 ID/标题;空 query 列出所有流程(#7)。
 	if a.Mode == "flow" {
 		if out, ok := e.flowView(a.Query); ok {
+			e.rt.mu.RUnlock()
 			return framed(out), ReadMeta{Hit: true}, nil
 		}
 		if strings.TrimSpace(a.Query) == "" {
-			return framed(e.listFlowsLocked()), ReadMeta{Hit: len(e.rt.flows) > 0}, nil
+			out, hit := e.listFlowsLocked(), len(e.rt.flows) > 0
+			e.rt.mu.RUnlock()
+			return framed(out), ReadMeta{Hit: hit}, nil
 		}
 	}
 
 	nodeID, candidates := e.resolveQueryLocked(a.Query)
 	if nodeID == "" && len(candidates) > 1 {
+		e.rt.mu.RUnlock()
 		return "", ReadMeta{}, kbErr("NODE_NOT_FOUND",
 			"符号 "+a.Query+" 有多个候选:"+strings.Join(candidates, "、"),
 			"按候选列表用完整节点 ID 重查")
@@ -720,42 +739,165 @@ func (e *Engine) Recall(a RecallArgs, sid string) (string, ReadMeta, error) {
 	if nodeID == "" {
 		if qf, _, _ := strings.Cut(strings.TrimSpace(a.Query), "#"); qf != "" {
 			if cerr := e.rt.cache.ConflictShard(qf); cerr != nil {
+				e.rt.mu.RUnlock()
 				return framed("该文件的知识分片有未解决的合并冲突或版本不兼容,知识暂不可用,请人工解决:" +
 					cerr.Error()), ReadMeta{Hit: false}, nil
 			}
 		}
 	}
 	if nodeID != "" {
-		return e.recallNodeLocked(nodeID, a, sid)
+		out, meta, err := e.recallNodeLocked(nodeID, a, sid)
+		e.rt.mu.RUnlock()
+		return out, meta, err
 	}
 
-	// 关键词倒排。
-	hits := e.rt.ix.Search(a.Query, a.Limit)
-	if len(hits) > 0 {
-		var b strings.Builder
-		fmt.Fprintf(&b, "关键词命中 %d 个节点:\n", len(hits))
-		var ids []string
-		for _, h := range hits {
-			ref := e.rt.ix.Node(h.NodeID)
-			fmt.Fprintf(&b, "- %s %s\n  ↳ 命中解释:score=%d(精确 token 权重 2,trigram 近似权重 1)\n",
-				h.NodeID, nodeLine(ref.Node), h.Score)
-			ids = append(ids, h.NodeID)
+	lexicalLimit := max(20, a.Limit*4)
+	if lexicalLimit > 100 {
+		lexicalLimit = 100
+	}
+	e.rt.mu.RUnlock()
+
+	semanticHits, semanticWarning := e.semanticCandidates(ctx, a.Query)
+	if err := ctx.Err(); err != nil {
+		return "", ReadMeta{}, err
+	}
+
+	e.rt.mu.RLock()
+	defer e.rt.mu.RUnlock()
+	// Provider 调用期间可能有 Remember/verify/init 发布了新 generation；关键词
+	// 候选便宜，回锁后按当前 index 重跑，绝不把旧 generation 的 rank 带进结果。
+	lexicalHits := e.rt.ix.Search(a.Query, lexicalLimit)
+	merged, validationWarning := e.mergeRecallCandidatesLocked(lexicalHits, semanticHits, a.Limit)
+	if validationWarning != "" {
+		if semanticWarning != "" {
+			semanticWarning += "; "
 		}
-		// 结构扩展一跳(检索三级递进第 2 级,knowledge.md §10.2):
-		// 沿调用边与流程引用带出关键词没匹配上、但结构相连的节点。
-		if nbs := e.structuralNeighborsLocked(ids, 5); len(nbs) > 0 {
-			b.WriteString("结构相邻(一跳,关键词未命中但与命中节点相连):\n")
-			for _, nb := range nbs {
-				fmt.Fprintf(&b, "- %s %s(%s)\n", nb.id, nodeLine(e.rt.ix.Node(nb.id).Node), nb.via)
-			}
-		}
-		b.WriteString("(用节点 ID 精确重查取快照/历史)")
-		b.WriteString(e.wipAttachment(ids))
-		return framed(b.String()), ReadMeta{Hit: true}, nil
+		semanticWarning += validationWarning
+	}
+	if len(merged) > 0 {
+		return e.renderRecallCandidatesLocked(merged, semanticWarning), ReadMeta{Hit: true}, nil
 	}
 
 	// miss 协议(impl §7.3 定案):零命中 → 符号模糊 + 最相关分支 map 摘要 + 回填义务。
-	return e.missProtocolLocked(a.Query), ReadMeta{Hit: false}, nil
+	return e.missProtocolWithSemanticWarningLocked(a.Query, semanticWarning), ReadMeta{Hit: false}, nil
+}
+
+const recallRRFK = 60
+
+type recallCandidate struct {
+	nodeID        string
+	lexicalRank   int
+	lexicalScore  int
+	semanticRank  int
+	semanticScore float32
+	fusedScore    float64
+}
+
+// mergeRecallCandidatesLocked 将两种不可直接比较的分数按分池 rank 做 RRF。
+// semantic 同一节点可有多个摘要记录，只取该节点的首个（最佳）rank。
+func (e *Engine) mergeRecallCandidatesLocked(lexical []index.Hit, semanticHits []vector.Hit, limit int) ([]recallCandidate, string) {
+	byNode := make(map[string]*recallCandidate, len(lexical)+len(semanticHits))
+	for i, hit := range lexical {
+		if e.rt.ix.Node(hit.NodeID) == nil {
+			continue
+		}
+		candidate := byNode[hit.NodeID]
+		if candidate == nil {
+			candidate = &recallCandidate{nodeID: hit.NodeID}
+			byNode[hit.NodeID] = candidate
+		}
+		candidate.lexicalRank = i + 1
+		candidate.lexicalScore = hit.Score
+		candidate.fusedScore += 1 / float64(recallRRFK+i+1)
+	}
+
+	manifest, sourceErr := e.semanticManifestLocked()
+	semanticRank := 0
+	seenSemanticNode := make(map[string]bool, len(semanticHits))
+	if sourceErr == nil {
+		for _, hit := range semanticHits {
+			record, current := manifest.records[hit.ID]
+			if !current || record.NodeID != hit.NodeID || record.SourceHash != hit.SourceHash ||
+				e.rt.ix.Node(hit.NodeID) == nil || seenSemanticNode[hit.NodeID] {
+				continue
+			}
+			seenSemanticNode[hit.NodeID] = true
+			semanticRank++
+			candidate := byNode[hit.NodeID]
+			if candidate == nil {
+				candidate = &recallCandidate{nodeID: hit.NodeID}
+				byNode[hit.NodeID] = candidate
+			}
+			candidate.semanticRank = semanticRank
+			candidate.semanticScore = hit.Score
+			candidate.fusedScore += 1 / float64(recallRRFK+semanticRank)
+		}
+	}
+
+	merged := make([]recallCandidate, 0, len(byNode))
+	for _, candidate := range byNode {
+		merged = append(merged, *candidate)
+	}
+	sort.Slice(merged, func(i, j int) bool {
+		if merged[i].fusedScore != merged[j].fusedScore {
+			return merged[i].fusedScore > merged[j].fusedScore
+		}
+		return merged[i].nodeID < merged[j].nodeID
+	})
+	if limit > 0 && len(merged) > limit {
+		merged = merged[:limit]
+	}
+	warning := ""
+	if sourceErr != nil && len(semanticHits) > 0 {
+		warning = sourceErr.Error()
+	}
+	return merged, warning
+}
+
+func (e *Engine) renderRecallCandidatesLocked(hits []recallCandidate, semanticWarning string) string {
+	var b strings.Builder
+	hybrid := false
+	for _, hit := range hits {
+		hybrid = hybrid || hit.semanticRank > 0
+	}
+	if hybrid {
+		fmt.Fprintf(&b, "关键词 + semantic 混合命中 %d 个节点(RRF):\n", len(hits))
+	} else {
+		fmt.Fprintf(&b, "关键词命中 %d 个节点:\n", len(hits))
+	}
+	ids := make([]string, 0, len(hits))
+	for _, hit := range hits {
+		ref := e.rt.ix.Node(hit.nodeID)
+		if ref == nil {
+			continue
+		}
+		fmt.Fprintf(&b, "- %s %s\n  ↳ 命中解释:", hit.nodeID, nodeLine(ref.Node))
+		if hit.lexicalRank > 0 {
+			fmt.Fprintf(&b, " keyword rank=%d score=%d", hit.lexicalRank, hit.lexicalScore)
+		}
+		if hit.semanticRank > 0 {
+			fmt.Fprintf(&b, " semantic rank=%d cosine=%.3f", hit.semanticRank, hit.semanticScore)
+		}
+		if hybrid {
+			fmt.Fprintf(&b, " RRF=%.6f", hit.fusedScore)
+		}
+		b.WriteString("\n")
+		ids = append(ids, hit.nodeID)
+	}
+	if nbs := e.structuralNeighborsLocked(ids, 5); len(nbs) > 0 {
+		b.WriteString("结构相邻(一跳,与命中节点相连):\n")
+		for _, nb := range nbs {
+			if ref := e.rt.ix.Node(nb.id); ref != nil {
+				fmt.Fprintf(&b, "- %s %s(%s)\n", nb.id, nodeLine(ref.Node), nb.via)
+			}
+		}
+	}
+	if semanticWarning != "" {
+		fmt.Fprintf(&b, "⚠ semantic 已降级: %s；已继续使用关键词/结构检索。\n", semanticWarning)
+	}
+	b.WriteString("(用节点 ID 精确重查取快照/历史)")
+	b.WriteString(e.wipAttachment(ids))
+	return framed(b.String())
 }
 
 // resolveQueryLocked:节点 ID 精确 → lineage → 宽松归一(impl §3 文法)。
@@ -1200,8 +1342,15 @@ func (e *Engine) flowView(query string) (string, bool) {
 
 // missProtocolLocked 空手协议:把每次空手变成索引生长的机会(impl §7.3 定案)。
 func (e *Engine) missProtocolLocked(query string) string {
+	return e.missProtocolWithSemanticWarningLocked(query, "")
+}
+
+func (e *Engine) missProtocolWithSemanticWarningLocked(query, semanticWarning string) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "关键词 %q 零命中。\n", query)
+	if semanticWarning != "" {
+		fmt.Fprintf(&b, "⚠ semantic 已降级: %s；已继续使用关键词/结构检索。\n", semanticWarning)
+	}
 	// 符号名模糊匹配(包含式)。
 	var fuzzy []string
 	ql := strings.ToLower(query)

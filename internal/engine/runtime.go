@@ -23,6 +23,11 @@ type runtime struct {
 	mu    sync.RWMutex
 	cache *store.Cache
 	ix    *index.Index
+	// semanticSourceVersion 只在健康 tree/project 视图变化时递增。
+	// manifest 由 semantic_source.go 在主锁外构造，再按 version 原子发布；
+	// recall 稳态只读取不可变 map/fingerprint，不再逐次全库脱敏扫描。
+	semanticSourceVersion uint64
+	semanticManifest      semanticSourceManifest
 	// truthTxActive 只在 rt.mu 写锁下访问。事务中途的内部 reload 必须跳过
 	// 崩溃恢复；新进程/下次请求则在加载缓存前恢复仓外 prepared WAL。
 	truthTxActive bool
@@ -289,7 +294,8 @@ func (e *Engine) reloadLocked() error {
 			return fmt.Errorf("恢复崩溃事务: %w", err)
 		}
 	}
-	if e.rt.cache == nil {
+	newCache := e.rt.cache == nil
+	if newCache {
 		e.rt.cache = store.NewCache(e.Store)
 		e.rt.sessionMu.Lock()
 		if e.rt.sessions == nil {
@@ -297,7 +303,8 @@ func (e *Engine) reloadLocked() error {
 		}
 		e.rt.sessionMu.Unlock()
 	}
-	if _, err := e.rt.cache.Refresh(); err != nil {
+	refresh, err := e.rt.cache.Refresh()
+	if err != nil {
 		return err
 	}
 	// flows/wip 体量小,每次直读(不进 mtime 缓存,switch 分支后天然新鲜)。
@@ -330,7 +337,25 @@ func (e *Engine) reloadLocked() error {
 	// 使读路径变纯读——失配降 suspect、pending_anchor 补全、回到锚定恢复 fresh。
 	// 只对有活跃知识且 fresh/suspect/pending 的节点做,成本受限。
 	e.reconcileAllLocked()
+	if newCache || refreshChangesSemanticSource(refresh) {
+		e.rt.semanticSourceVersion++
+		if e.rt.semanticSourceVersion == 0 { // 理论上的 uint64 回绕也不能复用旧 manifest。
+			e.rt.semanticSourceVersion = 1
+		}
+		e.rt.semanticManifest = semanticSourceManifest{}
+	}
 	return nil
+}
+
+func refreshChangesSemanticSource(rep store.RefreshReport) bool {
+	for _, paths := range [][]string{rep.Added, rep.Changed, rep.Removed} {
+		for _, rel := range paths {
+			if rel == "project.yaml" || strings.HasPrefix(rel, "tree/") {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // UsageRecord 是使用日志行(store.UsageRecord 的别名,R2-B5):

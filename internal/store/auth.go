@@ -26,6 +26,7 @@ const (
 	authTokenStateFile  = "auth-token"
 	localIdentityFile   = "local-identity"
 	scoutTrustStateFile = "scout-trust-v1"
+	semanticStateFile   = "semantic-config-v1.json"
 	legacyAuthTokenRel  = "local/token"
 	legacyScoutTrustRel = "local/scout-trust-v1"
 
@@ -312,6 +313,13 @@ func createPrivateStateFileExclusive(path string, data []byte) (bool, error) {
 }
 
 func readPrivateStateFile(path string) ([]byte, error) {
+	return readPrivateStateFileLimit(path, 4096)
+}
+
+func readPrivateStateFileLimit(path string, maxBytes int64) ([]byte, error) {
+	if maxBytes < 1 || maxBytes > 1<<20 {
+		return nil, fmt.Errorf("store: 本机状态读取上限非法: %d", maxBytes)
+	}
 	if err := ensurePrivateStateDir(filepath.Dir(path)); err != nil {
 		return nil, err
 	}
@@ -336,11 +344,11 @@ func readPrivateStateFile(path string) ([]byte, error) {
 		return nil, err
 	}
 	defer f.Close()
-	data, err := io.ReadAll(io.LimitReader(f, 4097))
+	data, err := io.ReadAll(io.LimitReader(f, maxBytes+1))
 	if err != nil {
 		return nil, err
 	}
-	if len(data) > 4096 {
+	if int64(len(data)) > maxBytes {
 		return nil, fmt.Errorf("store: 本机状态文件异常过大: %s", path)
 	}
 	return data, nil
@@ -503,6 +511,57 @@ func (s *Store) LoadScoutTrust() (string, error) {
 		return "", readErr
 	}
 	return strings.TrimSpace(string(data)), nil
+}
+
+// SemanticConfigFile 返回本仓库语义检索本机配置的位置，仅用于状态展示。
+// endpoint/model/启用开关都不进入仓库，避免恶意分支借配置触发内容外发。
+func (s *Store) SemanticConfigFile() (string, error) {
+	return s.privateStatePath(semanticStateFile)
+}
+
+// WriteSemanticConfig 写语义检索的仓外、本机、按 canonical repo 隔离的配置。
+// API key 不属于该文件；调用方只从固定的进程环境变量读取。
+func (s *Store) WriteSemanticConfig(data []byte) error {
+	if len(data) == 0 || len(data) > 64<<10 {
+		return fmt.Errorf("store: semantic 配置大小必须在 1..65536 字节")
+	}
+	path, err := s.privateStatePath(semanticStateFile)
+	if err != nil {
+		return err
+	}
+	return writePrivateStateFile(path, data)
+}
+
+// LoadSemanticConfig 只读仓外语义检索配置；不存在返回 os.ErrNotExist。
+func (s *Store) LoadSemanticConfig() ([]byte, error) {
+	path, err := s.privateStatePath(semanticStateFile)
+	if err != nil {
+		return nil, err
+	}
+	return readPrivateStateFileLimit(path, 64<<10)
+}
+
+// RemoveSemanticConfig 删除本机语义检索配置。向量缓存另在 .knowledge/local，
+// 调用方可选择保留（再次启用时校验指纹）或单独清理。
+func (s *Store) RemoveSemanticConfig() error {
+	path, err := s.privateStatePath(semanticStateFile)
+	if err != nil {
+		return err
+	}
+	info, err := os.Lstat(path)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+		return fmt.Errorf("store: semantic 配置必须是普通文件: %s", path)
+	}
+	if err := os.Remove(path); err != nil {
+		return err
+	}
+	return fsyncDir(filepath.Dir(path))
 }
 
 // LocalAuthClientProof / LocalAuthServerProof 是内部 loopback 握手的域分离 HMAC。

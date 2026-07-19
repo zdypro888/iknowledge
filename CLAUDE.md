@@ -5,13 +5,13 @@ AI 代码知识库(MCP 服务)。**两份现行设计文档是唯一真相源**,
 - [knowledge.md](knowledge.md) — 概念设计全案(五维模型、自愈机制、两条铁律、五篇推演)
 - [knowledge-impl.md](knowledge-impl.md) — 第一期工程方案(数据模型、存储、MCP API 全量规范、里程碑)——**写代码照这份**,已含推演五的全部定案
 
-[vecdb.md](vecdb.md) 只记录可选向量检索提案,尚未实现,不属于现有能力或现行实现正本。
+[vecdb.md](vecdb.md) 是可选 semantic/vector preview 的现行实施契约；能力已实现但默认禁用，质量晋级门尚未完成。
 
 ## 铁律(违反即返工)
 
 - **零重依赖**:第一期仅允许 `gopkg.in/yaml.v3`;禁止引入 MCP SDK/JSON-RPC 框架/tokenizer——JSON-RPC 2.0 手写(风格参照 aibridge 的 `internal/bridge/mcp.go`)
-- **工具对源码只读**:仓库内容只写 `.knowledge/`(设计铁律二),永不改源码;仓库外写入仅限按 canonical repo path 分仓的用户私有运行态(auth/local identity/scout trust/崩溃 WAL)、显式 `export -o` 制品与 install/uninstall 用户级部署,除此之外都是 bug
-- 包依赖方向:`mcpserv → engine → {store, index, parser, model, pty}`;`model`/`pty` 不依赖任何内部包
+- **工具对源码只读**:仓库内容只写 `.knowledge/`(设计铁律二),永不改源码;仓库外写入仅限按 canonical repo path 分仓的用户私有运行态(auth/local identity/scout trust/semantic provider 配置/崩溃 WAL)、显式 `export -o` 制品与 install/uninstall 用户级部署,除此之外都是 bug
+- 包依赖方向:`mcpserv → engine → {store, index, parser, model, pty, semantic, vector}`;`model`/`pty`/`semantic`/`vector` 不依赖其他内部包
 - 表驱动测试;所有 YAML 写入走 temp + fsync + `os.Rename` + 目录 fsync 原子写(轮 25);分片读写必须保留未知字段(yaml.Node 往返)
 - 三种哈希语义不许混用:`Hash` 只管腐烂检测,`StructHash` 只找迁移候选,`DocStructHash` 决定候选能否保持 fresh(impl §5/§6)
 - **测试 MCP:协议级手段优先**(curl / httptest,便宜无额度消耗);真实客户端联测**禁用 `claude -p`**(独立限流池,撞账号限额),用 **PTY 驱动交互式 claude**(aibridge `internal/agent` 模式,用户已授权)
@@ -76,4 +76,6 @@ go test -race ./...
 
 **轮 35(2026-07-18,参考 ProjectMem 后的选择性吸收)**:只吸收能强化“代码知识库”边界的机制,不搬全局跨项目记忆、watcher/dashboard、把 commit 前缀自动当决策或虚构金额 ROI。①所有语义写入口与 bundle 导入默认秘密脱敏(厂商 token/JWT/Bearer/私钥/URL 凭证/常见 credential 赋值),命中只回执类型/数量,原文不落盘;②新增 `iknowledge precheck` 暂存区预检,把源码增改删/重命名映射到历史否决、suspect/orphan/pending、未决矛盾、雷区/pitfall,记账只认相对 HEAD 新增且节点精确覆盖源码的 journal;缺省告警,`--strict` 才阻断;③新增 `iknowledge brief --budget` 一屏 Markdown(WIP/风险/近期决策/维护债),严格预算且始终保留防投毒数据框;④usage 只记录真实 precheck 次数/告警/阻断;⑤CLI/MCP 统一使用 `internal/buildinfo` 发布版本。仍零新依赖、MCP 工具数不变、只写既定边界。
 
-**轮 36(2026-07-19,分支合并收口 + 向量检索定案留档)**:把轮35能力合并到轮34之后的事务、bundle、listener identity 与解析加固主线,冲突处理以主线安全边界为底座并补齐回归:bundle 在 remap 后/写盘前脱敏且 dry-run 同报告;JSON-RPC 真 4MiB 上限、parse/invalid request 与显式 `id:null` 语义修正;stdio 同步转发 `id:null`;session 改机会性回收+容量上限,移除无生命周期后台 goroutine;自派侦察兵兼容不读 PTY 而直接交卷的非 TUI 命令。新增 [`vecdb.md`](vecdb.md) 定义尚未实现的可选语义检索层:默认纯 Go Flat 派生索引、仅摘要、混合召回、Zvec 只作规模增长后的可选后端;不得把设计文档误报为现有能力。
+**轮 36(2026-07-19,分支合并收口 + 向量检索定案留档)**:把轮35能力合并到轮34之后的事务、bundle、listener identity 与解析加固主线,冲突处理以主线安全边界为底座并补齐回归:bundle 在 remap 后/写盘前脱敏且 dry-run 同报告;JSON-RPC 真 4MiB 上限、parse/invalid request 与显式 `id:null` 语义修正;stdio 同步转发 `id:null`;session 改机会性回收+容量上限,移除无生命周期后台 goroutine;自派侦察兵兼容不读 PTY 而直接交卷的非 TUI 命令。新增 [`vecdb.md`](vecdb.md) 定义当时尚未实现的可选语义检索层:默认纯 Go Flat 派生索引、仅摘要、混合召回、Zvec 只作规模增长后的可选后端;不得把设计文档误报为现有能力。
+
+**轮 37(2026-07-19,semantic/vector preview 落地)**:按 vecdb 契约交付默认禁用的可选语义召回。新增 standard-library-only `internal/semantic`(自有 Embedder、OpenAI-compatible/Ollama HTTP、安全 URL/redirect/secret/context/资源边界)与 `internal/vector`(连续 float32 Flat snapshot、稳定 Top-K、有界 checksummed codec)，不引入 Eino/eino-ext 或第三方 MCP；Eino 仅参考 nbco 的 provider 抽象。provider 设置只由 `iknowledge semantic configure|enable|disable|status|rebuild|clear` 写 canonical-repo 仓外 0600 私有态，loopback Ollama 不读取远端 API key，远程只允许 HTTPS，configure/status 不联网，只有显式 rebuild 批量发送脱敏 active summary/era_summary。`kb_recall` 保持精确节点零 provider 短路，普通意图以 lexical+semantic 分池 RRF、当前 source hash 复核和结构扩展返回；missing/stale/corrupt/超限/provider 失败一律提示并降级。派生索引 `.knowledge/local/vector.idx` 用独立锁、不可变 generation 与原子流式写，硬界 top_k 100、dimensions 4096、vector 512MiB、HTTP 30s；多仓进程级 resident coordinator 与真实 qrels 质量晋级仍未交付，不能把 preview 宣称为默认能力。

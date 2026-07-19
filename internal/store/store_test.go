@@ -2,8 +2,10 @@ package store
 
 import (
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -72,6 +74,50 @@ func TestShardRoundTrip(t *testing.T) {
 		len(n.Entries) != 1 || n.Entries[0].Text != "不要在调用方预先加密" ||
 		n.Anchor.Lines != [2]int{40, 140} {
 		t.Errorf("节点字段往返不完整:%+v", n)
+	}
+}
+
+func TestPrivateKnowledgeStreamIsAtomic(t *testing.T) {
+	s := newStore(t)
+	const rel = "local/vector.idx"
+	if err := s.WritePrivateKnowledgeFile(rel, []byte("old")); err != nil {
+		t.Fatal(err)
+	}
+	wantErr := errors.New("encode failed")
+	err := s.WritePrivateKnowledgeFileStream(rel, func(w io.Writer) error {
+		_, _ = w.Write([]byte("partial-new"))
+		return wantErr
+	})
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("stream error=%v, want wrapped encode error", err)
+	}
+	if got, err := s.ReadKnowledgeFile(rel); err != nil || string(got) != "old" {
+		t.Fatalf("失败写入破坏旧文件: %q/%v", got, err)
+	}
+	payload := strings.Repeat("vector", 1<<15)
+	if err := s.WritePrivateKnowledgeFileStream(rel, func(w io.Writer) error {
+		_, err := io.WriteString(w, payload)
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	f, err := s.OpenKnowledgeFileRead(rel)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := io.ReadAll(f)
+	closeErr := f.Close()
+	if err != nil || closeErr != nil || string(got) != payload {
+		t.Fatalf("stream roundtrip bytes=%d read=%v close=%v", len(got), err, closeErr)
+	}
+	if runtime.GOOS != "windows" {
+		info, err := os.Stat(filepath.Join(s.Dir(), filepath.FromSlash(rel)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if info.Mode().Perm() != 0o600 {
+			t.Fatalf("vector cache mode=%o, want 600", info.Mode().Perm())
+		}
 	}
 }
 
@@ -387,6 +433,51 @@ func TestWriterLock(t *testing.T) {
 		t.Errorf("释放后应可再取: %v", err)
 	} else {
 		release2()
+	}
+}
+
+func TestSemanticLockIsIndependentAndExclusive(t *testing.T) {
+	s := newStore(t)
+	releaseWriter, err := s.AcquireWriterLock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer releaseWriter()
+	releaseSemantic, err := s.AcquireSemanticLock()
+	if err != nil {
+		t.Fatalf("serve writer lock 不应阻止 semantic lock: %v", err)
+	}
+	other, err := Open(s.RepoRoot())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := other.AcquireSemanticLock(); !errors.Is(err, ErrSemanticLocked) {
+		t.Fatalf("第二个 semantic lock=%v, want ErrSemanticLocked", err)
+	}
+	releaseSemantic()
+	releaseAgain, err := other.AcquireSemanticLock()
+	if err != nil {
+		t.Fatalf("释放后 semantic lock: %v", err)
+	}
+	releaseAgain()
+}
+
+func TestCheckedPrivateStreamKeepsOldFileWhenValidationFails(t *testing.T) {
+	s := newStore(t)
+	if err := s.WritePrivateKnowledgeFile("local/derived.bin", []byte("old")); err != nil {
+		t.Fatal(err)
+	}
+	wantErr := errors.New("generation changed")
+	err := s.WritePrivateKnowledgeFileStreamChecked("local/derived.bin", func(w io.Writer) error {
+		_, err := io.WriteString(w, "new")
+		return err
+	}, func() error { return wantErr })
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("checked write error=%v", err)
+	}
+	got, err := s.ReadKnowledgeFile("local/derived.bin")
+	if err != nil || string(got) != "old" {
+		t.Fatalf("old generation not preserved: %q err=%v", got, err)
 	}
 }
 

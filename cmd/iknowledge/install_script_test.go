@@ -213,7 +213,10 @@ func TestInstallUninstallScriptGuards(t *testing.T) {
 		`rm -f "$installed_bin"`,
 		`taskkill.exe /F /IM iknowledge.exe`,
 		`状态目录必须是绝对路径`,
-		`rm -f "$repo_state/auth-token" "$repo_state/local-identity" "$repo_state/scout-trust-v1"`,
+		`if [ -L "$state_dir" ]`,
+		`if [ -L "$state_dir/repos" ]`,
+		`if [ -L "$repo_state" ]`,
+		`rm -f "$repo_state/auth-token" "$repo_state/local-identity" "$repo_state/scout-trust-v1" "$repo_state/semantic-config-v1.json"`,
 		`保留待恢复事务状态`,
 	} {
 		if !bytes.Contains(uninstall, []byte(want)) {

@@ -58,3 +58,30 @@ func (s *Store) AcquireWriterLock() (release func(), err error) {
 		})
 	}, nil
 }
+
+// AcquireSemanticLock 是独立于 serve writer lock 的派生 generation 锁。
+func (s *Store) AcquireSemanticLock() (release func(), err error) {
+	path := filepath.Join(s.dir, "local", ".semantic.lock")
+	f, err := s.openKnowledgeFile(path, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return nil, fmt.Errorf("store: 开 semantic 锁文件: %w", err)
+	}
+	ol := new(syscall.Overlapped)
+	r, _, errno := procLockFileEx.Call(f.Fd(),
+		uintptr(lockfileExclusiveLock|lockfileFailImmediately),
+		0, 1, 0, uintptr(unsafe.Pointer(ol)))
+	if r == 0 {
+		f.Close()
+		if errors.Is(errno, errorLockViolation) {
+			return nil, ErrSemanticLocked
+		}
+		return nil, fmt.Errorf("store: semantic LockFileEx: %w", errno)
+	}
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			procUnlockFileEx.Call(f.Fd(), 0, 1, 0, uintptr(unsafe.Pointer(ol)))
+			_ = f.Close()
+		})
+	}, nil
+}

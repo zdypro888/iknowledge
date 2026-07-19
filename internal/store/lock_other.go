@@ -12,3 +12,7 @@ var ErrLocked = errors.New("serve 运行中,请改用 kb_init 或先停 serve")
 func (s *Store) AcquireWriterLock() (release func(), err error) {
 	return nil, errors.New("store: 本平台暂不支持写者锁(支持 macOS/Linux/Windows,impl §1)")
 }
+
+func (s *Store) AcquireSemanticLock() (release func(), err error) {
+	return nil, errors.New("store: 本平台暂不支持 semantic 锁(支持 macOS/Linux/Windows)")
+}

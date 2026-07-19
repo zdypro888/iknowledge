@@ -34,6 +34,7 @@ const usage = `iknowledge——AI 代码知识库(MCP 服务)
   iknowledge serve  --repo <path> [--repo <path2> …] [--auth]  启动 MCP 服务;--repo 可重复(单进程多仓库);--auth 启用 token 鉴权
                     [--addr host:port]                         (仅单仓库)覆盖监听地址
   iknowledge status --repo <path> [--prompt]                   库状态;--prompt 打印纪律提示词
+  iknowledge semantic <configure|enable|disable|status|rebuild|clear>  可选语义检索(本机显式配置,缺省关闭)
   iknowledge doctor --repo <path> [--deploy] [--strict]        自检:初始化/配置/parser/维护欠账/PATH 部署
   iknowledge maintain --repo <path> [--plan]                   打印维护欠账清单/路线(只读;取用/销账走 MCP kb_maintain)
   iknowledge brief --repo <path> [--budget 1200]               一屏项目简报(WIP/风险/近期决策/维护债)
@@ -64,6 +65,8 @@ func run(args []string) int {
 		return runStdio(args[1:], os.Stdin, os.Stdout)
 	case "status":
 		return runStatus(args[1:])
+	case "semantic":
+		return runSemantic(args[1:], os.Stdout, os.Stderr)
 	case "doctor":
 		return runDoctor(args[1:], os.Stdout)
 	case "maintain":
@@ -179,10 +182,14 @@ func runServe(args []string) int {
 		hs     *http.Server
 		ln     net.Listener
 		listen string
+		cancel context.CancelFunc
 	}
 	var units []unit
 	cleanup := func() {
 		for _, u := range units {
+			if u.cancel != nil {
+				u.cancel()
+			}
 			if u.ln != nil {
 				u.ln.Close()
 			}
@@ -294,9 +301,11 @@ func runServe(args []string) int {
 		// IdleTimeout 120s 回收 keep-alive 空闲连接。WriteTimeout 必须真实有界；
 		// engine.RequestWriteTimeout 对普通工具保持 10 分钟，并在 scout:self 时按
 		// 自派等待上限加启动/信任弹窗重投余量，避免 0 值无限占用也不误杀长调用。
-		units = append(units, unit{s: s, ln: ln, listen: listen,
+		serveCtx, serveCancel := context.WithCancel(context.Background())
+		units = append(units, unit{s: s, ln: ln, listen: listen, cancel: serveCancel,
 			hs: &http.Server{
 				Handler:           srv.Handler(),
+				BaseContext:       func(net.Listener) context.Context { return serveCtx },
 				ReadHeaderTimeout: 10 * time.Second,
 				ReadTimeout:       30 * time.Second,
 				IdleTimeout:       120 * time.Second,
@@ -324,6 +333,11 @@ func runServe(args []string) int {
 	case <-ctx.Done():
 		stop()
 		fmt.Println("收到退出信号,优雅停机中(等待在途请求,上限 10s)…")
+		// 先取消请求 context，让可选 embedding/向量长读立即停止；既有写工具
+		// 不依赖请求 context，仍由 Shutdown 等待原子落盘。
+		for _, u := range units {
+			u.cancel()
+		}
 		sctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		for _, u := range units {
