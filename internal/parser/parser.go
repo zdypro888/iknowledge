@@ -18,8 +18,9 @@ type Symbol struct {
 	Body  []byte // [Start:End) 原文
 	Lines [2]int
 	// 双哈希在 Parse 时计算(依赖 AST,离开 parser 无从复算):
-	Hash       string // 锚定/腐烂检测:go/printer 标准重打印(gofmt 免疫),含 doc comment
-	StructHash string // 迁移匹配:剥全部注释、自身标识符换占位符;绝不用于腐烂检测
+	Hash          string // 锚定/腐烂检测:go/printer 标准重打印(gofmt 免疫),含 doc comment
+	StructHash    string // 迁移匹配:剥全部注释、自身标识符换占位符;绝不用于腐烂检测
+	DocStructHash string // doc 敏感的迁移护栏:仅自身名免疫,契约 doc 改动必失配
 }
 
 // Parser 是解析器插件接口(impl §5)。
@@ -36,8 +37,17 @@ type FileHasher interface {
 	HashFile(src []byte) string
 }
 
+// ParsedFileHasher 让已有符号结果的插件复用 Parse 成果，避免为文件锚
+// 再做一次完整解析。优先级高于只接收原文的 FileHasher。
+type ParsedFileHasher interface {
+	HashParsedFile(syms []Symbol, src []byte) string
+}
+
 // HashFileFor 统一出口:插件自定义优先,否则符号级联(engine 各锚定点共用)。
 func HashFileFor(p Parser, syms []Symbol, src []byte) string {
+	if fh, ok := p.(ParsedFileHasher); ok {
+		return fh.HashParsedFile(syms, src)
+	}
 	if fh, ok := p.(FileHasher); ok {
 		return fh.HashFile(src)
 	}

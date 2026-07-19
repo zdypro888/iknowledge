@@ -60,11 +60,12 @@ const (
 
 // Anchor 把节点钉在源码上(impl §3)。
 type Anchor struct {
-	File       string `yaml:"file"`                  // repo 相对路径,一律正斜杠
-	Symbol     string `yaml:"symbol,omitempty"`      // 符号规范名(文法见 impl §3);文件/目录节点为空
-	Hash       string `yaml:"hash,omitempty"`        // 锚定/腐烂检测用,gofmt 免疫(impl §5 双哈希)
-	StructHash string `yaml:"struct_hash,omitempty"` // 结构哈希:改名/注释免疫,仅供迁移匹配(impl §6)
-	Lines      [2]int `yaml:"lines,omitempty,flow"`  // 仅展示用,不作锚定依据
+	File          string `yaml:"file"`                      // repo 相对路径,一律正斜杠
+	Symbol        string `yaml:"symbol,omitempty"`          // 符号规范名(文法见 impl §3);文件/目录节点为空
+	Hash          string `yaml:"hash,omitempty"`            // 锚定/腐烂检测用,gofmt 免疫
+	StructHash    string `yaml:"struct_hash,omitempty"`     // 名字/doc 免疫:只用于寻找迁移候选
+	DocStructHash string `yaml:"doc_struct_hash,omitempty"` // 自身名免疫但 doc 敏感:迁移 fresh 护栏
+	Lines         [2]int `yaml:"lines,omitempty,flow"`      // 仅展示用,不作锚定依据
 }
 
 // Entry 是一条经验知识(impl §3)。
@@ -156,10 +157,55 @@ type Change struct {
 	// 追加的 Change(追加式不变量不破):反向应用被撤销 change 的副作用(恢复被 supersede
 	// 的 entry、回滚 verify 级联)。用于撤销"全错"的记录(误 refute 级联、错误 overturns)。
 	Reverts string `json:"reverts,omitempty"`
+	// EffectsVersion=1 表示本条由支持结构化事务效果的引擎写出；即使本次
+	// 确实没有 shard 副作用也会显式置 1。缺失表示旧记录，不能把空 effects
+	// 猜成“可安全空撤销”。
+	EffectsVersion int `json:"effects_version,omitempty"`
+	// Effects 记录这条 change 对条目状态的结构化前后快照。它使 kb_revert
+	// 不必从 What/Why 的自然语言反猜 confirm/refute/obsolete 的副作用，且把
+	// based_on 级联降级也纳入同一个可逆操作。旧 journal 没有该字段仍可读，
+	// engine 会走保守兼容路径。
+	Effects []EntryEffect `json:"effects,omitempty"`
+	// NodeEffects 记录 record_change 对节点本身的可逆编辑（重锚、增量创建、
+	// remap 的源删除/目标接收与 lineage）。Before/After 为完整已知模型快照；
+	// Revert 仅在当前节点仍等于 After 时反向应用，避免覆盖后续编辑。
+	NodeEffects []NodeEffect `json:"node_effects,omitempty"`
 	// Remaps 重构申报(knowledge.md §12.6 第 2 层):拆分/合并机器猜不了,谁重构谁申报。
 	Remaps   []Remap `json:"remaps,omitempty"`
 	Verified string  `json:"verified,omitempty" redact:"true"`
 	Author   string  `json:"author,omitempty"`
+}
+
+// EntryEffect 是一次 change 对单条知识状态的可逆编辑。
+// Entry 使用稳定引用 "node-id#entry-id"；Before/After 只含 verify/revert 会改的
+// 状态字段，不复制 Text/Kind/BasedOn 等正文，避免撤销时覆盖并发的无关编辑。
+type EntryEffect struct {
+	Entry  string     `json:"entry"`
+	Before EntryState `json:"before"`
+	After  EntryState `json:"after"`
+}
+
+// EntryState 是 Entry 可逆状态字段的快照。
+type EntryState struct {
+	Confidence   Confidence `json:"confidence"`
+	ConfirmedAt  time.Time  `json:"confirmed_at,omitempty"`
+	RefutedBy    string     `json:"refuted_by,omitempty"`
+	RetiredBy    string     `json:"retired_by,omitempty"`
+	SupersededBy string     `json:"superseded_by,omitempty"`
+}
+
+// NodeEffect 是一次 change 对单个节点的可逆编辑。nil Before 表示新建，nil
+// After 表示删除；分片路径显式记录，因为 remap 前后节点可能不在同一分片。
+type NodeEffect struct {
+	Node        string `json:"node"`
+	BeforeShard string `json:"before_shard,omitempty"`
+	AfterShard  string `json:"after_shard,omitempty"`
+	Before      *Node  `json:"before,omitempty"`
+	After       *Node  `json:"after,omitempty"`
+	// Raw 保存该节点原始 YAML mapping，用于 remap/revert 时把未来版本添加的
+	// 未知字段一并搬迁/恢复；已知字段仍由 Before/After 模型状态裁决。
+	BeforeRaw string `json:"before_raw,omitempty"`
+	AfterRaw  string `json:"after_raw,omitempty"`
 }
 
 // Remap 是一条节点映射申报。分派粒度(定案,销 knowledge.md §16.14):

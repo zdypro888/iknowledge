@@ -231,13 +231,6 @@ func gitTestCommand(t *testing.T, repo string, args ...string) {
 	}
 }
 
-func TestShellQuote(t *testing.T) {
-	got := shellQuote("/tmp/a b/it's")
-	if got != `'/tmp/a b/it'"'"'s'` {
-		t.Fatalf("shellQuote=%q", got)
-	}
-}
-
 func TestBriefCLI(t *testing.T) {
 	repo := setupGitRepo(t)
 	initRepo(t, repo, engine.InitOptions{})

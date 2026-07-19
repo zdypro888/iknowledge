@@ -25,7 +25,9 @@ func TestConcurrentReadsNoRace(t *testing.T) {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			sid := fmt.Sprintf("reader-%d", i)
+			// 故意共用同一个 sid:Recall 会写 session ledger,Inject 会读它。
+			// 不可把 ledger 的 map 裸指针带出 sessionMu。
+			sid := "shared-session"
 			for j := 0; j < 20; j++ {
 				// Recall:命中节点路径
 				if _, _, err := e.Recall(RecallArgs{Query: "internal/auth/login.go#Login"}, sid); err != nil {

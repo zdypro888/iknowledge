@@ -7,6 +7,7 @@ import (
 	"slices"
 	"sort"
 	"strings"
+	"time"
 	"unicode"
 
 	"github.com/zdypro888/iknowledge/internal/model"
@@ -27,18 +28,19 @@ type ChangeRef struct {
 
 // Index 由一次快照(shards+journal+flows)构建;只读,重载后整体重建。
 type Index struct {
-	nodes       map[string]*NodeRef
-	lineage     map[string][]string        // 旧节点 ID → 现任节点 ID(拆分可多个,#8)
-	inverted    map[string]map[string]bool // token → 节点 ID 集合
-	trigram     map[string]map[string]bool // 三字母组 → 节点 ID 集合(R29 批次5:近似命中回退)
-	fileNodes   map[string][]string        // 文件路径 → 该文件的所有节点 ID(R29 批次3:文件域查询免扫全表)
-	basedOnRev  map[string][]string        // 归一化 "node#entry" → 依赖它的 "node#entry"
-	disputesRev map[string][]string        // 归一化 "node#entry" → 声明与它矛盾的 "node#entry"
-	flowsByNode map[string][]string        // 节点 ID → flow IDs(反向链接,现算不落盘)
-	journalBy   map[string][]ChangeRef     // 现任节点 ID → 变更引用
-	landmine    map[string]int             // 轮30-C:节点 ID → 雷区分(变更频次 + 推翻次数×2 + refute 数)
-	changes     []model.Change
-	flows       []model.Flow
+	nodes        map[string]*NodeRef
+	lineage      map[string][]string        // 旧节点 ID → 现任节点 ID(拆分可多个,#8)
+	inverted     map[string]map[string]bool // token → 节点 ID 集合
+	trigram      map[string]map[string]bool // 三字母组 → 节点 ID 集合(R29 批次5:近似命中回退)
+	fileNodes    map[string][]string        // 文件路径 → 该文件的所有节点 ID(R29 批次3:文件域查询免扫全表)
+	basedOnRev   map[string][]string        // 归一化 "node#entry" → 依赖它的 "node#entry"
+	disputesRev  map[string][]string        // 归一化 "node#entry" → 声明与它矛盾的 "node#entry"
+	flowsByNode  map[string][]string        // 节点 ID → flow IDs(反向链接,现算不落盘)
+	journalBy    map[string][]ChangeRef     // 现任节点 ID → 变更引用
+	landmine     map[string]int             // 轮30-C:节点 ID → 雷区分(变更频次 + 推翻次数×2 + refute 数)
+	duplicateIDs []string                   // 跨分片重复 node ID:隔离,避免 map 遍历 last-write-wins
+	changes      []model.Change
+	flows        []model.Flow
 }
 
 // Build 全量构建索引。shards 是"分片相对路径 → 节点切片",由 engine 从 store
@@ -60,12 +62,35 @@ func Build(shards map[string][]model.Node, changes []model.Change, flows []model
 		flows:       flows,
 	}
 
-	for rel, nodes := range shards {
+	// 先计数再建表:跨分片重复 ID 不能由 map 迭代顺序随机决定胜者。
+	// 全部副本都隔离,由 status 告警人工修复。
+	counts := map[string]int{}
+	for _, nodes := range shards {
+		for i := range nodes {
+			if model.SafeNodeID(nodes[i].ID) {
+				counts[nodes[i].ID]++
+			}
+		}
+	}
+	for id, n := range counts {
+		if n > 1 {
+			ix.duplicateIDs = append(ix.duplicateIDs, id)
+		}
+	}
+	sort.Strings(ix.duplicateIDs)
+
+	rels := make([]string, 0, len(shards))
+	for rel := range shards {
+		rels = append(rels, rel)
+	}
+	sort.Strings(rels)
+	for _, rel := range rels {
+		nodes := shards[rel]
 		for i := range nodes {
 			n := &nodes[i]
 			// 铁律二防线:恶意/损坏分片里带 ../ 的节点 ID 直接丢弃——
 			// 读路径由节点 ID 驱动文件读,不消毒会被穿越到仓库外(索引是唯一收口)。
-			if !model.SafeNodeID(n.ID) {
+			if !model.SafeNodeID(n.ID) || counts[n.ID] != 1 {
 				continue
 			}
 			ix.nodes[n.ID] = &NodeRef{ShardRel: rel, Node: n}
@@ -144,8 +169,11 @@ func Build(shards map[string][]model.Node, changes []model.Change, flows []model
 			continue
 		}
 		for _, step := range f.Steps {
-			nid := ix.ResolveNodeID(step.Node)
-			if nid != "" {
+			at := step.Since
+			if at.IsZero() {
+				at = f.Since
+			}
+			for _, nid := range ix.resolveNodeIDsAt(step.Node, at) {
 				ix.flowsByNode[nid] = appendUnique(ix.flowsByNode[nid], f.ID)
 			}
 		}
@@ -161,14 +189,15 @@ func Build(shards map[string][]model.Node, changes []model.Change, flows []model
 		if c.Overturns != "" || c.Reverts != "" {
 			overturnBonus = 2
 		}
-		for _, nid := range c.Nodes {
-			if _, ok := ix.nodes[nid]; ok {
-				ix.journalBy[nid] = append(ix.journalBy[nid], ChangeRef{Idx: ci})
-				ix.landmine[nid] += 1 + overturnBonus
-				continue
-			}
-			for _, cur := range ix.lineage[nid] {
-				ix.journalBy[cur] = append(ix.journalBy[cur], ChangeRef{Idx: ci, ViaLineage: true})
+		seenTargets := map[string]bool{}
+		for _, historicalID := range c.Nodes {
+			for _, cur := range ix.resolveNodeIDsAt(historicalID, c.At) {
+				if seenTargets[cur] {
+					continue
+				}
+				seenTargets[cur] = true
+				viaLineage := cur != historicalID
+				ix.journalBy[cur] = append(ix.journalBy[cur], ChangeRef{Idx: ci, ViaLineage: viaLineage})
 				ix.landmine[cur] += 1 + overturnBonus
 			}
 		}
@@ -182,6 +211,29 @@ func Build(shards map[string][]model.Node, changes []model.Change, flows []model
 		}
 	}
 	return ix
+}
+
+// resolveNodeIDsAt 在“旧 ID 被无关新节点复用”时用制品时间分代。普通查询的
+// ResolveNodeIDs 仍代表现在；journal/flow 是历史制品，必须把新节点诞生前的
+// 引用送往 lineage 继承者，不能先被 exact ID 截走。
+func (ix *Index) resolveNodeIDsAt(id string, at time.Time) []string {
+	exact := ix.nodes[id]
+	heirs := ix.lineage[id]
+	if exact != nil {
+		if len(heirs) > 0 && exact.Node.Since.IsZero() {
+			out := []string{id}
+			return append(out, heirs...)
+		}
+		if len(heirs) > 0 && (at.IsZero() || (!exact.Node.Since.IsZero() && at.Before(exact.Node.Since))) {
+			return append([]string(nil), heirs...)
+		}
+		if exact.Node.Since.IsZero() || at.IsZero() || !at.Before(exact.Node.Since) {
+			return []string{id}
+		}
+		// 无 lineage 可承接的前任历史宁可不污染无关的新 exact 节点。
+		return nil
+	}
+	return append([]string(nil), heirs...)
 }
 
 // ---- 查询面 ----
@@ -198,6 +250,11 @@ func (ix *Index) LandmineScore(nodeID string) int { return ix.landmine[nodeID] }
 
 // Nodes 返回全部节点表(只读用)。
 func (ix *Index) Nodes() map[string]*NodeRef { return ix.nodes }
+
+// DuplicateNodeIDs 返回被跨分片重复定义并隔离的节点 ID。
+func (ix *Index) DuplicateNodeIDs() []string {
+	return append([]string(nil), ix.duplicateIDs...)
+}
 
 // ResolveNodeID 把(可能是旧的)节点 ID 归一到现任 ID;查无返回 ""。
 // 旧 ID 因拆分对应多个现任时返回字典序首个(确定性);需要全部用 ResolveNodeIDs。
@@ -245,17 +302,60 @@ func (ix *Index) ResolveEntryRef(ref string) string {
 	if nodeID == "" {
 		return ref
 	}
-	cur := ix.ResolveNodeID(nodeID)
-	if cur == "" {
+	// Node ID 可能在迁移后被一个无关新符号复用。节点级解析此时应指向现任
+	// （ResolveNodeIDs 的既有语义），但稳定 entry 引用仍可能属于 lineage 继承者。
+	// 因此 entry 解析要同时查“现任同名节点 + 旧 ID 的全部继承者”。
+	candidates := append([]string(nil), ix.ResolveNodeIDs(nodeID)...)
+	for _, heir := range ix.lineage[nodeID] {
+		if !slices.Contains(candidates, heir) {
+			candidates = append(candidates, heir)
+		}
+	}
+	if len(candidates) == 0 {
 		return ref
 	}
-	n := ix.nodes[cur].Node
-	// 条目 supersedes 链解析(防环:步数上限)。
+	// 拆分时一个旧 node ID 可有多个继承者,条目只会被 remap 到其中一个。
+	// 必须先按 entry ID 在全部继承者中定位,不能先用 ResolveNodeID 固定选
+	// 字典序首个——否则 old#entry 会被归一到不含该条目的错误节点。
+	type match struct{ node, entry string }
+	var matches []match
+	for _, cur := range candidates {
+		if eid, ok := ix.resolveEntryInNode(cur, entryID); ok {
+			matches = append(matches, match{node: cur, entry: eid})
+		}
+	}
+	if len(matches) > 0 {
+		// 真正存在于现任同名节点的 exact entry 优先；稳定随机 entry ID 使它与
+		// 历史继承者碰撞的概率可忽略。现任不含该 entry 时才沿 lineage 追旧引用。
+		if ix.nodes[nodeID] != nil {
+			for _, m := range matches {
+				if m.node == nodeID {
+					return m.node + "#" + m.entry
+				}
+			}
+		}
+		sort.Slice(matches, func(i, j int) bool { return matches[i].node < matches[j].node })
+		return matches[0].node + "#" + matches[0].entry
+	}
+	// 保持原来的可诊断退化:节点能归一但条目不存在时,返回首个现任节点
+	// 加原 entry ID,由上层给出精确的“条目不在节点”错误。
+	return candidates[0] + "#" + entryID
+}
+
+// resolveEntryInNode 在单个现任节点内解析 supersedes 链。
+func (ix *Index) resolveEntryInNode(nodeID, entryID string) (string, bool) {
+	nref := ix.nodes[nodeID]
+	if nref == nil {
+		return "", false
+	}
 	byID := map[string]*model.Entry{}
-	for i := range n.Entries {
-		byID[n.Entries[i].ID] = &n.Entries[i]
+	for i := range nref.Node.Entries {
+		byID[nref.Node.Entries[i].ID] = &nref.Node.Entries[i]
 	}
 	eid := entryID
+	if byID[eid] == nil {
+		return "", false
+	}
 	for range 32 {
 		e, ok := byID[eid]
 		if !ok || e.SupersededBy == "" {
@@ -263,12 +363,14 @@ func (ix *Index) ResolveEntryRef(ref string) string {
 		}
 		eid = e.SupersededBy
 	}
-	return cur + "#" + eid
+	return eid, true
 }
 
 // DisputedBy 返回声明与该条目矛盾的条目引用(归一化;knowledge.md §12.4)。
 func (ix *Index) DisputedBy(entryRef string) []string {
-	out := ix.disputesRev[ix.ResolveEntryRef(entryRef)]
+	// disputesRev 是发布后只读的索引快照;排序前必须复制,否则多个持
+	// rt.mu.RLock 的 Recall 会并发改同一底层 slice。
+	out := append([]string(nil), ix.disputesRev[ix.ResolveEntryRef(entryRef)]...)
 	sort.Strings(out)
 	return out
 }
@@ -293,7 +395,8 @@ func (ix *Index) EntryByRef(ref string) *model.Entry {
 
 // Dependents 沿 basedOn 反向图取直接+间接依赖者(级联污染回收,knowledge.md §12.5)。
 func (ix *Index) Dependents(entryRef string) []string {
-	seen := map[string]bool{}
+	root := ix.ResolveEntryRef(entryRef)
+	seen := map[string]bool{root: true}
 	var out []string
 	var walk func(ref string)
 	walk = func(ref string) {
@@ -306,7 +409,7 @@ func (ix *Index) Dependents(entryRef string) []string {
 			walk(dep)
 		}
 	}
-	walk(entryRef)
+	walk(root)
 	sort.Strings(out)
 	return out
 }

@@ -17,6 +17,21 @@ import (
 	"github.com/zdypro888/iknowledge/internal/engine"
 )
 
+func TestLoopbackDialAddrNormalizesWildcard(t *testing.T) {
+	tests := map[string]string{
+		"0.0.0.0:18000": "127.0.0.1:18000",
+		":18000":        "127.0.0.1:18000",
+		"[::]:18000":    "[::1]:18000",
+		"127.0.0.1:9":   "127.0.0.1:9",
+		"[::1]:9":       "[::1]:9",
+	}
+	for input, want := range tests {
+		if got := loopbackDialAddr(input); got != want {
+			t.Errorf("loopbackDialAddr(%q)=%q, want %q", input, got, want)
+		}
+	}
+}
+
 // TestServeMultiRepo:多 repo 单守护 e2e(impl §1 修订)——一个 runServe 进程
 // 服务两个仓库,各自端口各答各的 repoRoot(连错仓库防护);SIGINT 优雅停机退出 0。
 func TestServeMultiRepo(t *testing.T) {

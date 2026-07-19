@@ -28,7 +28,13 @@ func startServe(t *testing.T, repo string, e *engine.Engine) int {
 	if err := os.WriteFile(filepath.Join(repo, ".knowledge", "config.yaml"), []byte(cfg), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	srv := &http.Server{Handler: mcpserv.New(e).Handler()}
+	identity, err := e.Store.EnsureLocalIdentity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	msrv := mcpserv.New(e)
+	msrv.LocalIdentity = identity
+	srv := &http.Server{Handler: msrv.Handler()}
 	go func() { _ = srv.Serve(ln) }()
 	t.Cleanup(func() { _ = srv.Close() })
 	return port
@@ -113,6 +119,11 @@ func TestHookBridgeAuth(t *testing.T) {
 	}
 	msrv := mcpserv.New(e)
 	msrv.AuthToken = tok
+	identity, err := e.Store.EnsureLocalIdentity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	msrv.LocalIdentity = identity
 	srv := &http.Server{Handler: msrv.Handler()}
 	go func() { _ = srv.Serve(ln) }()
 	t.Cleanup(func() { _ = srv.Close() })
@@ -125,41 +136,6 @@ func TestHookBridgeAuth(t *testing.T) {
 	}
 	if !strings.Contains(out.String(), "pass 传明文") {
 		t.Errorf("鉴权下 hook 注入失败(应自动带 token):%s", out.String())
-	}
-}
-
-func TestHookDoesNotLeakTokenToForgedBearerChallenge(t *testing.T) {
-	repo := setupGitRepo(t)
-	e, _ := initRepo(t, repo, engine.InitOptions{})
-	if _, err := e.Store.EnsureAuthToken(); err != nil {
-		t.Fatal(err)
-	}
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	port := ln.Addr().(*net.TCPAddr).Port
-	if err := os.WriteFile(filepath.Join(repo, ".knowledge", "config.yaml"),
-		fmt.Appendf(nil, "schema: 1\nport: %d\n", port), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	gotAuthorization := ""
-	srv := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		gotAuthorization = r.Header.Get("Authorization")
-		w.Header().Set("WWW-Authenticate", `Bearer realm="forged"`)
-		w.WriteHeader(http.StatusUnauthorized)
-	})}
-	go func() { _ = srv.Serve(ln) }()
-	t.Cleanup(func() { _ = srv.Close() })
-
-	stdin := fmt.Sprintf(`{"session_id":"x","cwd":%q,"tool_input":{"file_path":%q}}`,
-		repo, filepath.Join(repo, "internal", "auth", "login.go"))
-	var out bytes.Buffer
-	if code := runHook([]string{"--repo", repo}, strings.NewReader(stdin), &out); code != 0 {
-		t.Fatalf("hook 退出码 %d", code)
-	}
-	if gotAuthorization != "" || out.Len() != 0 {
-		t.Fatalf("伪造 challenge 不得获得 token/注入:auth=%q out=%s", gotAuthorization, out.String())
 	}
 }
 
@@ -215,9 +191,9 @@ func TestSetupPrints(t *testing.T) {
 	for _, want := range []string{
 		"mcpServers", "/mcp/main?repo=",
 		"本仓库配有 knowledge MCP", // 纪律段(engine.DisciplinePrompt 首行)
-		"PostToolUse", "iknowledge hook --repo",
+		"PostToolUse", `"command": "iknowledge hook"`,
 		"[mcp_servers.knowledge]", "AGENTS.md", // Codex 段(config.toml + 纪律载体)
-		"Git pre-commit 预检", "iknowledge precheck --repo",
+		"Git pre-commit 预检", "iknowledge precheck --repo .",
 	} {
 		if !strings.Contains(out.String(), want) {
 			t.Errorf("setup 输出缺 %q", want)
@@ -258,33 +234,28 @@ func TestSetupPrintsCodexAuthHeaders(t *testing.T) {
 	}
 }
 
-func TestSetupFailsClosedOnCorruptAuthToken(t *testing.T) {
-	repo := setupGitRepo(t)
-	e, _ := initRepo(t, repo, engine.InitOptions{})
-	if _, err := e.Store.EnsureConfig(); err != nil {
+func TestHooksJSONSnippetIsCrossShellSafe(t *testing.T) {
+	snippet := hooksJSONSnippet()
+	if !json.Valid([]byte(snippet)) {
+		t.Fatalf("hook 片段不是合法 JSON:\n%s", snippet)
+	}
+	var got struct {
+		Hooks struct {
+			PostToolUse []struct {
+				Hooks []struct {
+					Command string `json:"command"`
+				} `json:"hooks"`
+			} `json:"PostToolUse"`
+		} `json:"hooks"`
+	}
+	if err := json.Unmarshal([]byte(snippet), &got); err != nil {
 		t.Fatal(err)
 	}
-	path := filepath.Join(repo, ".knowledge", "local", "token")
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		t.Fatal(err)
+	if len(got.Hooks.PostToolUse) != 1 || len(got.Hooks.PostToolUse[0].Hooks) != 1 {
+		t.Fatalf("hook 结构异常: %+v", got)
 	}
-	if err := os.WriteFile(path, []byte("broken\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	var out bytes.Buffer
-	if code := runSetup([]string{"--repo", repo}, &out); code != 1 {
-		t.Fatalf("损坏 token 时 setup 必须 fail closed,退出码=%d\n%s", code, out.String())
-	}
-}
-
-func TestHooksJSONSnippetQuotesRepoPath(t *testing.T) {
-	root := `/tmp/repo with space/it's`
-	snippet := hooksJSONSnippet(root)
-	var decoded map[string]any
-	if err := json.Unmarshal([]byte(snippet), &decoded); err != nil {
-		t.Fatalf("hook 片段不是合法 JSON:%v\n%s", err, snippet)
-	}
-	if !strings.Contains(snippet, `repo with space`) || !strings.Contains(snippet, `'\"'\"'`) {
-		t.Fatalf("hook 命令未安全引用路径:%s", snippet)
+	want := "iknowledge hook"
+	if command := got.Hooks.PostToolUse[0].Hooks[0].Command; command != want {
+		t.Fatalf("command = %q, want %q", command, want)
 	}
 }

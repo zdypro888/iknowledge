@@ -1,17 +1,19 @@
 # iknowledge 开发约定
 
-AI 代码知识库(MCP 服务)。**两份设计文档是唯一真相源**,实现与其冲突时要么修文档(留痕)要么修实现,不许静默偏离:
+AI 代码知识库(MCP 服务)。**两份现行设计文档是唯一真相源**,实现与其冲突时要么修文档(留痕)要么修实现,不许静默偏离:
 
 - [knowledge.md](knowledge.md) — 概念设计全案(五维模型、自愈机制、两条铁律、五篇推演)
 - [knowledge-impl.md](knowledge-impl.md) — 第一期工程方案(数据模型、存储、MCP API 全量规范、里程碑)——**写代码照这份**,已含推演五的全部定案
 
+[vecdb.md](vecdb.md) 只记录可选向量检索提案,尚未实现,不属于现有能力或现行实现正本。
+
 ## 铁律(违反即返工)
 
 - **零重依赖**:第一期仅允许 `gopkg.in/yaml.v3`;禁止引入 MCP SDK/JSON-RPC 框架/tokenizer——JSON-RPC 2.0 手写(风格参照 aibridge 的 `internal/bridge/mcp.go`)
-- **工具对源码只读**:唯一写入 `.knowledge/`(设计铁律二);任何往 `.knowledge/` 之外写文件的代码都是 bug
-- 包依赖方向:`mcpserv → engine → {store, index, parser, model}`;`model` 不依赖任何内部包
+- **工具对源码只读**:仓库内容只写 `.knowledge/`(设计铁律二),永不改源码;仓库外写入仅限按 canonical repo path 分仓的用户私有运行态(auth/local identity/scout trust/崩溃 WAL)、显式 `export -o` 制品与 install/uninstall 用户级部署,除此之外都是 bug
+- 包依赖方向:`mcpserv → engine → {store, index, parser, model, pty}`;`model`/`pty` 不依赖任何内部包
 - 表驱动测试;所有 YAML 写入走 temp + fsync + `os.Rename` + 目录 fsync 原子写(轮 25);分片读写必须保留未知字段(yaml.Node 往返)
-- 双哈希语义不许混用:`Hash` 只管腐烂检测,`StructHash` 只管迁移匹配(impl §5)
+- 三种哈希语义不许混用:`Hash` 只管腐烂检测,`StructHash` 只找迁移候选,`DocStructHash` 决定候选能否保持 fresh(impl §5/§6)
 - **测试 MCP:协议级手段优先**(curl / httptest,便宜无额度消耗);真实客户端联测**禁用 `claude -p`**(独立限流池,撞账号限额),用 **PTY 驱动交互式 claude**(aibridge `internal/agent` 模式,用户已授权)
 
 ## 命令
@@ -48,7 +50,7 @@ go test -race ./...
 
 ⑥**JS/TS 解析器**(多语言 T1):纯 Go 轻量词法(零运行时依赖,Node.js 不自带 AST 解析库),.ts/.tsx/.js/.jsx/.mjs/.cjs/.mts/.cts。近似解析(宁缺不要错),格式/注释免疫哈希 + 改名免疫 StructHash。恒注册(纯 Go 无需探测)。
 
-⑦**工程化/健壮性**:atomicWrite symlink 防线注释;fsyncdir build tag !unix→windows(+unknown 报错版);Python helper -S + 清环境变量;mergeUnknown/cloneNode 深度限(防恶意嵌套栈溢出);只读端点 limit 钳制;session 在访问/initialize 时机会性回收 + cap 10000(无常驻清扫 goroutine 生命周期泄漏)。
+⑦**工程化/健壮性**:atomicWrite symlink 防线注释;fsyncdir build tag !unix→windows(+unknown 报错版);Python helper `-I -S` + 最小环境/非仓库 cwd;mergeUnknown/cloneNode 深度限(防恶意嵌套栈溢出);只读端点 limit 钳制;session 后台回收 goroutine + cap 10000。
 
 全轮零重依赖守住(go.mod 仍只 yaml.v3)、工具不碰源码、包依赖方向不变。新增 ~1500 行 Go(含测试),总测试 149→175+。
 
@@ -68,6 +70,10 @@ go test -race ./...
 
 **轮 32(2026-07-09,地基验证 + 智能升级——"完善智能"三件)**:用户命题"按最完美方法做,尽量完善智能"。①**端到端工作流集成测试**:4 个测试模拟 AI 真实工作序列(record→recall→防撞→revert / diagnose 定位 / 雷区累积 / 跨会话 stale),验证轮29~30 所有功能协同正确(此前 181 测试全是单工具单点)。发现 stale 测试构造要点:Go parser 哈希 gofmt 免疫且行内注释不参与,须改实际语句才触发失配;②**变更影响面分析**:record_change 回执末尾用 callgraph calledByOf 报告波及调用方——改一个函数立刻知道"被 N 处调用,其中带契约知识的 M 处可能被破坏,建议 kb_recall 复核"。从"记忆"到"主动协作"的关键一跃;③**知识缺口发现**:kb_status 加知识缺口 TOP5(被依赖 calledBy≥2 却零活跃知识的节点),主动提示"这块每次用都得从零读代码,该沉淀契约/坑了"。三批次 build/vet/-race 全绿,新增 ~470 行(含测试),总测试 181→193。
 
-**轮 33(2026-07-18,参考 projectmem 后的选择性吸收)**:只借能强化本项目边界的机制,不搬全局跨项目记忆、watcher/dashboard、把 commit 前缀自动当决策、硬编码 token/金额 ROI。①修复 stdio 鉴权降级 P1:token 先于探活加载,健康检查带 Bearer,token 在位时自动拉起 `serve --auth`,token 文件存在但空/损坏时 fail closed;②所有语义写入口与 bundle 导入默认秘密脱敏(厂商 token/JWT/Bearer/私钥/URL 凭证/常见 credential 赋值),命中类型与数量回执,原文不落盘;③新增 `iknowledge precheck` 暂存区预检,把源码映射到历史否决、suspect/orphan/pending、未决矛盾、雷区/pitfall;记账只认相对 HEAD 新增且节点精确覆盖源码的 journal,无关记录/改写旧 ID 不得假通过;缺省只告警、`--strict` 才阻断,setup 仅打印可选 pre-commit 片段;④新增 `iknowledge brief --budget` 一屏 Markdown(WIP/风险/近期决策/维护债),严格预算、源码优先、输出二次脱敏且截断不丢防投毒数据框;⑤usage 只记录真实 precheck 次数/告警/阻断,不编造节省金额。仍零新依赖、MCP 工具数不变、只写 `.knowledge/`。
+**轮 33(2026-07-09,预编译发布)**:release workflow 在 `v*` tag 构建 darwin/linux/windows × amd64/arm64、生成 sha256sums 并创建 GitHub Release;install.sh 优先预编译、无匹配资产回退 go install,双宿主 skill 同步安装。`v0.2.0` 为首个标签;随后主线补 Windows arm64 与 installer 静态加固。
 
-**轮 34(2026-07-18,轮33交付后的全仓第三方复审与收口)**:按 go-audit 规则从威胁边界、协议、并发、持久化、发布与运维重新审计,不是只复跑已有测试。修复项:①precheck 覆盖增改删/重命名,删除记账后不永久死锁;只认相对 HEAD 新增、真实 `chg_<UTC>_<16hex>` + 非零 at + nodes/what/why 且能反查同一源码的记录;②鉴权 token 损坏/权限过宽 fail closed,stdio 与 hook 发送 Bearer 前均以随机 256-bit nonce + HMAC-SHA256(token,nonce) 做不可重放持钥证明,拒绝无鉴权端口、普通 Bearer challenge、静态指纹重放与重定向;旧后台 serve 升级后需重启一次。主动同机代理实时转发挑战/流量仍是明文 loopback 的诚实边界,靠 OS/用户隔离;③MCP 修正 parse error/invalid request、显式 `id:null`、stdio 错误转发与 4MiB 真上限,移除无生命周期的 session reaper goroutine;④语义写入与 bundle 导入脱敏覆盖全部参数类型,brief/precheck 始终保留防投毒数据框;⑤CLI/MCP 共用 buildinfo,release tag 以 ldflags 注入;⑥清完 53 项历史 errcheck/style lint,修正文件关闭/原子写/journal close、PTY 非 TUI 直接交卷兼容及竞态。**独立复审结论:P0=0、P1=0、P2=0(无开放可执行项)**。全仓 224 个 Test/Fuzz/Benchmark 入口;`go test -shuffle=on -count=1 ./...`、`go test -race -count=1 ./...`、`go vet ./...`、`staticcheck ./...`、`golangci-lint run ./...`(0 issues)、`govulncheck ./...`(No vulnerabilities)、`go mod tidy -diff`、`git diff --check`、gofmt 全绿;darwin/linux/windows × amd64/arm64 六目标构建全过;release 版本注入冒烟输出 `iknowledge v9.9.9-smoke go1.26.5`。仍零新依赖、工具不写源码、未提交/未推送。
+**轮 34(2026-07-11,先 pull 最新后全仓审核并修复)**:安全/事务/解析/并发四镜头清盘。①self scout 授权、auth 根 token、本机 listener identity 全迁仓外用户私有态;stdio/hook/scout 无论 Bearer 开关均先做 loopback 双向 HMAC,仓内临时配置只含 scope 短 session;源码与 `.knowledge` 根以下 symlink/非普通文件统一拒绝。②record_change/verify/revert/adopt/task-complete/import 统一用仓外 prepared/committed WAL,恢复只允许 writer-lock owner,panic 同进程回滚;结构化 Entry/Node effects 使 revert 可证明、旧记录 fail closed。③bundle 必须唯一 manifest/单 gzip,限制单条/总量/header/staging,拒尾随、非普通、不可便携与运行时不可见路径;默认不覆盖异内容,显式 `--force`;remap 覆盖 project/tree/flow/journal/config 并做最终引用/月分片/effects 校验。④Go 哈希/调用图按 `(dir,package)` 隔离,Python `-I -S`+PEP263,TS regex/class initializer,Java/Rust 边界修正;DocStructHash 护栏。⑤session ledger/callgraph 不可变快照,重复 Node ID 全隔离,历史/FlowStep 按 Since 路由代际,拆分 entry 找真实继承者,WIP 按 session。⑥安装/卸载/发布跨平台与 checksum/原子性加固。README/两份正本同步;交付门仍为 build/vet/全量 race + shell 语法/脚本动态回归 + Windows 双架构交叉构建。未发布/未打新 tag。
+
+**轮 35(2026-07-18,参考 ProjectMem 后的选择性吸收)**:只吸收能强化“代码知识库”边界的机制,不搬全局跨项目记忆、watcher/dashboard、把 commit 前缀自动当决策或虚构金额 ROI。①所有语义写入口与 bundle 导入默认秘密脱敏(厂商 token/JWT/Bearer/私钥/URL 凭证/常见 credential 赋值),命中只回执类型/数量,原文不落盘;②新增 `iknowledge precheck` 暂存区预检,把源码增改删/重命名映射到历史否决、suspect/orphan/pending、未决矛盾、雷区/pitfall,记账只认相对 HEAD 新增且节点精确覆盖源码的 journal;缺省告警,`--strict` 才阻断;③新增 `iknowledge brief --budget` 一屏 Markdown(WIP/风险/近期决策/维护债),严格预算且始终保留防投毒数据框;④usage 只记录真实 precheck 次数/告警/阻断;⑤CLI/MCP 统一使用 `internal/buildinfo` 发布版本。仍零新依赖、MCP 工具数不变、只写既定边界。
+
+**轮 36(2026-07-19,分支合并收口 + 向量检索定案留档)**:把轮35能力合并到轮34之后的事务、bundle、listener identity 与解析加固主线,冲突处理以主线安全边界为底座并补齐回归:bundle 在 remap 后/写盘前脱敏且 dry-run 同报告;JSON-RPC 真 4MiB 上限、parse/invalid request 与显式 `id:null` 语义修正;stdio 同步转发 `id:null`;session 改机会性回收+容量上限,移除无生命周期后台 goroutine;自派侦察兵兼容不读 PTY 而直接交卷的非 TUI 命令。新增 [`vecdb.md`](vecdb.md) 定义尚未实现的可选语义检索层:默认纯 Go Flat 派生索引、仅摘要、混合召回、Zvec 只作规模增长后的可选后端;不得把设计文档误报为现有能力。

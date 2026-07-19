@@ -27,6 +27,10 @@ func TestSelfDispatchE2E(t *testing.T) {
 	}
 	repo := setupGitRepo(t)
 	e, _ := initRepo(t, repo, engine.InitOptions{})
+	rootToken, err := e.Store.EnsureAuthToken()
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -40,15 +44,25 @@ func TestSelfDispatchE2E(t *testing.T) {
 	cfg := fmt.Sprintf(`schema: 1
 port: %d
 scout: self
-scout_command: 'GO_SCOUT_HELPER=1 %s -test.run=TestScoutHelperProcess -- {mcp}'
+scout_command: '%s -test.run=TestScoutHelperProcess -- {mcp}'
 scout_timeout_seconds: 30
 `, port, bin)
 	if err := os.WriteFile(filepath.Join(repo, ".knowledge", "config.yaml"), []byte(cfg), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	srv := &http.Server{Handler: mcpserv.New(e).Handler()}
-	go func() { _ = srv.Serve(ln) }()
-	t.Cleanup(func() { _ = srv.Close() })
+	if _, _, err := engine.TrustScout(e.Store); err != nil {
+		t.Fatalf("授权测试侦察兵: %v", err)
+	}
+	mcpServer := mcpserv.New(e)
+	mcpServer.AuthToken = rootToken
+	identity, err := e.Store.EnsureLocalIdentity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	mcpServer.LocalIdentity = identity
+	srv := &http.Server{Handler: mcpServer.Handler()}
+	go srv.Serve(ln)
+	t.Cleanup(func() { srv.Close() })
 	e.SetScoutAddr(fmt.Sprintf("127.0.0.1:%d", port))
 
 	out, err := e.Investigate(engine.InvestigateArgs{Question: "支付回调偶发超时的原因在哪"}, "sid-self", "claude-code")
@@ -62,12 +76,9 @@ scout_timeout_seconds: 30
 	}
 }
 
-// TestScoutHelperProcess 是假侦察兵进程本体(仅当 GO_SCOUT_HELPER=1 时活动):
+// TestScoutHelperProcess 是假侦察兵进程本体（由 -test.run 精确重执行）:
 // 读 {mcp} 配置 → initialize(带 Mcp-Session-Id 回带)→ tools/call kb_submit_findings。
 func TestScoutHelperProcess(t *testing.T) {
-	if os.Getenv("GO_SCOUT_HELPER") != "1" {
-		t.Skip("helper 进程专用")
-	}
 	var cfgPath string
 	for i, a := range os.Args {
 		if a == "--" && i+1 < len(os.Args) {
@@ -75,7 +86,7 @@ func TestScoutHelperProcess(t *testing.T) {
 		}
 	}
 	if cfgPath == "" {
-		t.Fatal("缺 {mcp} 参数")
+		t.Skip("helper 进程专用")
 	}
 	data, err := os.ReadFile(cfgPath)
 	if err != nil {
@@ -93,6 +104,10 @@ func TestScoutHelperProcess(t *testing.T) {
 	kn, ok := cfg.MCPServers["knowledge"]
 	if !ok {
 		t.Fatal("配置缺 knowledge 条目")
+	}
+	if auth := kn.Headers["Authorization"]; strings.HasPrefix(auth, "Bearer ") ||
+		!strings.HasPrefix(auth, "IKnowledgeSession ") {
+		t.Fatalf("临时 scout 配置必须只含短期 session，不能含根 Bearer: %q", auth)
 	}
 	// job ID 从 URL 路径提取(/mcp/scout/<job>?repo=...)。
 	jobPart := kn.URL[strings.LastIndex(kn.URL, "/")+1:]
@@ -117,12 +132,8 @@ func TestScoutHelperProcess(t *testing.T) {
 		t.Fatal(err)
 	}
 	sid := resp.Header.Get("Mcp-Session-Id")
-	if _, err := io.Copy(io.Discard, resp.Body); err != nil {
-		t.Fatal(err)
-	}
-	if err := resp.Body.Close(); err != nil {
-		t.Fatal(err)
-	}
+	io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
 
 	call := fmt.Sprintf(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"kb_submit_findings","arguments":{"job":%q,"conclusion":"回调超时来自网关重试风暴","locations":["internal/auth/login.go#Login"],"plan":"给回调处理加幂等键","risks":"重试窗口内的重复入账"}}}`, job)
 	resp, err = post(sid, call)
@@ -130,12 +141,8 @@ func TestScoutHelperProcess(t *testing.T) {
 		t.Fatal(err)
 	}
 	var buf bytes.Buffer
-	if _, err := io.Copy(&buf, resp.Body); err != nil {
-		t.Fatal(err)
-	}
-	if err := resp.Body.Close(); err != nil {
-		t.Fatal(err)
-	}
+	io.Copy(&buf, resp.Body)
+	resp.Body.Close()
 	if !strings.Contains(buf.String(), "ack") {
 		t.Fatalf("交卷失败:%s", buf.String())
 	}

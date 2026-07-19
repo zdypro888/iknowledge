@@ -3,7 +3,6 @@
 package mcpserv
 
 import (
-	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
@@ -11,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"path/filepath"
@@ -21,56 +21,14 @@ import (
 
 	"github.com/zdypro888/iknowledge/internal/buildinfo"
 	"github.com/zdypro888/iknowledge/internal/engine"
+	"github.com/zdypro888/iknowledge/internal/store"
 )
 
 const protocolVersion = "2025-06-18"
 const maxRPCBodyBytes = 4 << 20
 
-// AuthFingerprintHeader 是 256-bit 随机 token 的 SHA-256,仅供实例诊断与
-// 排除误连,不可单独作持钥证明(值可被读取后重放);实际预认证见 nonce-HMAC 头。
-const AuthFingerprintHeader = "X-Iknowledge-Auth-SHA256"
-
-// AuthChallengeHeader/AuthProofHeader 构成发送 Bearer 前的 nonce-HMAC 证明。
-// 静态指纹可被读取后重放,只能诊断实例;随机挑战证明当前监听者此刻持有 token。
-const (
-	AuthChallengeHeader = "X-Iknowledge-Auth-Challenge"
-	AuthProofHeader     = "X-Iknowledge-Auth-Proof"
-)
-
-func AuthFingerprint(token string) string {
-	sum := sha256.Sum256([]byte(token))
-	return hex.EncodeToString(sum[:])
-}
-
-func NewAuthChallenge() (string, error) {
-	b := make([]byte, 32)
-	if _, err := rand.Read(b); err != nil {
-		return "", err
-	}
-	return hex.EncodeToString(b), nil
-}
-
-func AuthProof(token, challenge string) string {
-	mac := hmac.New(sha256.New, []byte(token))
-	_, _ = mac.Write([]byte(challenge)) // hash.Hash writes never fail
-	return hex.EncodeToString(mac.Sum(nil))
-}
-
-func VerifyAuthProof(token, challenge, proof string) bool {
-	want := AuthProof(token, challenge)
-	return hmac.Equal([]byte(proof), []byte(want))
-}
-
-func validAuthChallenge(challenge string) bool {
-	b, err := hex.DecodeString(challenge)
-	return err == nil && len(b) == 32
-}
-
-// serverVersion 与 CLI version 同源取 Go 构建元数据:发布安装显示模块标签,
-// 本地构建显示 (devel),避免功能已前进但 MCP 仍伪报旧版本常量。
-func serverVersion() string {
-	return buildinfo.Read().Version
-}
+// serverVersion 与 CLI 版本共用构建元数据，避免两个入口报告不同版本。
+func serverVersion() string { return buildinfo.Read().Version }
 
 // Server 是一个仓库的 MCP 服务。
 type Server struct {
@@ -78,9 +36,16 @@ type Server struct {
 	// AuthToken 非空即启用 Bearer 鉴权(impl §1 --auth,2026-07-04 自四期提前):
 	// 全部端点(含 /inject)要求 Authorization: Bearer <token>。Handler() 前设置。
 	AuthToken string
+	// LocalIdentity 始终用于内部 loopback 的双向 HMAC 身份证明；它不决定
+	// 业务端点是否要求鉴权，因而可在 AuthToken 为空时防端口冒充。
+	LocalIdentity string
 
 	mu       sync.Mutex
 	sessions map[string]*session
+
+	authMu         sync.Mutex
+	authChallenges map[string]localAuthChallenge
+	authSessions   map[string]localAuthSession
 }
 
 type session struct {
@@ -88,15 +53,35 @@ type session struct {
 	lastSeen time.Time
 }
 
+type localAuthChallenge struct {
+	client  string
+	scope   string
+	expires time.Time
+}
+
+type localAuthSession struct {
+	scope   string
+	expires time.Time
+}
+
+const (
+	localChallengeTTL = 30 * time.Second
+	localSessionTTL   = time.Hour // 覆盖最长 32m self scout；stdio 到期会自动重握手。
+	maxChallenges     = 1024
+	maxAuthSessions   = 4096
+)
+
 // sessionTTL 是 MCP 会话的空闲上限(R2-D2:原先 sessions 只增不清,长跑 serve
 // 内存无界增长;engine 侧台账早有 2h TTL,这里不对称)。过期会话按规范返回 404,
-// 客户端自动重新 initialize——与服务端重启后的自愈路径完全相同。回收在会话
-// 访问/initialize 时机会性执行;容量另有 10000 硬上限,无需常驻清扫 goroutine。
+// 客户端自动重新 initialize——与服务端重启后的自愈路径完全相同。
 const sessionTTL = 24 * time.Hour
 
 // New 建服务。
 func New(e *engine.Engine) *Server {
-	return &Server{E: e, sessions: map[string]*session{}}
+	return &Server{
+		E: e, sessions: map[string]*session{},
+		authChallenges: map[string]localAuthChallenge{}, authSessions: map[string]localAuthSession{},
+	}
 }
 
 // Handler 返回完整路由(impl §7.1):
@@ -106,28 +91,35 @@ func New(e *engine.Engine) *Server {
 //	     /mcp                 308 → /mcp/main(原示例写 /mcp,照抄连不上——M1.2 验收入口)
 //	GET  /inject              hook 注入端点(非 MCP)
 func (s *Server) Handler() http.Handler {
-	mux := http.NewServeMux()
-	mux.HandleFunc("/mcp/main", func(w http.ResponseWriter, r *http.Request) {
+	protected := http.NewServeMux()
+	protected.HandleFunc("/mcp/main", func(w http.ResponseWriter, r *http.Request) {
 		s.serveRPC(w, r, "main")
 	})
-	mux.HandleFunc("/mcp/scout/", func(w http.ResponseWriter, r *http.Request) {
+	protected.HandleFunc("/mcp/scout/", func(w http.ResponseWriter, r *http.Request) {
 		s.serveRPC(w, r, "scout")
 	})
-	mux.HandleFunc("/mcp", func(w http.ResponseWriter, r *http.Request) {
+	protected.HandleFunc("/mcp", func(w http.ResponseWriter, r *http.Request) {
 		target := "/mcp/main"
 		if r.URL.RawQuery != "" {
 			target += "?" + r.URL.RawQuery
 		}
 		http.Redirect(w, r, target, http.StatusPermanentRedirect)
 	})
-	mux.HandleFunc("/inject", s.serveInject)
+	protected.HandleFunc("/inject", s.serveInject)
 	// 子代理只读腿(2026-07-04,实战反馈:受限工具集的审计/侦查子代理没有 kb_* 工具,
 	// 主 AI 手工转录知识进 brief 必有损耗——但子代理有 shell,curl 即可查库):
 	// 纯只读,记账/沉淀仍归有 MCP 的主 AI;同受 auth/origin 门;usage 照记。
-	mux.HandleFunc("/recall", s.serveRecall)
-	mux.HandleFunc("/map", s.serveMap)
-	mux.HandleFunc("/status", s.serveStatus)
-	return s.authGuard(originGuard(mux))
+	protected.HandleFunc("/recall", s.serveRecall)
+	protected.HandleFunc("/map", s.serveMap)
+	protected.HandleFunc("/status", s.serveStatus)
+
+	// 本机 challenge/session 端点必须在根 Bearer guard 之外，否则客户端为了
+	// 认证 server 又得先把根密钥发给未知 listener，正是此协议要消除的漏洞。
+	root := http.NewServeMux()
+	root.HandleFunc(store.LocalAuthChallengePath, s.serveLocalAuthChallenge)
+	root.HandleFunc(store.LocalAuthSessionPath, s.serveLocalAuthSession)
+	root.Handle("/", s.authGuard(protected))
+	return originGuard(root)
 }
 
 // authGuard Bearer 鉴权(AuthToken 非空时):常数时间比较防时序侧信道。
@@ -137,24 +129,210 @@ func (s *Server) authGuard(next http.Handler) http.Handler {
 		return next
 	}
 	wantHash := sha256.Sum256([]byte("Bearer " + s.AuthToken))
-	fingerprint := AuthFingerprint(s.AuthToken)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// 静态指纹用于诊断;客户端只有在下面的 nonce-HMAC 证明通过后才发送
-		// Bearer。它仍不是抵御主动实时转发代理的通道绑定。
-		w.Header().Set(AuthFingerprintHeader, fingerprint)
-		if challenge := r.Header.Get(AuthChallengeHeader); validAuthChallenge(challenge) {
-			w.Header().Set(AuthProofHeader, AuthProof(s.AuthToken, challenge))
+		got := []byte(r.Header.Get("Authorization"))
+		gotHash := sha256.Sum256(got)
+		rootOK := subtle.ConstantTimeCompare(gotHash[:], wantHash[:]) == 1
+		sessionOK := false
+		if !rootOK {
+			prefix := store.LocalSessionAuthScheme + " "
+			header := string(got)
+			if strings.HasPrefix(header, prefix) {
+				sessionOK = s.localAuthSessionValid(strings.TrimPrefix(header, prefix), r.URL.Path, time.Now())
+			}
 		}
-		// 先哈希成固定宽度再常数时间比较,避免 subtle.ConstantTimeCompare 对不等长
-		// 输入提前返回。Authorization 长度本身不是秘密,但注释与实现都不虚称。
-		gotHash := sha256.Sum256([]byte(r.Header.Get("Authorization")))
-		if subtle.ConstantTimeCompare(gotHash[:], wantHash[:]) != 1 {
+		if !rootOK && !sessionOK {
 			w.Header().Set("WWW-Authenticate", `Bearer realm="iknowledge"`)
-			http.Error(w, "unauthorized: serve 以 --auth 启动,需 Authorization: Bearer <.knowledge/local/token>", http.StatusUnauthorized)
+			http.Error(w, "unauthorized: 需要显式 HTTP Bearer 或经本机 HMAC 握手取得的短期 session", http.StatusUnauthorized)
 			return
 		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+func (s *Server) serveLocalAuthChallenge(w http.ResponseWriter, r *http.Request) {
+	if s.LocalIdentity == "" {
+		http.NotFound(w, r)
+		return
+	}
+	if !localAuthRequestIsLoopback(r) {
+		http.Error(w, "local auth is loopback-only", http.StatusForbidden)
+		return
+	}
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	var input struct {
+		Client string `json:"client"`
+		Scope  string `json:"scope"`
+	}
+	if !decodeLocalAuthJSON(w, r, &input) {
+		return
+	}
+	if !store.ValidLocalAuthValue(input.Client) || !validLocalAuthScope(input.Scope) {
+		http.Error(w, "invalid local auth request", http.StatusBadRequest)
+		return
+	}
+	challenge, err := secureHex32()
+	if err != nil {
+		http.Error(w, "entropy unavailable", http.StatusInternalServerError)
+		return
+	}
+	now := time.Now()
+	s.authMu.Lock()
+	s.pruneLocalAuthLocked(now)
+	if len(s.authChallenges) >= maxChallenges {
+		s.authMu.Unlock()
+		http.Error(w, "too many auth challenges", http.StatusTooManyRequests)
+		return
+	}
+	s.authChallenges[challenge] = localAuthChallenge{client: input.Client, scope: input.Scope, expires: now.Add(localChallengeTTL)}
+	s.authMu.Unlock()
+	writeLocalAuthJSON(w, map[string]string{"challenge": challenge})
+}
+
+func (s *Server) serveLocalAuthSession(w http.ResponseWriter, r *http.Request) {
+	if s.LocalIdentity == "" {
+		http.NotFound(w, r)
+		return
+	}
+	if !localAuthRequestIsLoopback(r) {
+		http.Error(w, "local auth is loopback-only", http.StatusForbidden)
+		return
+	}
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	var input struct {
+		Client    string `json:"client"`
+		Challenge string `json:"challenge"`
+		Scope     string `json:"scope"`
+		Proof     string `json:"proof"`
+	}
+	if !decodeLocalAuthJSON(w, r, &input) {
+		return
+	}
+	if !store.ValidLocalAuthValue(input.Client) || !store.ValidLocalAuthValue(input.Challenge) ||
+		!store.ValidLocalAuthValue(input.Proof) || !validLocalAuthScope(input.Scope) {
+		http.Error(w, "invalid local auth proof", http.StatusUnauthorized)
+		return
+	}
+	now := time.Now()
+	s.authMu.Lock()
+	s.pruneLocalAuthLocked(now)
+	challenge, ok := s.authChallenges[input.Challenge]
+	delete(s.authChallenges, input.Challenge) // 成败都一次性消费，防重放/在线猜测。
+	s.authMu.Unlock()
+	if !ok || challenge.client != input.Client || challenge.scope != input.Scope || !challenge.expires.After(now) {
+		http.Error(w, "invalid local auth proof", http.StatusUnauthorized)
+		return
+	}
+	want, err := store.LocalAuthClientProof(s.LocalIdentity, input.Client, input.Challenge, input.Scope)
+	if err != nil || !store.EqualLocalAuthProof(input.Proof, want) {
+		http.Error(w, "invalid local auth proof", http.StatusUnauthorized)
+		return
+	}
+	session, err := secureHex32()
+	if err != nil {
+		http.Error(w, "entropy unavailable", http.StatusInternalServerError)
+		return
+	}
+	expiresAt := now.Add(localSessionTTL).Truncate(time.Second)
+	serverProof, err := store.LocalAuthServerProof(s.LocalIdentity, input.Client, input.Challenge, input.Scope, session, expiresAt.Unix())
+	if err != nil {
+		http.Error(w, "local auth failure", http.StatusInternalServerError)
+		return
+	}
+	s.authMu.Lock()
+	s.pruneLocalAuthLocked(now)
+	if len(s.authSessions) >= maxAuthSessions {
+		s.authMu.Unlock()
+		http.Error(w, "too many auth sessions", http.StatusServiceUnavailable)
+		return
+	}
+	s.authSessions[session] = localAuthSession{scope: input.Scope, expires: expiresAt}
+	s.authMu.Unlock()
+	writeLocalAuthJSON(w, struct {
+		Session   string `json:"session"`
+		ExpiresAt int64  `json:"expires_at"`
+		Proof     string `json:"proof"`
+	}{Session: session, ExpiresAt: expiresAt.Unix(), Proof: serverProof})
+}
+
+func localAuthRequestIsLoopback(r *http.Request) bool {
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return false
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
+func decodeLocalAuthJSON(w http.ResponseWriter, r *http.Request, out any) bool {
+	r.Body = http.MaxBytesReader(w, r.Body, 8192)
+	dec := json.NewDecoder(r.Body)
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(out); err != nil {
+		http.Error(w, "invalid local auth request", http.StatusBadRequest)
+		return false
+	}
+	var extra any
+	if err := dec.Decode(&extra); err != io.EOF {
+		http.Error(w, "invalid local auth request", http.StatusBadRequest)
+		return false
+	}
+	return true
+}
+
+func writeLocalAuthJSON(w http.ResponseWriter, value any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "no-store")
+	_ = json.NewEncoder(w).Encode(value)
+}
+
+func secureHex32() (string, error) {
+	b := make([]byte, 32)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(b), nil
+}
+
+func (s *Server) pruneLocalAuthLocked(now time.Time) {
+	for challenge, state := range s.authChallenges {
+		if !state.expires.After(now) {
+			delete(s.authChallenges, challenge)
+		}
+	}
+	for session, state := range s.authSessions {
+		if !state.expires.After(now) {
+			delete(s.authSessions, session)
+		}
+	}
+}
+
+func (s *Server) localAuthSessionValid(session, requestPath string, now time.Time) bool {
+	if !store.ValidLocalAuthValue(session) {
+		return false
+	}
+	s.authMu.Lock()
+	defer s.authMu.Unlock()
+	s.pruneLocalAuthLocked(now)
+	state, ok := s.authSessions[session]
+	return ok && state.expires.After(now) && state.scope == requestPath
+}
+
+func validLocalAuthScope(scope string) bool {
+	if len(scope) > 512 {
+		return false
+	}
+	switch scope {
+	case "/mcp/main", "/inject", "/recall", "/map", "/status":
+		return true
+	}
+	return strings.HasPrefix(scope, "/mcp/scout/") && len(strings.TrimPrefix(scope, "/mcp/scout/")) > 0
 }
 
 // originGuard 是 MCP 2025-06-18 传输安全要求(R2-E1):
@@ -246,8 +424,7 @@ func (s *Server) serveRPC(w http.ResponseWriter, r *http.Request, role string) {
 		return
 	}
 
-	// 通知是“完全没有 id 字段”的合法请求 → 202 无体。显式 id:null 虽不推荐,
-	// 仍是请求而非通知,必须返回 id:null 的响应(JSON-RPC 2.0 §4.1)。
+	// 通知只有“完全没有 id 字段”的合法请求。显式 id:null 仍必须返回响应。
 	if len(req.ID) == 0 {
 		w.WriteHeader(http.StatusAccepted)
 		return
@@ -606,7 +783,7 @@ func writeReadOnly(w http.ResponseWriter, out string, err error) {
 		return
 	}
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-	_, _ = io.WriteString(w, out) // response is already committed; no recovery path remains
+	_, _ = io.WriteString(w, out) // response 已提交，无可恢复路径
 }
 
 func (s *Server) serveInject(w http.ResponseWriter, r *http.Request) {
@@ -639,7 +816,7 @@ func (s *Server) serveInject(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-	_, _ = io.WriteString(w, text) // response is already committed; no recovery path remains
+	_, _ = io.WriteString(w, text) // response 已提交，无可恢复路径
 }
 
 func writeToolResult(w http.ResponseWriter, id json.RawMessage, text string, isErr bool) {

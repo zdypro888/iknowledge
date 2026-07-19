@@ -68,6 +68,114 @@ func B2() { sub() }
 	}
 }
 
+func TestCallGraphSeparatesExternalTestPackage(t *testing.T) {
+	files := map[string]string{
+		"go.mod": "module example.com/m\n\ngo 1.26\n",
+		"pkg/prod.go": `package pkg
+
+func helper() {}
+func Run() {}
+`,
+		"pkg/use.go": `package pkg
+
+func Use() { helper() }
+`,
+		"pkg/external_test.go": `package pkg_test
+
+func helper() {}
+func Run() {}
+`,
+		"pkg/external_use_test.go": `package pkg_test
+
+func TestUse() { helper() }
+`,
+		"caller/caller.go": `package caller
+
+import "example.com/m/pkg"
+
+func Call() { pkg.Run() }
+`,
+	}
+	_, cg := cgRepo(t, files)
+
+	tests := []struct {
+		from string
+		want []string
+	}{
+		{"pkg/use.go#Use", []string{"pkg/prod.go#helper"}},
+		{"pkg/external_use_test.go#TestUse", []string{"pkg/external_test.go#helper"}},
+		// import 只能落到目标目录的 production package，不能被同目录
+		// external-test package 的同名声明制造歧义。
+		{"caller/caller.go#Call", []string{"pkg/prod.go#Run"}},
+	}
+	for _, tt := range tests {
+		if got := cg.callsOf(tt.from); !reflect.DeepEqual(got, tt.want) {
+			t.Errorf("callsOf(%s) = %v, want %v", tt.from, got, tt.want)
+		}
+	}
+}
+
+func TestCallGraphRejectsSourceAndModuleSymlinks(t *testing.T) {
+	e, repo := newRepo(t, map[string]string{
+		"go.mod": "module example.com/m\n\ngo 1.26\n",
+		"a/a.go": `package a
+
+func Run() { helper() }
+func helper() {}
+`,
+	})
+
+	cg := e.ensureCallGraphLocked()
+	if cg == nil {
+		t.Fatal("初始调用图 = nil")
+	}
+	if cg.module != "example.com/m" {
+		t.Fatalf("初始调用图 module = %q", cg.module)
+	}
+	if got := cg.callsOf("a/a.go#Run"); !reflect.DeepEqual(got, []string{"a/a.go#helper"}) {
+		t.Fatalf("初始 callsOf(Run) = %v", got)
+	}
+
+	outside := t.TempDir()
+	outsideSource := filepath.Join(outside, "outside.go")
+	if err := os.WriteFile(outsideSource, []byte("package a\nfunc OutsideSecret() {}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	outsideModule := filepath.Join(outside, "go.mod")
+	if err := os.WriteFile(outsideModule, []byte("module outside.example/secret\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	sourcePath := filepath.Join(repo, "a", "a.go")
+	if err := os.Remove(sourcePath); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outsideSource, sourcePath); err != nil {
+		t.Skipf("当前平台不能创建 symlink: %v", err)
+	}
+	modulePath := filepath.Join(repo, "go.mod")
+	if err := os.Remove(modulePath); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outsideModule, modulePath); err != nil {
+		t.Skipf("当前平台不能创建 symlink: %v", err)
+	}
+
+	cg = e.ensureCallGraphLocked()
+	if cg == nil {
+		t.Fatal("symlink 被拒绝后调用图不应整体失效")
+	}
+	if cg.module != "" {
+		t.Errorf("callgraph 跟随了仓外 go.mod symlink: module = %q", cg.module)
+	}
+	if _, ok := cg.files["a/a.go"]; ok {
+		t.Error("callgraph 保留或读取了仓外源码 symlink")
+	}
+	if got := cg.callsOf("a/a.go#Run"); got != nil {
+		t.Errorf("仓外源码 symlink 的旧调用边未清除: %v", got)
+	}
+}
+
 func TestCallGraphAmbiguityAndHeuristic(t *testing.T) {
 	files := map[string]string{
 		"go.mod": "module example.com/m\n\ngo 1.26\n",
@@ -187,6 +295,12 @@ func g() {}
 	e.rt.mu.Lock()
 	cg2 := e.ensureCallGraphLocked()
 	e.rt.mu.Unlock()
+	if cg2 == cg {
+		t.Fatal("刷新应发布新 callGraph 快照,不能原地修改已交给读者的图")
+	}
+	if got := cg.callsOf("a/a.go#A"); !reflect.DeepEqual(got, []string{"a/a.go#f"}) {
+		t.Fatalf("旧调用图快照被刷新原地改写: %v", got)
+	}
 	if got := cg2.callsOf("a/a.go#A"); !reflect.DeepEqual(got, []string{"a/a.go#g"}) {
 		t.Errorf("增量刷新后 callsOf(A) = %v, want [a/a.go#g]", got)
 	}

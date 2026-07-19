@@ -128,7 +128,7 @@ nodes:
         confidence: inferred
         future_entry: 条目层未知
 `
-	if err := atomicWrite(path, []byte(future)); err != nil {
+	if err := s.atomicWrite(path, []byte(future)); err != nil {
 		t.Fatalf("写 fixture: %v", err)
 	}
 
@@ -190,11 +190,78 @@ func TestShardDeletedNodeNotResurrected(t *testing.T) {
 	}
 }
 
+func TestShardUnknownFieldsDoNotCrossChangedStableIDs(t *testing.T) {
+	s := newStore(t)
+	path := s.ShardPathFor("a.go")
+	fixture := `schema: 1
+nodes:
+  - id: a.go#Old
+    level: function
+    anchor:
+      file: a.go
+      symbol: Old
+    status: fresh
+    since: 2026-07-04T00:00:00Z
+    future_node: belongs-to-old
+`
+	if err := s.atomicWrite(path, []byte(fixture)); err != nil {
+		t.Fatal(err)
+	}
+	_, raw, err := s.LoadShard(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	replacement := &Shard{Schema: model.SchemaVersion, Nodes: []model.Node{{
+		ID: "a.go#New", Level: model.LevelFunction,
+		Anchor: model.Anchor{File: "a.go", Symbol: "New"},
+		Status: model.StatusFresh, Since: time.Now().UTC(),
+	}}}
+	if err := s.SaveShard(path, replacement, raw); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(data), "belongs-to-old") {
+		t.Fatalf("稳定 id 改变后不应把旧节点未知字段挂到新节点:\n%s", data)
+	}
+}
+
+func TestShardOverdeepUnknownFieldFailsClosedWithoutPanic(t *testing.T) {
+	s := newStore(t)
+	path := s.ShardPathFor("deep.go")
+	var nested strings.Builder
+	nested.WriteString("future_deep:\n")
+	for i := 0; i < maxMergeDepth+2; i++ {
+		nested.WriteString(strings.Repeat("  ", i+1) + "x:\n")
+	}
+	nested.WriteString(strings.Repeat("  ", maxMergeDepth+3) + "leaf: value\n")
+	fixture := "schema: 1\nnodes: []\n" + nested.String()
+	if err := s.atomicWrite(path, []byte(fixture)); err != nil {
+		t.Fatal(err)
+	}
+	sh, raw, err := s.LoadShard(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SaveShard(path, sh, raw); err == nil {
+		t.Fatal("过深未知字段必须只读拒写")
+	}
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(after) != fixture {
+		t.Fatal("拒写时原文件不应改变")
+	}
+}
+
 func TestShardConflictIsolated(t *testing.T) {
 	s := newStore(t)
 	path := s.ShardPathFor("a.go")
 	conflict := "schema: 1\n<<<<<<< HEAD\nnodes: []\n=======\nnodes:\n  - id: a\n>>>>>>> other\n"
-	if err := atomicWrite(path, []byte(conflict)); err != nil {
+	if err := s.atomicWrite(path, []byte(conflict)); err != nil {
 		t.Fatalf("写 fixture: %v", err)
 	}
 	_, _, err := s.LoadShard(path)
@@ -206,7 +273,7 @@ func TestShardConflictIsolated(t *testing.T) {
 func TestShardSchemaTooNew(t *testing.T) {
 	s := newStore(t)
 	path := s.ShardPathFor("a.go")
-	if err := atomicWrite(path, []byte("schema: 99\nnodes: []\n")); err != nil {
+	if err := s.atomicWrite(path, []byte("schema: 99\nnodes: []\n")); err != nil {
 		t.Fatalf("写 fixture: %v", err)
 	}
 	_, _, err := s.LoadShard(path)
@@ -370,6 +437,25 @@ func TestConfig(t *testing.T) {
 	}
 	if cfg2.Port != 19999 {
 		t.Errorf("用户改的端口被覆盖:%d", cfg2.Port)
+	}
+}
+
+func TestLoadConfigFailsClosedOnInvalidRuntimeValues(t *testing.T) {
+	for _, fixture := range []string{
+		"schema: 99\nport: 18000\n",
+		"schema: 1\nport: 0\n",
+		"schema: 1\nport: 18000\ninclude: ['[bad']\n",
+		"schema: 1\nport: 18000\nexclude: ['../escape']\n",
+		"schema: 1\nport: 18000\nscout: surprise\n",
+		"schema: 1\nport: 18000\nextensions: ['../go']\n",
+	} {
+		s := newStore(t)
+		if err := s.WriteKnowledgeFile("config.yaml", []byte(fixture)); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.LoadConfig(); err == nil {
+			t.Fatalf("非法 config 必须 fail closed:\n%s", fixture)
+		}
 	}
 }
 

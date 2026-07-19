@@ -2,9 +2,12 @@ package engine
 
 import (
 	"fmt"
+	"path/filepath"
+	"sort"
 	"strings"
 
 	"github.com/zdypro888/iknowledge/internal/model"
+	"github.com/zdypro888/iknowledge/internal/store"
 )
 
 // ---- kb_verify(impl §7.3):勘误与污染回收 ----
@@ -68,8 +71,12 @@ func (e *Engine) Verify(a VerifyArgs, sid, author string) (out string, err error
 		now := e.now().UTC()
 		// derived 恒真(机器从 AST 推导):改成 verified 反而丢来源信息,只刷时间锚。
 		if old == model.ConfidenceDerived {
-			entry.ConfirmedAt = now
+			before := entryState(entry)
+			after := before
+			after.ConfirmedAt = now
+			applyEntryState(entry, after)
 			if err := e.saveNodeShardLocked(nodeRef); err != nil {
+				applyEntryState(entry, before)
 				return "", err
 			}
 			if err := e.reloadLocked(); err != nil {
@@ -88,28 +95,30 @@ func (e *Engine) Verify(a VerifyArgs, sid, author string) (out string, err error
 					"附 evidence 后重试;只是读过原文没发现问题不构成验证——那仍是 inferred")
 			}
 			chID := e.freshChangeIDLocked()
+			before := entryState(entry)
+			after := before
+			after.Confidence = model.ConfidenceVerified
+			after.ConfirmedAt = now
 			change := model.Change{
 				ID: chID, Nodes: []string{nodeID}, At: now,
-				What:   "确认:条目 " + entryID + " 升级 verified(" + firstLine(entry.Text) + ")",
-				Why:    "验证依据:" + a.Evidence,
-				Author: author,
+				What:           "确认:条目 " + entryID + " 升级 verified(" + firstLine(entry.Text) + ")",
+				Why:            "验证依据:" + a.Evidence,
+				Author:         author,
+				EffectsVersion: 1,
+				Effects:        []model.EntryEffect{{Entry: nodeID + "#" + entryID, Before: before, After: after}},
 			}
-			if err := e.Store.AppendChange(change); err != nil {
-				return "", err
-			}
-			entry.Confidence = model.ConfidenceVerified
-			entry.ConfirmedAt = now
-			if err := e.saveNodeShardLocked(nodeRef); err != nil {
-				return "", err
-			}
-			if err := e.reloadLocked(); err != nil {
+			if err := e.commitEntryEffectsLocked(change); err != nil {
 				return "", err
 			}
 			return fmt.Sprintf("newConfidence: verified(原 %s,确认记录 %s)", old, chID), nil
 		}
 		// verified→verified:复确认,纯时间锚刷新(§8.4),不要求新证据。
-		entry.ConfirmedAt = now
+		before := entryState(entry)
+		after := before
+		after.ConfirmedAt = now
+		applyEntryState(entry, after)
 		if err := e.saveNodeShardLocked(nodeRef); err != nil {
+			applyEntryState(entry, before)
 			return "", err
 		}
 		if err := e.reloadLocked(); err != nil {
@@ -125,17 +134,18 @@ func (e *Engine) Verify(a VerifyArgs, sid, author string) (out string, err error
 		}
 		// 勘误进 journal:纠错是一等公民。
 		chID := e.freshChangeIDLocked()
+		rootBefore := entryState(entry)
+		rootAfter := rootBefore
+		rootAfter.Confidence = model.ConfidenceRefuted
+		rootAfter.RefutedBy = chID
 		change := model.Change{
 			ID: chID, Nodes: []string{nodeID}, At: e.now().UTC(),
-			What:   "勘误:条目 " + entryID + " 被驳倒(" + firstLine(entry.Text) + ")",
-			Why:    "原文证据:" + a.Evidence,
-			Author: author,
+			What:           "勘误:条目 " + entryID + " 被驳倒(" + firstLine(entry.Text) + ")",
+			Why:            "原文证据:" + a.Evidence,
+			Author:         author,
+			EffectsVersion: 1,
+			Effects:        []model.EntryEffect{{Entry: nodeID + "#" + entryID, Before: rootBefore, After: rootAfter}},
 		}
-		if err := e.Store.AppendChange(change); err != nil {
-			return "", err
-		}
-		entry.Confidence = model.ConfidenceRefuted
-		entry.RefutedBy = chID
 		// 污染回收:沿 based_on 级联降级衍生条目(knowledge.md §12.5 第 2 条)。
 		var cascaded []string
 		for _, depRef := range e.rt.ix.Dependents(nodeID + "#" + entryID) {
@@ -147,18 +157,15 @@ func (e *Engine) Verify(a VerifyArgs, sid, author string) (out string, err error
 			for j := range depNode.Node.Entries {
 				en := &depNode.Node.Entries[j]
 				if en.ID == depRef[di+1:] && en.Active() && en.Confidence != model.ConfidenceSuspect {
-					en.Confidence = model.ConfidenceSuspect
+					before := entryState(en)
+					after := before
+					after.Confidence = model.ConfidenceSuspect
+					change.Effects = append(change.Effects, model.EntryEffect{Entry: depRef, Before: before, After: after})
 					cascaded = append(cascaded, depRef)
-					if err := e.saveNodeShardLocked(depNode); err != nil {
-						return "", err
-					}
 				}
 			}
 		}
-		if err := e.saveNodeShardLocked(nodeRef); err != nil {
-			return "", err
-		}
-		if err := e.reloadLocked(); err != nil {
+		if err := e.commitEntryEffectsLocked(change); err != nil {
 			return "", err
 		}
 		var b strings.Builder
@@ -172,24 +179,153 @@ func (e *Engine) Verify(a VerifyArgs, sid, author string) (out string, err error
 			return "", kbErr("EVIDENCE_REQUIRED", "obsolete 须附 reason(功能下线/约定废止)", "附 reason 后重试")
 		}
 		chID := e.freshChangeIDLocked()
+		before := entryState(entry)
+		after := before
+		after.RetiredBy = chID
 		change := model.Change{
 			ID: chID, Nodes: []string{nodeID}, At: e.now().UTC(),
 			What: "退休:条目 " + entryID + "(" + firstLine(entry.Text) + ")",
-			Why:  a.Reason, Author: author,
+			Why:  a.Reason, Author: author, EffectsVersion: 1,
+			Effects: []model.EntryEffect{{Entry: nodeID + "#" + entryID, Before: before, After: after}},
 		}
-		if err := e.Store.AppendChange(change); err != nil {
-			return "", err
-		}
-		entry.RetiredBy = chID
-		if err := e.saveNodeShardLocked(nodeRef); err != nil {
-			return "", err
-		}
-		if err := e.reloadLocked(); err != nil {
+		if err := e.commitEntryEffectsLocked(change); err != nil {
 			return "", err
 		}
 		return "条目已退休(记录 " + chID + "),不触发级联", nil
 	}
 	return "", kbErr("INVALID_ARGUMENT", "非法 verdict "+a.Verdict, "verdict ∈ confirm|refute|obsolete")
+}
+
+func entryState(en *model.Entry) model.EntryState {
+	return model.EntryState{
+		Confidence: en.Confidence, ConfirmedAt: en.ConfirmedAt,
+		RefutedBy: en.RefutedBy, RetiredBy: en.RetiredBy, SupersededBy: en.SupersededBy,
+	}
+}
+
+func applyEntryState(en *model.Entry, state model.EntryState) {
+	en.Confidence = state.Confidence
+	en.ConfirmedAt = state.ConfirmedAt
+	en.RefutedBy = state.RefutedBy
+	en.RetiredBy = state.RetiredBy
+	en.SupersededBy = state.SupersededBy
+}
+
+// entryByExactRefLocked 不沿 supersedes 链跳到现任条目。Effects 记录的是被修改
+// 的稳定 entry ID，撤销时必须命中同一实体，不能误改它的继任者。
+func (e *Engine) entryByExactRefLocked(ref string) *model.Entry {
+	i := strings.LastIndexByte(ref, '#')
+	if i <= 0 || i == len(ref)-1 {
+		return nil
+	}
+	nodeID, entryID := ref[:i], ref[i+1:]
+	nodeRef := e.rt.ix.Node(nodeID)
+	if nodeRef == nil {
+		return nil
+	}
+	for i := range nodeRef.Node.Entries {
+		if nodeRef.Node.Entries[i].ID == entryID {
+			return &nodeRef.Node.Entries[i]
+		}
+	}
+	return nil
+}
+
+// commitEntryEffectsLocked 以“分片先提交、journal 后标记”的顺序提交 verify。
+// 所有编辑先落在 shard 克隆上；任一 Save/Append 失败恢复原字节并 reload，
+// 因而不会出现 journal 宣称已 refute、实际级联只写了一半的状态。
+func (e *Engine) commitEntryEffectsLocked(change model.Change) error {
+	if len(change.Effects) == 0 {
+		return fmt.Errorf("verify change %s 缺 effects", change.ID)
+	}
+	uniqueNodes := make([]string, 0, len(change.Nodes)+len(change.Effects))
+	for _, id := range change.Nodes {
+		uniqueNodes = appendUnique(uniqueNodes, id)
+	}
+	for _, effect := range change.Effects {
+		if i := strings.LastIndexByte(effect.Entry, '#'); i > 0 {
+			uniqueNodes = appendUnique(uniqueNodes, effect.Entry[:i])
+		}
+	}
+	change.Nodes = uniqueNodes
+	touched := map[string]*store.Shard{}
+	relsSet := map[string]bool{}
+	seen := map[string]bool{}
+	for _, effect := range change.Effects {
+		if effect.Entry == "" || seen[effect.Entry] {
+			return fmt.Errorf("verify change %s effect 重复或为空:%s", change.ID, effect.Entry)
+		}
+		seen[effect.Entry] = true
+		i := strings.LastIndexByte(effect.Entry, '#')
+		if i <= 0 || i == len(effect.Entry)-1 {
+			return fmt.Errorf("verify change %s effect 引用非法:%s", change.ID, effect.Entry)
+		}
+		nodeID, entryID := effect.Entry[:i], effect.Entry[i+1:]
+		ref := e.rt.ix.Node(nodeID)
+		if ref == nil {
+			return fmt.Errorf("verify effect 节点不存在:%s", nodeID)
+		}
+		current := e.entryByExactRefLocked(effect.Entry)
+		if current == nil || entryState(current) != effect.Before {
+			return fmt.Errorf("verify effect before 与当前状态不符:%s", effect.Entry)
+		}
+		if touched[ref.ShardRel] == nil {
+			cs := e.rt.cache.Shards()[ref.ShardRel]
+			if cs == nil || cs.Shard == nil {
+				return fmt.Errorf("verify effect 分片不可用:%s", ref.ShardRel)
+			}
+			touched[ref.ShardRel] = cloneEngineShard(cs.Shard)
+			relsSet[ref.ShardRel] = true
+		}
+		en := entryInShard(touched[ref.ShardRel], nodeID, entryID)
+		if en == nil {
+			return fmt.Errorf("verify effect 克隆条目不存在:%s", effect.Entry)
+		}
+		applyEntryState(en, effect.After)
+	}
+	relsSet[e.Store.JournalRelFor(change)] = true
+	tx, err := e.prepareTruthTransactionLocked(relsSet)
+	if err != nil {
+		return err
+	}
+	defer e.guardTruthTransactionPanicLocked(tx)
+	rollback := func(cause error) error {
+		return e.rollbackTruthTransactionLocked(tx, cause)
+	}
+	rels := make([]string, 0, len(touched))
+	for rel := range touched {
+		rels = append(rels, rel)
+	}
+	sort.Strings(rels)
+	for _, rel := range rels {
+		cs := e.rt.cache.Shards()[rel]
+		path := filepath.Join(e.Store.Dir(), filepath.FromSlash(rel))
+		if err := e.Store.SaveShard(path, touched[rel], cs.Raw); err != nil {
+			return rollback(fmt.Errorf("verify 保存 %s: %w", rel, err))
+		}
+	}
+	if err := e.Store.AppendChange(change); err != nil {
+		committed := false
+		if changes, _, loadErr := e.Store.LoadJournal(); loadErr == nil {
+			for _, c := range changes {
+				if c.ID == change.ID {
+					committed = true
+					break
+				}
+			}
+		}
+		if !committed {
+			return rollback(fmt.Errorf("verify 追加 journal: %w", err))
+		}
+	}
+	committed, commitErr := e.commitTruthTransactionLocked(tx)
+	if !committed {
+		return rollback(fmt.Errorf("verify 写 committed marker: %w", commitErr))
+	}
+	if commitErr != nil {
+		return fmt.Errorf("verify 已提交但 WAL 清理/重载失败(不要重试同一操作): %w", commitErr)
+	}
+	return nil
 }
 
 // reverifyNodeLocked 节点级重验:读原文现算哈希,与当前锚一致则清 suspect(重验即重锚)。
@@ -201,6 +337,7 @@ func (e *Engine) reverifyNodeLocked(nodeID string) (string, error) {
 	// 无代码锚的节点(project/dir,§8.4):confirm = 批量刷新全部活跃条目的时间锚
 	// (逐条 confirm 太摩擦;节点级语义即"我核实过,这些仍成立")。
 	if ref.Node.Anchor.Hash == "" && !ref.Node.PendingAnchor {
+		before := cloneModelNode(ref.Node)
 		refreshed := 0
 		now := e.now().UTC()
 		for i := range ref.Node.Entries {
@@ -213,6 +350,7 @@ func (e *Engine) reverifyNodeLocked(nodeID string) (string, error) {
 			return "节点 " + nodeID + " 无活跃条目,无需复核。", nil
 		}
 		if err := e.saveNodeShardLocked(ref); err != nil {
+			*ref.Node = *before
 			return "", err
 		}
 		if err := e.reloadLocked(); err != nil {
@@ -231,9 +369,11 @@ func (e *Engine) reverifyNodeLocked(nodeID string) (string, error) {
 		return "", kbErr("NODE_ORPHANED", "符号已消失,无法重验", "认领/送葬走 kb_adopt")
 	}
 	// 重锚到当前代码 + 清 suspect(等价"我读过原文,现有知识对当前代码仍成立")。
+	before := cloneModelNode(ref.Node)
 	ref.Node.Anchor = cur.anchor
 	ref.Node.Status = model.StatusFresh
 	if err := e.saveNodeShardLocked(ref); err != nil {
+		*ref.Node = *before
 		return "", err
 	}
 	if err := e.reloadLocked(); err != nil {
@@ -256,6 +396,23 @@ type AdoptArgs struct {
 func (e *Engine) Adopt(a AdoptArgs, sid, author string) (out string, err error) {
 	redaction := RedactSecrets(&a)
 	defer appendRedactionNotice(&out, &err, redaction)
+	// claim 与 record_change 的“申报式迁移”是同一事务语义，直接复用其
+	// 先规划、分片提交、journal 提交、失败回滚与 NodeEffects 管线。
+	if a.Action == "claim" {
+		if strings.TrimSpace(a.Orphan) == "" || strings.TrimSpace(a.To) == "" {
+			return "", kbErr("NODE_NOT_FOUND", "claim 必须给 orphan 与 to(新节点 ID)", "补全后重试")
+		}
+		out, err = e.RecordChange(ChangeArgs{
+			Nodes: []string{a.To}, What: "认领孤儿 " + a.Orphan + " → " + a.To,
+			Why:         "kb_adopt claim(等价申报式迁移)",
+			Remaps:      []model.Remap{{From: a.Orphan, To: []string{a.To}}},
+			adoptOrphan: a.Orphan,
+		}, sid, author)
+		if err != nil {
+			return "", err
+		}
+		return "migrated: " + a.Orphan + " → " + a.To + "(条目降半级待确认,血缘已接续)\n" + out, nil
+	}
 	if err := e.requireInit(); err != nil {
 		return "", err
 	}
@@ -274,27 +431,6 @@ func (e *Engine) Adopt(a AdoptArgs, sid, author string) (out string, err error) 
 	}
 
 	switch a.Action {
-	case "claim":
-		if a.To == "" {
-			return "", kbErr("NODE_NOT_FOUND", "claim 必须给 to(新节点 ID)", "附 to 后重试")
-		}
-		chID := e.freshChangeIDLocked()
-		change := model.Change{
-			ID: chID, Nodes: []string{a.To}, At: e.now().UTC(),
-			What: "认领孤儿 " + a.Orphan + " → " + a.To,
-			Why:  "kb_adopt claim(等价申报式迁移)", Author: author,
-		}
-		if err := e.Store.AppendChange(change); err != nil {
-			return "", err
-		}
-		if err := e.applyRemapsLocked([]model.Remap{{From: a.Orphan, To: []string{a.To}}}); err != nil {
-			return "", err
-		}
-		if err := e.reloadLocked(); err != nil {
-			return "", err
-		}
-		return "migrated: " + a.Orphan + " → " + a.To + "(条目降半级待确认,血缘已接续,记录 " + chID + ")", nil
-
 	case "bury":
 		if strings.TrimSpace(a.Reason) == "" {
 			return "", kbErr("EVIDENCE_REQUIRED", "bury 必须附 reason(为什么确认作废)", "附 reason 后重试")
@@ -306,19 +442,62 @@ func (e *Engine) Adopt(a AdoptArgs, sid, author string) (out string, err error) 
 			snapshot = append(snapshot, "["+ref.Node.Entries[i].Kind+"] "+ref.Node.Entries[i].Text)
 		}
 		chID := e.freshChangeIDLocked()
+		before := cloneModelNode(ref.Node)
 		change := model.Change{
 			ID: chID, Nodes: []string{a.Orphan}, At: e.now().UTC(),
 			What: "送葬孤儿 " + a.Orphan + "(知识快照:" + strings.Join(snapshot, ";") + ")",
-			Why:  a.Reason, Author: author,
+			Why:  a.Reason, Author: author, Commit: gitHead(e.Store.RepoRoot()), EffectsVersion: 1,
+			NodeEffects: []model.NodeEffect{{
+				Node: a.Orphan, BeforeShard: ref.ShardRel,
+				Before: before, BeforeRaw: e.rawNodeYAMLLocked(a.Orphan),
+			}},
+		}
+		cs := e.rt.cache.Shards()[ref.ShardRel]
+		if cs == nil || cs.Shard == nil {
+			return "", kbErr("SHARD_CONFLICT", "孤儿分片不可用:"+ref.ShardRel, "先修复分片冲突")
+		}
+		sh := cloneEngineShard(cs.Shard)
+		kept := make([]model.Node, 0, len(sh.Nodes))
+		for i := range sh.Nodes {
+			if sh.Nodes[i].ID != a.Orphan {
+				kept = append(kept, sh.Nodes[i])
+			}
+		}
+		sh.Nodes = kept
+		tx, err := e.prepareTruthTransactionLocked(map[string]bool{
+			ref.ShardRel: true, e.Store.JournalRelFor(change): true,
+		})
+		if err != nil {
+			return "", err
+		}
+		defer e.guardTruthTransactionPanicLocked(tx)
+		rollback := func(cause error) (string, error) {
+			return "", e.rollbackTruthTransactionLocked(tx, cause)
+		}
+		path := filepath.Join(e.Store.Dir(), filepath.FromSlash(ref.ShardRel))
+		if err := e.Store.SaveShard(path, sh, cs.Raw); err != nil {
+			return rollback(fmt.Errorf("adopt bury 保存分片: %w", err))
 		}
 		if err := e.Store.AppendChange(change); err != nil {
-			return "", err
+			committed := false
+			if changes, _, loadErr := e.Store.LoadJournal(); loadErr == nil {
+				for _, c := range changes {
+					if c.ID == change.ID {
+						committed = true
+						break
+					}
+				}
+			}
+			if !committed {
+				return rollback(fmt.Errorf("adopt bury 追加 journal: %w", err))
+			}
 		}
-		if err := e.removeNodeLocked(ref); err != nil {
-			return "", err
+		committed, commitErr := e.commitTruthTransactionLocked(tx)
+		if !committed {
+			return rollback(fmt.Errorf("adopt bury 写 committed marker: %w", commitErr))
 		}
-		if err := e.reloadLocked(); err != nil {
-			return "", err
+		if commitErr != nil {
+			return "", fmt.Errorf("adopt bury 已提交但 WAL 清理/重载失败(不要重试): %w", commitErr)
 		}
 		return "buried: " + a.Orphan + "(记录 " + chID + ",知识快照已入 journal 可溯)", nil
 	}

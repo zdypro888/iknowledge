@@ -39,9 +39,10 @@ const usage = `iknowledge——AI 代码知识库(MCP 服务)
   iknowledge brief --repo <path> [--budget 1200]               一屏项目简报(WIP/风险/近期决策/维护债)
   iknowledge precheck --repo <path> [--working] [--strict]     提交前检查已知否决/腐烂/矛盾/记账;缺省仅告警
   iknowledge setup  --repo <path>                              打印 MCP/纪律/hook/pre-commit 接入片段,只打印不代写
+  iknowledge trust-scout --repo <path>                         本机授权当前 scout:self/command 配置(配置变化即失效)
   iknowledge hook   [--repo <path>]                            宿主 hook 桥(Claude Code PostToolUse):注入所触文件的知识
   iknowledge export  --repo <path> [-o file.kbundle]           导出知识为 .kbundle(tar.gz;备份/迁移;缺省输出 stdout)
-  iknowledge import  --repo <path> -i file.kbundle [--dry-run] [--backup] [--remap from=to]  导入 .kbundle(跨仓迁移用 --remap 重映射路径前缀)
+  iknowledge import  --repo <path> -i file.kbundle [--dry-run] [--backup] [--force] [--remap from=to]  导入 .kbundle(默认不覆盖异内容)
   iknowledge version                                           版本自报(排障:确认在跑哪个构建)
 `
 
@@ -73,6 +74,8 @@ func run(args []string) int {
 		return runPrecheck(args[1:], os.Stdout)
 	case "setup":
 		return runSetup(args[1:], os.Stdout)
+	case "trust-scout":
+		return runTrustScout(args[1:])
 	case "export":
 		return runExport(args[1:])
 	case "import":
@@ -80,14 +83,68 @@ func run(args []string) int {
 	case "hook":
 		return runHook(args[1:], os.Stdin, os.Stdout)
 	case "version", "-v", "--version":
+		if len(args) != 1 {
+			fmt.Fprintln(os.Stderr, "错误: version 不接受 positional 参数")
+			return 2
+		}
 		return runVersion()
 	case "-h", "--help", "help":
+		if len(args) != 1 {
+			fmt.Fprintln(os.Stderr, "错误: help 不接受 positional 参数")
+			return 2
+		}
 		fmt.Print(usage)
 		return 0
 	default:
 		fmt.Fprintf(os.Stderr, "未知子命令 %q\n%s", args[0], usage)
 		return 2
 	}
+}
+
+func rejectUnexpectedArgs(fs *flag.FlagSet) bool {
+	if fs.NArg() == 0 {
+		return false
+	}
+	fmt.Fprintf(os.Stderr, "错误: %s 不接受 positional 参数: %s\n", fs.Name(), strings.Join(fs.Args(), " "))
+	return true
+}
+
+// recoverTruthBeforeRead 在没有活跃 writer 时先恢复崩溃 WAL，再允许 CLI 读取
+// config/知识。若 live serve 正持锁，它负责自己的事务，读者不能越权恢复。
+func acquireRecoveredView(s *store.Store) (func(), error) {
+	if !s.Initialized() {
+		return func() {}, nil
+	}
+	release, err := s.AcquireWriterLock()
+	if err != nil {
+		return nil, err
+	}
+	if err := s.RecoverTruthTransaction(); err != nil {
+		release()
+		return nil, err
+	}
+	return release, nil
+}
+
+func recoverTruthBeforeRead(s *store.Store) error {
+	release, err := acquireRecoveredView(s)
+	if err != nil {
+		return err
+	}
+	release()
+	return nil
+}
+
+func verifiedLiveServe(s *store.Store) bool {
+	cfg, err := s.LoadConfig()
+	if err != nil || cfg == nil {
+		return false
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 800*time.Millisecond)
+	defer cancel()
+	base := fmt.Sprintf("http://127.0.0.1:%d", cfg.Port)
+	_, err = s.AcquireLocalAuthSession(ctx, base, "/status", &http.Client{Timeout: 800 * time.Millisecond})
+	return err == nil
 }
 
 func runServe(args []string) int {
@@ -98,9 +155,12 @@ func runServe(args []string) int {
 		return nil
 	})
 	addr := fs.String("addr", "", "监听地址(缺省 127.0.0.1:<config 端口>;仅单仓库可用)")
-	auth := fs.Bool("auth", false, "启用 Bearer 鉴权(每仓 token 生成于各自 .knowledge/local/token,0600;共享多用户机器用)")
+	auth := fs.Bool("auth", false, "启用 Bearer 鉴权(每仓 token 位于用户私有状态,Unix 0600;共享多用户机器用)")
 	allowInsecure := fs.Bool("allow-insecure-bind", false, "确认监听非回环地址的风险(无 --auth 时裸奔于网络;仅限可信隔离网络)")
 	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	if rejectUnexpectedArgs(fs) {
 		return 2
 	}
 	if len(repos) == 0 {
@@ -124,7 +184,7 @@ func runServe(args []string) int {
 	cleanup := func() {
 		for _, u := range units {
 			if u.ln != nil {
-				_ = u.ln.Close() // best-effort cleanup; startup errors are reported separately
+				u.ln.Close()
 			}
 		}
 	}
@@ -153,15 +213,20 @@ func runServe(args []string) int {
 			return 1
 		}
 		defer release()
+		if err := s.RecoverTruthTransaction(); err != nil {
+			fmt.Fprintln(os.Stderr, "错误: 恢复未完成事务:", err)
+			cleanup()
+			return 1
+		}
 
+		cfg, err := s.EnsureConfig()
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "错误:", err)
+			cleanup()
+			return 1
+		}
 		listen := *addr
 		if listen == "" {
-			cfg, err := s.EnsureConfig()
-			if err != nil {
-				fmt.Fprintln(os.Stderr, "错误:", err)
-				cleanup()
-				return 1
-			}
 			listen = fmt.Sprintf("127.0.0.1:%d", cfg.Port)
 		}
 		e := engine.New(s)
@@ -170,16 +235,25 @@ func runServe(args []string) int {
 			cleanup()
 			return 1
 		}
+		tok, err := serveAuthToken(s, *auth)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "错误:", err)
+			cleanup()
+			return 1
+		}
+		actualAuth := tok != ""
+		identity, err := s.EnsureLocalIdentity()
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "错误:", err)
+			cleanup()
+			return 1
+		}
 		srv := mcpserv.New(e)
-		if *auth {
-			tok, err := s.EnsureAuthToken()
-			if err != nil {
-				fmt.Fprintln(os.Stderr, "错误:", err)
-				cleanup()
-				return 1
-			}
-			srv.AuthToken = tok
-			fmt.Printf("鉴权已启用(%s):token 在 .knowledge/local/token(0600);重跑 iknowledge setup 取带 headers 的接入片段。\n", s.RepoRoot())
+		srv.AuthToken = tok
+		srv.LocalIdentity = identity
+		if actualAuth {
+			tokenPath, _ := s.AuthTokenFile()
+			fmt.Printf("鉴权已启用(%s):根 token 在用户私有状态 %s；手工/stdio 重启均保持鉴权。\n", s.RepoRoot(), tokenPath)
 		}
 		// 端口被占(哈希撞车):启动即报错并提示改 config,不静默换端口(impl §1)。
 		ln, err := net.Listen("tcp", listen)
@@ -188,7 +262,10 @@ func runServe(args []string) int {
 			cleanup()
 			return 1
 		}
-		e.SetScoutAddr(listen) // 自派侦察兵回连实际监听地址(--addr 覆盖时 config 端口不可信)
+		// :0 必须改成内核实际分配的端口；wildcard 只能用于监听，不能作为
+		// 客户端目标（本机身份客户端也会按设计拒绝 0.0.0.0/::）。
+		listen = ln.Addr().String()
+		e.SetScoutAddr(loopbackDialAddr(listen))
 		// R29-S1.5:无鉴权服务的信任模型是"仅回环"(impl §1)。监听非回环时,Origin 校验
 		// 挡不住直连的非浏览器客户端(curl/任何本机进程)——以前只 warn 就放行,现在强制:
 		// 非 loopback 且无 --auth,必须显式 --allow-insecure-bind 才启动,否则拒绝(退出 2)。
@@ -197,13 +274,13 @@ func runServe(args []string) int {
 			ip := net.ParseIP(host)
 			nonLoopback := host != "localhost" && (ip == nil || !ip.IsLoopback())
 			if nonLoopback {
-				if !*auth && !*allowInsecure {
+				if !actualAuth && !*allowInsecure {
 					fmt.Fprintln(os.Stderr, "错误: 监听非回环地址且无 --auth——任何能连通该端口的主机都可读写知识库。")
 					fmt.Fprintln(os.Stderr, "若确为可信隔离网络,加 --allow-insecure-bind 显式确认此风险;否则用 --auth 或保持缺省回环监听。")
 					cleanup()
 					return 2
 				}
-				if *auth {
+				if actualAuth {
 					fmt.Fprintln(os.Stderr, "警告: 监听非回环地址——token 鉴权已启用,但明文 HTTP 仍可被网络窃听(含 token 本身);仅限可信隔离网络使用。")
 				} else {
 					fmt.Fprintln(os.Stderr, "警告: 监听非回环地址且无鉴权(--allow-insecure-bind 已确认)——任何能连通该端口的主机都可读写知识库。")
@@ -214,18 +291,16 @@ func runServe(args []string) int {
 			listen, url.QueryEscape(s.RepoRoot()), listen)
 		// R29-S1.4:HTTP 服务器超时硬化(防 slowloris / 慢客户端无限占用 goroutine)。
 		// ReadHeaderTimeout 10s 防半开连接(R2-D3,原有);ReadTimeout 30s 限制请求体读取;
-		// IdleTimeout 120s 回收 keep-alive 空闲连接。WriteTimeout 不在 Server 层设——
-		// scout 自派路由(/mcp/scout/ 的 kb_investigate selfDispatch)可阻塞最长
-		// ScoutTimeoutSec(缺省 300s)等侦察兵交卷,全局 WriteTimeout 会误杀。
-		// 改在快端点(/inject /recall /map /status /mcp/main)用 srv.scoutExempt 区分:
-		// 那些路由 handler 内自带短超时;scout 路由显式解除 WriteDeadline(见 server.go)。
+		// IdleTimeout 120s 回收 keep-alive 空闲连接。WriteTimeout 必须真实有界；
+		// engine.RequestWriteTimeout 对普通工具保持 10 分钟，并在 scout:self 时按
+		// 自派等待上限加启动/信任弹窗重投余量，避免 0 值无限占用也不误杀长调用。
 		units = append(units, unit{s: s, ln: ln, listen: listen,
 			hs: &http.Server{
 				Handler:           srv.Handler(),
 				ReadHeaderTimeout: 10 * time.Second,
 				ReadTimeout:       30 * time.Second,
 				IdleTimeout:       120 * time.Second,
-				WriteTimeout:      0, // 见上:scout 长路由在 handler 层自管
+				WriteTimeout:      engine.RequestWriteTimeout(cfg),
 				MaxHeaderBytes:    1 << 20,
 			}})
 	}
@@ -261,9 +336,75 @@ func runServe(args []string) int {
 	return 0
 }
 
+func loopbackDialAddr(listen string) string {
+	host, port, err := net.SplitHostPort(listen)
+	if err != nil {
+		return listen
+	}
+	ip := net.ParseIP(host)
+	if host == "" || (ip != nil && ip.IsUnspecified()) {
+		if strings.Contains(host, ":") {
+			return net.JoinHostPort("::1", port)
+		}
+		return net.JoinHostPort("127.0.0.1", port)
+	}
+	return net.JoinHostPort(host, port)
+}
+
+// serveAuthToken 把 token 文件作为持久化 auth 模式标记。用户曾启用过
+// --auth 后，后续任何手工 serve 即使漏写 flag 也不得静默降级为裸服务。
+func serveAuthToken(s *store.Store, requested bool) (string, error) {
+	if requested {
+		return s.EnsureAuthToken()
+	}
+	return s.LoadAuthToken()
+}
+
+func runTrustScout(args []string) int {
+	fs := flag.NewFlagSet("trust-scout", flag.ContinueOnError)
+	repo := fs.String("repo", ".", "仓库路径")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	if rejectUnexpectedArgs(fs) {
+		return 2
+	}
+	s, err := store.Open(*repo)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "错误:", err)
+		return 1
+	}
+	if !s.Initialized() {
+		fmt.Fprintln(os.Stderr, "错误: 库未初始化,先跑 iknowledge init --repo "+s.RepoRoot())
+		return 1
+	}
+	releaseView, viewErr := acquireRecoveredView(s)
+	if viewErr != nil {
+		if !errors.Is(viewErr, store.ErrLocked) || !verifiedLiveServe(s) {
+			fmt.Fprintln(os.Stderr, "错误: 恢复未完成事务或仓库 writer 正忙:", viewErr)
+			return 1
+		}
+	} else {
+		defer releaseView()
+	}
+	command, fingerprint, err := engine.TrustScout(s)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "错误:", err)
+		return 1
+	}
+	fmt.Printf("已在本机授权当前 scout:self 配置。\n  command: %q\n  fingerprint: %s\n配置变化会自动失效；重新核对后再运行本命令。\n",
+		command, fingerprint)
+	return 0
+}
+
 // runVersion 版本自报(运维排障:确认在跑哪个构建)。全部取构建元数据,
 // 不维护手写版本常量——发布忘更新的散落硬编码比没有版本号更误导。
 func runVersion() int {
+	fmt.Println(versionText())
+	return 0
+}
+
+func versionText() string {
 	info := buildinfo.Read()
 	version, revision, dirty := info.Version, info.Revision, info.Dirty
 	if len(revision) > 12 {
@@ -277,8 +418,7 @@ func runVersion() int {
 		}
 		out += ")"
 	}
-	fmt.Println(out + " " + runtime.Version())
-	return 0
+	return out + " " + runtime.Version()
 }
 
 func runStatus(args []string) int {
@@ -286,6 +426,9 @@ func runStatus(args []string) int {
 	repo := fs.String("repo", ".", "仓库路径")
 	prompt := fs.Bool("prompt", false, "打印纪律提示词(粘贴进 CLAUDE.md / codex 指令)")
 	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	if rejectUnexpectedArgs(fs) {
 		return 2
 	}
 	if *prompt {
@@ -297,6 +440,12 @@ func runStatus(args []string) int {
 		fmt.Fprintln(os.Stderr, "错误:", err)
 		return 1
 	}
+	releaseView, err := acquireRecoveredView(s)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "错误: 无法取得一致知识视图:", err)
+		return 1
+	}
+	defer releaseView()
 	text, err := engine.New(s).Status()
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "错误:", err)
@@ -314,28 +463,31 @@ func runDoctor(args []string, w io.Writer) int {
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
+	if rejectUnexpectedArgs(fs) {
+		return 2
+	}
 	s, err := store.Open(*repo)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "错误:", err)
 		return 1
 	}
+	releaseView, err := acquireRecoveredView(s)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "错误: 无法取得一致知识视图:", err)
+		return 1
+	}
+	defer releaseView()
 	rep, err := engine.New(s).Doctor()
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "错误:", err)
 		return 1
 	}
-	if _, err := fmt.Fprintln(w, rep.Text()); err != nil {
-		fmt.Fprintln(os.Stderr, "错误: 写 doctor 输出:", err)
-		return 1
-	}
+	fmt.Fprintln(w, rep.Text())
 	warnings := len(rep.Warnings)
 	if *deploy {
 		text, n := deployDoctorText()
 		if text != "" {
-			if _, err := fmt.Fprintln(w, text); err != nil {
-				fmt.Fprintln(os.Stderr, "错误: 写 doctor 输出:", err)
-				return 1
-			}
+			fmt.Fprintln(w, text)
 		}
 		warnings += n
 	}
@@ -399,21 +551,27 @@ func runMaintain(args []string, w io.Writer) int {
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
+	if rejectUnexpectedArgs(fs) {
+		return 2
+	}
 	s, err := store.Open(*repo)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "错误:", err)
 		return 1
 	}
+	releaseView, err := acquireRecoveredView(s)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "错误: 无法取得一致知识视图:", err)
+		return 1
+	}
+	defer releaseView()
 	if *patrol {
 		brief, err := engine.New(s).PatrolBrief(*scope)
 		if err != nil {
 			fmt.Fprintln(os.Stderr, "错误:", err)
 			return 1
 		}
-		if _, err := fmt.Fprintln(w, brief); err != nil {
-			fmt.Fprintln(os.Stderr, "错误: 写 maintain 输出:", err)
-			return 1
-		}
+		fmt.Fprintln(w, brief)
 		return 0
 	}
 	debts, err := engine.New(s).Debts()
@@ -422,28 +580,16 @@ func runMaintain(args []string, w io.Writer) int {
 		return 1
 	}
 	if len(debts) == 0 {
-		if _, err := fmt.Fprintln(w, "无维护欠账。"); err != nil {
-			fmt.Fprintln(os.Stderr, "错误: 写 maintain 输出:", err)
-			return 1
-		}
+		fmt.Fprintln(w, "无维护欠账。")
 		return 0
 	}
 	if *plan {
-		if _, err := fmt.Fprintln(w, renderMaintainPlan(debts)); err != nil {
-			fmt.Fprintln(os.Stderr, "错误: 写 maintain 输出:", err)
-			return 1
-		}
+		fmt.Fprintln(w, renderMaintainPlan(debts))
 		return 0
 	}
-	if _, err := fmt.Fprintf(w, "维护欠账 %d 条(清账走 MCP:kb_maintain next → 处理 → complete/dismiss):\n", len(debts)); err != nil {
-		fmt.Fprintln(os.Stderr, "错误: 写 maintain 输出:", err)
-		return 1
-	}
+	fmt.Fprintf(w, "维护欠账 %d 条(清账走 MCP:kb_maintain next → 处理 → complete/dismiss):\n", len(debts))
 	for _, d := range debts {
-		if _, err := fmt.Fprintf(w, "- %s [%s] %s\n  %s\n", d.ID, d.Kind, d.Node, d.Desc); err != nil {
-			fmt.Fprintln(os.Stderr, "错误: 写 maintain 输出:", err)
-			return 1
-		}
+		fmt.Fprintf(w, "- %s [%s] %s\n  %s\n", d.ID, d.Kind, d.Node, d.Desc)
 	}
 	return 0
 }
@@ -485,6 +631,9 @@ func runExport(args []string) int {
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
+	if rejectUnexpectedArgs(fs) {
+		return 2
+	}
 	s, err := store.Open(*repo)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "错误:", err)
@@ -494,37 +643,100 @@ func runExport(args []string) int {
 		fmt.Fprintln(os.Stderr, "错误: 库未初始化")
 		return 1
 	}
+	release, err := s.AcquireWriterLock()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "错误:", err)
+		return 1
+	}
+	defer release()
+	if err := s.RecoverTruthTransaction(); err != nil {
+		fmt.Fprintln(os.Stderr, "错误: 恢复未完成事务:", err)
+		return 1
+	}
 	e := engine.New(s)
 	if err := e.EnsureRuntime(); err != nil {
 		fmt.Fprintln(os.Stderr, "错误:", err)
 		return 1
 	}
-	var w io.Writer = os.Stdout
-	var outFile *os.File
-	if *out != "" {
-		f, err := os.Create(*out)
-		if err != nil {
+	if *out == "" {
+		if err := e.Export(os.Stdout); err != nil {
 			fmt.Fprintln(os.Stderr, "错误:", err)
 			return 1
 		}
-		outFile = f
-		w = f
-	}
-	if err := e.Export(w); err != nil {
-		if outFile != nil {
-			_ = outFile.Close()
-		}
+	} else if err := exportAtomicFile(e, s, *out); err != nil {
 		fmt.Fprintln(os.Stderr, "错误:", err)
 		return 1
 	}
-	if outFile != nil {
-		if err := outFile.Close(); err != nil {
-			fmt.Fprintln(os.Stderr, "错误: 关闭导出文件:", err)
-			return 1
-		}
-	}
 	fmt.Fprintf(os.Stderr, "导出完成 → %s\n", outDesc(*out))
 	return 0
+}
+
+func exportAtomicFile(e *engine.Engine, s *store.Store, output string) error {
+	abs, err := filepath.Abs(output)
+	if err != nil {
+		return err
+	}
+	if err := rejectKnowledgeOutput(s, abs); err != nil {
+		return err
+	}
+	dir := filepath.Dir(abs)
+	if info, err := os.Stat(abs); err == nil && info.IsDir() {
+		return fmt.Errorf("输出路径是目录:%s", abs)
+	} else if err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	tmp, err := os.CreateTemp(dir, "."+filepath.Base(abs)+"-*.tmp")
+	if err != nil {
+		return fmt.Errorf("创建同目录临时输出:%w", err)
+	}
+	tmpName := tmp.Name()
+	committed := false
+	defer func() {
+		_ = tmp.Close()
+		if !committed {
+			_ = os.Remove(tmpName)
+		}
+	}()
+	// CreateTemp 的 0600 是安全默认：bundle 可能含团队决策/事故经验，不能
+	// 绕过 umask 在共享目录强制发布成 0644。
+	if err := e.Export(tmp); err != nil {
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		return fmt.Errorf("fsync 导出临时文件:%w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("关闭导出临时文件:%w", err)
+	}
+	// 输出期间再校验一次，避免父目录被换成指向 .knowledge 的 symlink。
+	if err := rejectKnowledgeOutput(s, abs); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpName, abs); err != nil {
+		return fmt.Errorf("原子替换导出文件:%w", err)
+	}
+	if err := store.SyncDir(dir); err != nil {
+		return fmt.Errorf("fsync 导出父目录:%w", err)
+	}
+	committed = true
+	return nil
+}
+
+func rejectKnowledgeOutput(s *store.Store, output string) error {
+	knowledge, err := filepath.EvalSymlinks(s.Dir())
+	if err != nil {
+		return fmt.Errorf("解析 knowledge 目录:%w", err)
+	}
+	parent, err := filepath.EvalSymlinks(filepath.Dir(output))
+	if err != nil {
+		return fmt.Errorf("解析输出父目录:%w", err)
+	}
+	target := filepath.Join(parent, filepath.Base(output))
+	rel, err := filepath.Rel(knowledge, target)
+	if err == nil && (rel == "." || (rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) && !filepath.IsAbs(rel))) {
+		return fmt.Errorf("拒绝把 export 输出写入源库 .knowledge 内:%s", output)
+	}
+	return nil
 }
 
 func outDesc(path string) string {
@@ -540,11 +752,24 @@ func runImport(args []string) int {
 	fs := flag.NewFlagSet("import", flag.ContinueOnError)
 	repo := fs.String("repo", ".", "目标仓库路径")
 	in := fs.String("i", "", "输入文件(缺省 stdin)")
-	remapStr := fs.String("remap", "", "路径前缀重映射(跨仓迁移,格式 from=to,可重复用逗号或多次)")
+	var remapSpecs []string
+	fs.Func("remap", "路径前缀重映射(跨仓迁移,格式 from=to,可重复用逗号或多次)", func(value string) error {
+		remapSpecs = append(remapSpecs, value)
+		return nil
+	})
 	dryRun := fs.Bool("dry-run", false, "只解析 bundle 并打印将导入的文件,不写盘")
 	backup := fs.Bool("backup", false, "导入前备份当前知识库到 .knowledge/local/import-backups/")
+	force := fs.Bool("force", false, "显式替换已有但语义不同的非 journal 文件")
 	maxEntryMB := fs.Int("max-entry-mb", 16, "单个 bundle 条目大小上限(MB)")
+	maxTotalMB := fs.Int("max-total-mb", 256, "bundle 声明解压量与 staging 总上限(MB)")
 	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	if rejectUnexpectedArgs(fs) {
+		return 2
+	}
+	if *maxEntryMB <= 0 || *maxTotalMB <= 0 || *maxEntryMB > *maxTotalMB || *maxTotalMB > 256 {
+		fmt.Fprintln(os.Stderr, "错误: --max-entry-mb/--max-total-mb 必须在 1..256，且单条上限不得大于总上限")
 		return 2
 	}
 	s, err := store.Open(*repo)
@@ -552,45 +777,45 @@ func runImport(args []string) int {
 		fmt.Fprintln(os.Stderr, "错误:", err)
 		return 1
 	}
-	remap := map[string]string{}
-	if *remapStr != "" {
-		for _, pair := range strings.Split(*remapStr, ",") {
-			if from, to, ok := strings.Cut(pair, "="); ok {
-				remap[strings.TrimSpace(from)] = strings.TrimSpace(to)
-			}
-		}
+	if !s.Initialized() {
+		fmt.Fprintln(os.Stderr, "错误: 目标库未初始化")
+		return 1
+	}
+	remap, err := parseImportRemaps(remapSpecs)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "错误:", err)
+		return 2
 	}
 	var r io.Reader = os.Stdin
-	var inFile *os.File
 	if *in != "" {
 		f, err := os.Open(*in)
 		if err != nil {
 			fmt.Fprintln(os.Stderr, "错误:", err)
 			return 1
 		}
-		inFile = f
+		defer f.Close()
 		r = f
 	}
-	if !*dryRun {
-		release, err := s.AcquireWriterLock()
-		if err != nil {
-			fmt.Fprintln(os.Stderr, "错误:", err)
-			return 1
-		}
-		defer release()
+	// dry-run 同样需要一致快照，不能一边扫现有分片一边被 serve 改写。
+	release, err := s.AcquireWriterLock()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "错误:", err)
+		return 1
+	}
+	defer release()
+	if err := s.RecoverTruthTransaction(); err != nil {
+		fmt.Fprintln(os.Stderr, "错误: 恢复未完成事务:", err)
+		return 1
 	}
 	e := engine.New(s)
 	rep, err := e.ImportWithOptions(r, engine.ImportOptions{
 		PathRemap:     remap,
 		DryRun:        *dryRun,
 		Backup:        *backup,
+		Force:         *force,
 		MaxEntryBytes: int64(*maxEntryMB) << 20,
+		MaxTotalBytes: int64(*maxTotalMB) << 20,
 	})
-	if inFile != nil {
-		if closeErr := inFile.Close(); err == nil && closeErr != nil {
-			err = fmt.Errorf("关闭导入文件:%w", closeErr)
-		}
-	}
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "错误:", err)
 		return 1
@@ -604,6 +829,28 @@ func runImport(args []string) int {
 	return 0
 }
 
+func parseImportRemaps(specs []string) (map[string]string, error) {
+	remap := map[string]string{}
+	for _, spec := range specs {
+		for _, rawPair := range strings.Split(spec, ",") {
+			pair := strings.TrimSpace(rawPair)
+			if pair == "" || strings.Count(pair, "=") != 1 {
+				return nil, fmt.Errorf("非法 --remap %q,须为 from=to", rawPair)
+			}
+			from, to, _ := strings.Cut(pair, "=")
+			from, to = strings.TrimSpace(from), strings.TrimSpace(to)
+			if from == "" || to == "" {
+				return nil, fmt.Errorf("非法 --remap %q,from/to 均须非空", rawPair)
+			}
+			if previous, exists := remap[from]; exists && previous != to {
+				return nil, fmt.Errorf("--remap 源 %q 重复映射到 %q 与 %q", from, previous, to)
+			}
+			remap[from] = to
+		}
+	}
+	return remap, nil
+}
+
 func runInit(args []string) int {
 	fs := flag.NewFlagSet("init", flag.ContinueOnError)
 	repo := fs.String("repo", ".", "仓库路径")
@@ -611,6 +858,9 @@ func runInit(args []string) int {
 	reanchorAll := fs.Bool("reanchor-all", false,
 		"mass-suspect 批量出口:确认全局性变更为预期后,全库按当前代码重锚,suspect 升回 fresh")
 	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	if rejectUnexpectedArgs(fs) {
 		return 2
 	}
 
@@ -630,6 +880,10 @@ func runInit(args []string) int {
 		return 1
 	}
 	defer release()
+	if err := s.RecoverTruthTransaction(); err != nil {
+		fmt.Fprintln(os.Stderr, "错误: 恢复未完成事务:", err)
+		return 1
+	}
 
 	rep, err := engine.New(s).Init(engine.InitOptions{Force: *force, ReanchorAll: *reanchorAll})
 	if err != nil {

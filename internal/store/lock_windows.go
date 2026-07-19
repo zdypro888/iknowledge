@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 	"syscall"
 	"unsafe"
 )
@@ -32,10 +33,7 @@ const (
 // flock(LOCK_EX|LOCK_NB)——进程退出/句柄关闭自动释放,无残锁问题。
 func (s *Store) AcquireWriterLock() (release func(), err error) {
 	path := filepath.Join(s.dir, "local", ".lock")
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return nil, fmt.Errorf("store: 建 local 目录: %w", err)
-	}
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o644)
+	f, err := s.openKnowledgeFile(path, os.O_CREATE|os.O_RDWR, 0o644)
 	if err != nil {
 		return nil, fmt.Errorf("store: 开锁文件: %w", err)
 	}
@@ -50,8 +48,13 @@ func (s *Store) AcquireWriterLock() (release func(), err error) {
 		}
 		return nil, fmt.Errorf("store: LockFileEx: %w", errno)
 	}
+	s.setWriterLockHeld(true)
+	var once sync.Once
 	return func() {
-		procUnlockFileEx.Call(f.Fd(), 0, 1, 0, uintptr(unsafe.Pointer(ol)))
-		f.Close()
+		once.Do(func() {
+			s.setWriterLockHeld(false)
+			procUnlockFileEx.Call(f.Fd(), 0, 1, 0, uintptr(unsafe.Pointer(ol)))
+			f.Close()
+		})
 	}, nil
 }

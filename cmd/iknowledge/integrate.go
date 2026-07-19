@@ -1,4 +1,4 @@
-// 接入套件(impl §7.1/§9):setup 只打印 MCP/纪律/hook/pre-commit 片段,
+// 接入套件(impl §7.1/§9):setup 打印 MCP/纪律/hook/pre-commit 片段，
 // hook 做宿主 PostToolUse 桥。
 // 两者都不往 .knowledge/ 之外写任何文件(铁律二)——setup 只打印,hook 只读+HTTP。
 package main
@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -14,12 +15,9 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
-	"strconv"
-	"strings"
 	"time"
 
 	"github.com/zdypro888/iknowledge/internal/engine"
-	"github.com/zdypro888/iknowledge/internal/mcpserv"
 	"github.com/zdypro888/iknowledge/internal/store"
 )
 
@@ -46,11 +44,20 @@ func mcpJSONHTTPSnippet(root string, port int, token string) string {
 // hooksJSONSnippet 是 Claude Code hooks 接入片段(.claude/settings.json)。
 // PostToolUse 而非设计初稿的 PreToolUse:现版 Claude Code 只有 PostToolUse 的
 // hookSpecificOutput.additionalContext 能把文本注入上下文(impl §7.1 轮 25 勘误)。
-func hooksJSONSnippet(root string) string {
-	command := "iknowledge hook --repo " + shellQuote(root)
-	return fmt.Sprintf(`{ "hooks": { "PostToolUse": [ {
-  "matcher": "Read|Edit|Write|MultiEdit",
-  "hooks": [ { "type": "command", "command": %s } ] } ] } }`, strconv.Quote(command))
+func hooksJSONSnippet() string {
+	// 不把 repo 路径拼进 shell command：hook 事件本身带 cwd/file_path，runHook
+	// 会向上发现 .knowledge。这样同一片段跨 POSIX shell/cmd.exe/PowerShell 安全，
+	// 也彻底消除路径中的 &、%VAR%、引号在不同 shell 下的注入/转义分歧。
+	command := "iknowledge hook"
+	payload := map[string]any{"hooks": map[string]any{"PostToolUse": []any{map[string]any{
+		"matcher": "Read|Edit|Write|MultiEdit",
+		"hooks":   []any{map[string]any{"type": "command", "command": command}},
+	}}}}
+	data, err := json.MarshalIndent(payload, "", "  ")
+	if err != nil { // 当前 payload 仅含字符串/切片/map，保留签名故这里不可达。
+		return "{}"
+	}
+	return string(data)
 }
 
 // codexTOMLSnippet 是 Codex 接入片段(~/.codex/config.toml;CLI 与桌面 App 共用;
@@ -75,22 +82,20 @@ url = "http://127.0.0.1:%d/mcp/main?repo=%s"`, port, url.QueryEscape(root))
 Authorization = "Bearer %s"`, token)
 }
 
-// shellQuote 把仓库绝对路径安全嵌进 POSIX hook 命令。setup 只打印,不安装 hook。
-func shellQuote(s string) string {
-	return "'" + strings.ReplaceAll(s, "'", `'"'"'`) + "'"
+func preCommitHookSnippet() string {
+	return `#!/bin/sh
+# 缺省只告警不阻断；团队准备好后在命令末尾追加 --strict。
+iknowledge precheck --repo .`
 }
 
-func preCommitHookSnippet(root string) string {
-	return fmt.Sprintf(`#!/bin/sh
-# 缺省只告警不阻断;团队准备好后在命令末尾追加 --strict。
-iknowledge precheck --repo %s`, shellQuote(root))
-}
-
-// runSetup 只打印接入片段,不改用户配置或 git hook。
+// runSetup 只打印接入片段，不改用户配置或 Git hook。
 func runSetup(args []string, out io.Writer) int {
 	fs := flag.NewFlagSet("setup", flag.ContinueOnError)
 	repo := fs.String("repo", ".", "仓库路径")
 	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	if rejectUnexpectedArgs(fs) {
 		return 2
 	}
 	s, err := store.Open(*repo)
@@ -101,6 +106,15 @@ func runSetup(args []string, out io.Writer) int {
 	if !s.Initialized() {
 		fmt.Fprintln(os.Stderr, "错误: 库未初始化,先跑 iknowledge init --repo "+s.RepoRoot())
 		return 1
+	}
+	releaseView, viewErr := acquireRecoveredView(s)
+	if viewErr != nil {
+		if !errors.Is(viewErr, store.ErrLocked) || !verifiedLiveServe(s) {
+			fmt.Fprintln(os.Stderr, "错误: 恢复未完成事务或仓库 writer 正忙:", viewErr)
+			return 1
+		}
+	} else {
+		defer releaseView()
 	}
 	cfg, err := s.LoadConfig()
 	if err != nil {
@@ -115,7 +129,7 @@ func runSetup(args []string, out io.Writer) int {
 	// http 备选片段:serve --auth 已启用(token 在位)时带 headers,因此含密钥。
 	token, err := s.LoadAuthToken()
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "错误:读取鉴权 token:", err)
+		fmt.Fprintln(os.Stderr, "错误:", err)
 		return 1
 	}
 	authNote := ""
@@ -156,9 +170,9 @@ func runSetup(args []string, out io.Writer) int {
   curl "http://127.0.0.1:%d/inject?file=<某个 .go 文件路径>"
 `, root, mcpJSONSnippet(root), mcpJSONHTTPSnippet(root, cfg.Port, token),
 		root, engine.DisciplinePrompt,
-		root, hooksJSONSnippet(root),
+		root, hooksJSONSnippet(),
 		codexTOMLSnippet(root), codexTOMLHTTPSnippet(root, cfg.Port, token),
-		root, root, preCommitHookSnippet(root), root, cfg.Port); err != nil {
+		root, root, preCommitHookSnippet(), root, cfg.Port); err != nil {
 		fmt.Fprintln(os.Stderr, "错误:写 setup 输出:", err)
 		return 1
 	}
@@ -186,6 +200,9 @@ func runHook(args []string, in io.Reader, out io.Writer) int {
 	if err := fs.Parse(args); err != nil {
 		return 0
 	}
+	if fs.NArg() != 0 {
+		return 0 // hook 非法调用也遵守静默、永不阻断宿主的契约
+	}
 	var hi hookInput
 	if err := json.NewDecoder(io.LimitReader(in, 1<<20)).Decode(&hi); err != nil {
 		return 0
@@ -211,52 +228,34 @@ func runHook(args []string, in io.Reader, out io.Writer) int {
 	if err != nil {
 		return 0
 	}
+	releaseView, viewErr := acquireRecoveredView(s)
+	if viewErr != nil && !errors.Is(viewErr, store.ErrLocked) {
+		return 0
+	}
+	if releaseView != nil {
+		defer releaseView()
+	}
 	cfg, err := s.LoadConfig()
 	if err != nil || cfg == nil {
 		return 0
 	}
-	// 本机回环全流程共用 1s deadline;超时静默——宁可少注入一次,不能卡住宿主。
+	// 本机回环,1s 足够;超时静默——宁可少注入一次,不能卡住宿主。
+	client := &http.Client{Timeout: time.Second}
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
-	client := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error {
-		return http.ErrUseLastResponse
-	}}
 	base := fmt.Sprintf("http://127.0.0.1:%d", cfg.Port)
-	token, err := s.LoadAuthToken()
-	if err != nil {
-		return 0 // 本地认证状态损坏时 fail closed,不向未认证端口取注入内容
-	}
-	// hook 也不能把 token 直接送给“碰巧占着配置端口”的进程。先无秘密探活并
-	// 用随机 nonce-HMAC 核对持钥证明;普通 challenge/静态指纹都可伪造或重放。
-	if token != "" {
-		challenge, err := mcpserv.NewAuthChallenge()
-		if err != nil {
-			return 0
-		}
-		probe, err := http.NewRequestWithContext(ctx, http.MethodGet, base+"/status", nil)
-		if err != nil {
-			return 0
-		}
-		probe.Header.Set(mcpserv.AuthChallengeHeader, challenge)
-		resp, err := client.Do(probe)
-		if err != nil {
-			return 0
-		}
-		matched := resp.StatusCode == http.StatusUnauthorized &&
-			resp.Header.Get(mcpserv.AuthFingerprintHeader) == mcpserv.AuthFingerprint(token) &&
-			mcpserv.VerifyAuthProof(token, challenge, resp.Header.Get(mcpserv.AuthProofHeader))
-		if !discardAndClose(resp) || !matched {
-			return 0
-		}
-	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, fmt.Sprintf("%s/inject?file=%s&session=%s&tool=%s",
 		base, url.QueryEscape(file), url.QueryEscape(hi.SessionID), url.QueryEscape(hi.ToolName)), nil)
 	if err != nil {
 		return 0
 	}
-	if token != "" {
-		req.Header.Set("Authorization", "Bearer "+token)
+	// 无论业务 Bearer 是否启用，先做双向 HMAC 身份验证；否则占用可预测
+	// loopback 端口并返回 200 的无关进程可收到文件路径、session 与注入查询。
+	session, err := s.AcquireLocalAuthSession(ctx, base, "/inject", client)
+	if err != nil {
+		return 0
 	}
+	req.Header.Set("Authorization", store.LocalSessionAuthorization(session.Token))
 	resp, err := client.Do(req)
 	if err != nil {
 		return 0
