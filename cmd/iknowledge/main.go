@@ -150,6 +150,49 @@ func verifiedLiveServe(s *store.Store) bool {
 	return err == nil
 }
 
+const serveSemanticResidentMaxMiB int64 = engine.SemanticProcessResidentMaxMiB
+
+// preflightServeRepos 在任何 writer lock、Engine 或 listener 之前完成多仓库
+// canonicalize/去重/初始化/config/semantic 校验。semantic snapshot 是惰性加载，
+// 这里按每仓用户授权的 max_vector_mib 做最坏 resident 预算；disabled 不占额度。
+func preflightServeRepos(repos []string) ([]*store.Store, error) {
+	stores := make([]*store.Store, 0, len(repos))
+	seen := make(map[string]bool, len(repos))
+	var semanticResidentMiB int64
+	for _, repo := range repos {
+		s, err := store.Open(repo)
+		if err != nil {
+			return nil, fmt.Errorf("打开仓库 %q: %w", repo, err)
+		}
+		root := s.RepoRoot()
+		if seen[root] {
+			continue
+		}
+		seen[root] = true
+		if !s.Initialized() {
+			return nil, fmt.Errorf("库未初始化,先跑 iknowledge init --repo %s", root)
+		}
+		// EnsureConfig 会在 writer lock 下补缺失文件；已有配置先全部只读校验，
+		// 避免处理后仓失败时前仓已持锁或占端口。
+		if _, err := s.LoadConfig(); err != nil {
+			return nil, fmt.Errorf("仓库配置损坏(%s): %w", root, err)
+		}
+		semanticCfg, err := engine.LoadSemanticSettings(s)
+		if err != nil {
+			return nil, fmt.Errorf("semantic 配置损坏(%s): %w", root, err)
+		}
+		if semanticCfg.Enabled {
+			semanticResidentMiB += int64(semanticCfg.MaxVectorMiB)
+			if semanticResidentMiB > serveSemanticResidentMaxMiB {
+				return nil, fmt.Errorf("semantic resident 预算超限: enabled 仓库 max_vector_mib 合计 %d MiB > 进程硬上限 %d MiB（在 %s 超限）；请降低各仓 --max-vector-mib，或拆分为多个 daemon",
+					semanticResidentMiB, serveSemanticResidentMaxMiB, root)
+			}
+		}
+		stores = append(stores, s)
+	}
+	return stores, nil
+}
+
 func runServe(args []string) int {
 	fs := flag.NewFlagSet("serve", flag.ContinueOnError)
 	var repos []string
@@ -179,12 +222,18 @@ func runServe(args []string) int {
 	// "每仓一个进程"的管理负担。
 	type unit struct {
 		s      *store.Store
+		e      *engine.Engine
 		hs     *http.Server
 		ln     net.Listener
 		listen string
 		cancel context.CancelFunc
 	}
 	var units []unit
+	// Startup cleanup is quiescent. Once Serve begins, semantic resident locks
+	// are released only after every HTTP server has drained successfully. If the
+	// 10-second shutdown budget expires, the process is already exiting; waiting
+	// again without a context here would turn that bound back into infinity.
+	semanticCleanupSafe := true
 	cleanup := func() {
 		for _, u := range units {
 			if u.cancel != nil {
@@ -193,25 +242,19 @@ func runServe(args []string) int {
 			if u.ln != nil {
 				u.ln.Close()
 			}
+			if u.e != nil && semanticCleanupSafe {
+				u.e.ReleaseSemanticProcessResources()
+			}
 		}
 	}
-	seen := map[string]bool{}
-	for _, repo := range repos {
-		s, err := store.Open(repo)
-		if err != nil {
-			fmt.Fprintln(os.Stderr, "错误:", err)
-			cleanup()
-			return 1
-		}
-		if seen[s.RepoRoot()] {
-			continue // 同仓库重复传参:幂等去重
-		}
-		seen[s.RepoRoot()] = true
-		if !s.Initialized() {
-			fmt.Fprintln(os.Stderr, "错误: 库未初始化,先跑 iknowledge init --repo "+s.RepoRoot())
-			cleanup()
-			return 1
-		}
+	defer cleanup()
+	stores, err := preflightServeRepos(repos)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "错误:", err)
+		return 1
+	}
+	semanticProcess := engine.NewSemanticProcessCoordinator(int(serveSemanticResidentMaxMiB))
+	for _, s := range stores {
 		// 写者互斥(impl §4):serve 启动时取 flock 并持有;第二个 serve/并行 CLI init 被挡。
 		release, err := s.AcquireWriterLock()
 		if err != nil {
@@ -237,6 +280,11 @@ func runServe(args []string) int {
 			listen = fmt.Sprintf("127.0.0.1:%d", cfg.Port)
 		}
 		e := engine.New(s)
+		if err := e.SetSemanticProcessCoordinator(semanticProcess); err != nil {
+			fmt.Fprintf(os.Stderr, "错误(%s): %v\n", s.RepoRoot(), err)
+			cleanup()
+			return 1
+		}
 		if err := e.EnsureRuntime(); err != nil {
 			fmt.Fprintf(os.Stderr, "错误(%s): %v\n", s.RepoRoot(), err)
 			cleanup()
@@ -302,7 +350,7 @@ func runServe(args []string) int {
 		// engine.RequestWriteTimeout 对普通工具保持 10 分钟，并在 scout:self 时按
 		// 自派等待上限加启动/信任弹窗重投余量，避免 0 值无限占用也不误杀长调用。
 		serveCtx, serveCancel := context.WithCancel(context.Background())
-		units = append(units, unit{s: s, ln: ln, listen: listen, cancel: serveCancel,
+		units = append(units, unit{s: s, e: e, ln: ln, listen: listen, cancel: serveCancel,
 			hs: &http.Server{
 				Handler:           srv.Handler(),
 				BaseContext:       func(net.Listener) context.Context { return serveCtx },
@@ -320,6 +368,7 @@ func runServe(args []string) int {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	errCh := make(chan error, len(units))
+	semanticCleanupSafe = false
 	for _, u := range units {
 		go func() { errCh <- u.hs.Serve(u.ln) }()
 	}
@@ -346,6 +395,7 @@ func runServe(args []string) int {
 				return 1
 			}
 		}
+		semanticCleanupSafe = true
 	}
 	return 0
 }

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"path"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -40,24 +41,66 @@ type ReadMeta struct {
 
 // Status 组装库状态(impl §7.3)。
 func (e *Engine) Status() (string, error) {
+	return e.StatusContext(context.Background())
+}
+
+func (e *Engine) StatusContext(ctx context.Context) (string, error) {
+	if ctx == nil {
+		return "", fmt.Errorf("status: nil context")
+	}
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
 	if !e.Store.Initialized() {
 		return "库未初始化。先调 kb_init(或 CLI:iknowledge init --repo " + e.Store.RepoRoot() + ")。", nil
 	}
-	if err := e.Sync(); err != nil {
+	if err := e.SyncContext(ctx); err != nil {
+		return "", err
+	}
+	// SemanticHealthSnapshot 会在必要时发布 source manifest（短持
+	// rt.mu）并可能淘汰外部已替换的 vector generation。必须在下方
+	// 主 rt.RLock 之外完成，否则 RWMutex 不可升级会死锁。该检查纯本地：
+	// 不联网、不读 API key、不解码大向量 payload。
+	semanticHealth, err := e.SemanticHealthSnapshotContext(ctx)
+	if err != nil {
 		return "", err
 	}
 
 	// 解析失败文件:全库 parse 扫描,60s TTL 缓存(kb_status 最大单项成本,
 	// casino 实测数百毫秒)。#21:锁外做——只读 Store/Reg 不碰 rt 状态。
-	parseFailed := e.parseFailedCached()
+	parseFailed, err := e.parseFailedCachedContext(ctx)
+	if err != nil {
+		return "", err
+	}
 	// 热区频率因子同样锁外跑 git(knowledge.md §12.1);60s TTL 缓存——
 	// git log 在大仓库百毫秒级,频繁 kb_status 不该每次付。
-	gitCounts := e.gitCountsCached()
+	gitCounts, err := e.gitCountsCachedContext(ctx)
+	if err != nil {
+		return "", err
+	}
+	// Usage telemetry is advisory filesystem I/O and can be as large as its
+	// explicit 64 MiB status budget. Read it before taking the truth snapshot
+	// lock so a large local log cannot stall remember/record_change writers.
+	usageRecords, usageErr := e.Store.LoadUsageContext(ctx)
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	cg, cgErr := e.ensureCallGraphContext(ctx)
+	if cgErr != nil {
+		return "", cgErr
+	}
 
 	// R29 批次2:Status 改用读锁——ensureCallGraphLocked 走 cgMu 独立锁,
 	// computeDebtsLocked/节点遍历全纯读。parseFailed/gitCounts 已锁外算。
-	e.rt.mu.RLock()
+	if err := e.rt.mu.RLockContext(ctx); err != nil {
+		return "", err
+	}
 	defer e.rt.mu.RUnlock()
+	ops := 0
+	checkpoint := func() error {
+		ops++
+		return contextCheckpoint(ctx, ops)
+	}
 
 	total, digested, suspect, orphaned, pending := 0, 0, 0, 0, 0
 	conflicts := 0
@@ -71,11 +114,17 @@ func (e *Engine) Status() (string, error) {
 	type fileDigest struct{ done, total int }
 	perFile := map[string]*fileDigest{} // 符号节点按文件聚合(热点消化比)
 	for _, cs := range e.rt.cache.Shards() {
+		if err := checkpoint(); err != nil {
+			return "", err
+		}
 		if cs.Err != nil {
 			conflicts++
 			continue
 		}
 		for i := range cs.Shard.Nodes {
+			if err := checkpoint(); err != nil {
+				return "", err
+			}
 			n := &cs.Shard.Nodes[i]
 			total++
 			if hasActiveEntries(n) {
@@ -98,6 +147,9 @@ func (e *Engine) Status() (string, error) {
 			}
 			// R29-续:健康度——活跃条目的置信度分布 + 年龄。
 			for i := range n.Entries {
+				if err := checkpoint(); err != nil {
+					return "", err
+				}
 				en := &n.Entries[i]
 				if !en.Active() {
 					continue
@@ -128,11 +180,15 @@ func (e *Engine) Status() (string, error) {
 			}
 		}
 	}
-	sort.Strings(orphanIDs)
+	if err := contextSortStrings(ctx, orphanIDs); err != nil {
+		return "", err
+	}
 	_, jstats := e.rt.cache.Journal()
 
 	var b strings.Builder
 	fmt.Fprintf(&b, "repoRoot: %s\nschema: %d\n", e.Store.RepoRoot(), model.SchemaVersion)
+	b.WriteString(semanticHealth.compactText())
+	b.WriteByte('\n')
 	// 覆盖率一位小数:68/15598 取整成 "0%" 会把正常的按需消化误读成没干活。
 	fmt.Fprintf(&b, "节点: %d(已消化 %d,覆盖率 %.1f%%)\n", total, digested, pct(digested, total))
 	fmt.Fprintf(&b, "suspect: %d | 孤儿: %d | 待补锚: %d | 冲突分片: %d | 解析失败文件: %d | journal 坏行: %d\n",
@@ -154,10 +210,13 @@ func (e *Engine) Status() (string, error) {
 	}
 
 	// 使用日志汇总(impl §7.6:数据裁决的采集底)。
-	if recs, err := e.Store.LoadUsage(); err == nil && len(recs) > 0 {
+	if usageErr == nil && len(usageRecords) > 0 {
 		var recalls, hits, staleN, changes, remembers, undigestedHits int
 		var prechecks, precheckWarnings, precheckBlocked int
-		for _, r := range recs {
+		for i, r := range usageRecords {
+			if err := contextCheckpoint(ctx, i); err != nil {
+				return "", err
+			}
 			switch r.Tool {
 			case "kb_recall":
 				recalls++
@@ -194,13 +253,18 @@ func (e *Engine) Status() (string, error) {
 		if prechecks > 0 {
 			fmt.Fprintf(&b, "提交预检: %d 次 | 实际告警 %d | strict 阻断 %d\n", prechecks, precheckWarnings, precheckBlocked)
 		}
+	} else if usageErr != nil {
+		fmt.Fprintf(&b, "⚠ 使用日志未汇总:%v\n", usageErr)
 	}
 
 	// 热点待消化(knowledge.md §12.1:热度 = git 近期改动频率 × 跨文件被调中心度,
 	// +1 平滑——非 git 仓库/新文件退化为单因子仍可排序)。消化优先级的机械输出,
 	// 消化本身仍由 AI 会话做(kb_recall 读原文 → kb_remember 沉淀)。
-	if cg := e.ensureCallGraphLocked(); cg != nil && len(perFile) > 0 {
-		centrality := cg.fileCentrality()
+	if cg != nil && len(perFile) > 0 {
+		centrality, err := cg.fileCentralityContext(ctx)
+		if err != nil {
+			return "", err
+		}
 		type hotspot struct {
 			file        string
 			heat        int
@@ -209,18 +273,23 @@ func (e *Engine) Status() (string, error) {
 		}
 		var hot []hotspot
 		for file, fd := range perFile {
+			if err := checkpoint(); err != nil {
+				return "", err
+			}
 			if fd.done >= fd.total {
 				continue // 全消化的文件不是"待消化"热点
 			}
 			chg, ctr := gitCounts[file], centrality[file]
 			hot = append(hot, hotspot{file, (1 + chg) * (1 + ctr), chg, ctr, fd.done, fd.total})
 		}
-		sort.Slice(hot, func(i, j int) bool {
-			if hot[i].heat != hot[j].heat {
-				return hot[i].heat > hot[j].heat
+		if err := contextHeapSort(ctx, hot, func(a, b hotspot) bool {
+			if a.heat != b.heat {
+				return a.heat > b.heat
 			}
-			return hot[i].file < hot[j].file
-		})
+			return a.file < b.file
+		}); err != nil {
+			return "", err
+		}
 		if len(hot) > 10 {
 			hot = hot[:10] // TOP10:对齐 M1.4 种子协议("消化 10 个热点")
 		}
@@ -240,16 +309,21 @@ func (e *Engine) Status() (string, error) {
 	}
 	var mines []mine
 	for _, ref := range e.rt.ix.Nodes() {
+		if err := checkpoint(); err != nil {
+			return "", err
+		}
 		if s := e.rt.ix.LandmineScore(ref.Node.ID); s >= 3 {
 			mines = append(mines, mine{ref.Node.ID, s})
 		}
 	}
-	sort.Slice(mines, func(i, j int) bool {
-		if mines[i].score != mines[j].score {
-			return mines[i].score > mines[j].score
+	if err := contextHeapSort(ctx, mines, func(a, b mine) bool {
+		if a.score != b.score {
+			return a.score > b.score
 		}
-		return mines[i].nodeID < mines[j].nodeID
-	})
+		return a.nodeID < b.nodeID
+	}); err != nil {
+		return "", err
+	}
 	if len(mines) > 5 {
 		mines = mines[:5]
 	}
@@ -261,13 +335,16 @@ func (e *Engine) Status() (string, error) {
 	}
 	// 轮31 批次3 知识缺口 TOP5:高被依赖(calledBy 多)却零活跃知识的节点——
 	// 这些是"每次用都得从零读代码"的盲区,优先沉淀契约/坑(跨改动仍成立的不变量)。
-	if cg := e.ensureCallGraphLocked(); cg != nil {
+	if cg != nil {
 		type gap struct {
 			nodeID  string
 			callers int
 		}
 		var gaps []gap
 		for _, ref := range e.rt.ix.Nodes() {
+			if err := checkpoint(); err != nil {
+				return "", err
+			}
 			n := ref.Node
 			if n.Level != model.LevelFunction && n.Level != model.LevelDecl {
 				continue
@@ -283,12 +360,14 @@ func (e *Engine) Status() (string, error) {
 				gaps = append(gaps, gap{n.ID, callers})
 			}
 		}
-		sort.Slice(gaps, func(i, j int) bool {
-			if gaps[i].callers != gaps[j].callers {
-				return gaps[i].callers > gaps[j].callers
+		if err := contextHeapSort(ctx, gaps, func(a, b gap) bool {
+			if a.callers != b.callers {
+				return a.callers > b.callers
 			}
-			return gaps[i].nodeID < gaps[j].nodeID
-		})
+			return a.nodeID < b.nodeID
+		}); err != nil {
+			return "", err
+		}
 		if len(gaps) > 5 {
 			gaps = gaps[:5]
 		}
@@ -304,16 +383,28 @@ func (e *Engine) Status() (string, error) {
 	if len(e.rt.wips) > 0 {
 		b.WriteString("活跃 wip:\n")
 		for _, w := range e.rt.wips {
+			if err := checkpoint(); err != nil {
+				return "", err
+			}
 			fmt.Fprintf(&b, "  - [%s] %s(todo %d 项,touching %v)\n", w.Owner, w.Task, len(w.Todo), w.Touching)
 		}
 	}
 	// 维护欠账。
-	debts := e.computeDebtsLocked()
+	debts, err := e.computeDebtsLockedContext(ctx)
+	if err != nil {
+		return "", err
+	}
 	fmt.Fprintf(&b, "维护欠账: %d 条(kb_maintain 取用)\n", len(debts))
 	for _, w := range e.rt.warns {
+		if err := checkpoint(); err != nil {
+			return "", err
+		}
 		fmt.Fprintf(&b, "⚠ %s\n", w)
 	}
 	for _, w := range e.rt.opsWarns {
+		if err := checkpoint(); err != nil {
+			return "", err
+		}
 		fmt.Fprintf(&b, "⚠ %s\n", w)
 	}
 	// R29 批次3:config.yaml 解析失败不再静默吞——kb_status 显式提示。
@@ -325,6 +416,9 @@ func (e *Engine) Status() (string, error) {
 	// 置信度分布。
 	totalEntries := 0
 	for _, c := range confCounts {
+		if err := checkpoint(); err != nil {
+			return "", err
+		}
 		totalEntries += c
 	}
 	if totalEntries > 0 {
@@ -343,6 +437,9 @@ func (e *Engine) Status() (string, error) {
 		var sum time.Duration
 		var newest time.Duration
 		for i, a := range entryAges {
+			if err := contextCheckpoint(ctx, i); err != nil {
+				return "", err
+			}
 			sum += a
 			if i == 0 || a < newest {
 				newest = a
@@ -364,6 +461,9 @@ func (e *Engine) Status() (string, error) {
 	recent30 := e.now().AddDate(0, 0, -30)
 	changes, verifies, refutes := 0, 0, 0
 	for _, c := range e.rt.ix.Changes() {
+		if err := checkpoint(); err != nil {
+			return "", err
+		}
 		if c.At.After(recent30) {
 			changes++
 			if c.Overturns != "" {
@@ -632,6 +732,20 @@ func nodeLine(n *model.Node) string {
 	return strings.Join(parts, " ")
 }
 
+// recallNodeStateLine intentionally renders only structural truth. A recall
+// candidate can be discovered by one safe current card while another summary
+// on the same node is suspect or under an open dispute. Reusing nodeLine here
+// would therefore print an unvalidated summary inside the "current candidate"
+// section. Exact kb_recall(node, ...) down-drill remains the place that renders
+// entry text together with confidence and dispute state.
+func recallNodeStateLine(n *model.Node) string {
+	parts := []string{"[level=" + n.Level + "]", "[status=" + string(n.Status) + "]"}
+	if n.PendingAnchor {
+		parts = append(parts, "[pending-anchor]")
+	}
+	return strings.Join(parts, " ")
+}
+
 func firstSummary(n *model.Node) string {
 	for i := range n.Entries {
 		if n.Entries[i].Active() && n.Entries[i].Kind == model.KindSummary {
@@ -697,7 +811,7 @@ func (e *Engine) RecallContext(ctx context.Context, a RecallArgs, sid string) (s
 	if err := e.requireInit(); err != nil {
 		return "", ReadMeta{}, err
 	}
-	if err := e.Sync(); err != nil {
+	if err := e.SyncContext(ctx); err != nil {
 		return "", ReadMeta{}, err
 	}
 	if a.Mode == "" {
@@ -712,7 +826,9 @@ func (e *Engine) RecallContext(ctx context.Context, a RecallArgs, sid string) (s
 
 	// 精确解析与关键词候选只读当前 generation。语义 provider 调用必须在主
 	// runtime 锁外；拿到候选后再回锁校验当前 source hash 并渲染。
-	e.rt.mu.RLock()
+	if err := e.rt.mu.RLockContext(ctx); err != nil {
+		return "", ReadMeta{}, err
+	}
 
 	// flow 模式且 query 直指流程 ID/标题;空 query 列出所有流程(#7)。
 	if a.Mode == "flow" {
@@ -762,19 +878,22 @@ func (e *Engine) RecallContext(ctx context.Context, a RecallArgs, sid string) (s
 		return "", ReadMeta{}, err
 	}
 
-	e.rt.mu.RLock()
+	if err := e.rt.mu.RLockContext(ctx); err != nil {
+		return "", ReadMeta{}, err
+	}
 	defer e.rt.mu.RUnlock()
 	// Provider 调用期间可能有 Remember/verify/init 发布了新 generation；关键词
 	// 候选便宜，回锁后按当前 index 重跑，绝不把旧 generation 的 rank 带进结果。
-	lexicalHits := e.rt.ix.Search(a.Query, lexicalLimit)
-	merged, validationWarning := e.mergeRecallCandidatesLocked(lexicalHits, semanticHits, a.Limit)
+	lexicalHits := e.rt.ix.SearchCurrent(a.Query, lexicalLimit)
+	lexicalRiskHits := e.rt.ix.SearchRisk(a.Query, lexicalLimit)
+	merged, validationWarning := e.mergeRecallCandidatesLocked(lexicalHits, lexicalRiskHits, semanticHits, a.Limit)
 	if validationWarning != "" {
 		if semanticWarning != "" {
 			semanticWarning += "; "
 		}
 		semanticWarning += validationWarning
 	}
-	if len(merged) > 0 {
+	if merged.hit() {
 		return e.renderRecallCandidatesLocked(merged, semanticWarning), ReadMeta{Hit: true}, nil
 	}
 
@@ -785,18 +904,46 @@ func (e *Engine) RecallContext(ctx context.Context, a RecallArgs, sid string) (s
 const recallRRFK = 60
 
 type recallCandidate struct {
-	nodeID        string
-	lexicalRank   int
-	lexicalScore  int
-	semanticRank  int
-	semanticScore float32
-	fusedScore    float64
+	nodeID         string
+	lexicalRank    int
+	lexicalScore   int
+	semanticRank   int
+	semanticScore  float32
+	fusedScore     float64
+	semanticID     string
+	semanticKind   string
+	semanticFacets []string
+	semanticRefs   []string
 }
+
+type semanticEvidence struct {
+	nodeID       string
+	lane         string
+	lexicalRank  int
+	lexicalScore int
+	rank         int
+	score        float32
+	recordID     string
+	facets       []string
+	references   []string
+}
+
+type recallMerge struct {
+	current []recallCandidate
+	risk    []semanticEvidence
+	history []semanticEvidence
+}
+
+// hit means recall returned useful knowledge evidence, not that semantic
+// similarity promoted an advisory into a current answer. An advisory-only
+// result therefore remains a usage-log hit while render keeps the current
+// section explicitly empty and risk/history outside RRF.
+func (m recallMerge) hit() bool { return len(m.current)+len(m.risk)+len(m.history) > 0 }
 
 // mergeRecallCandidatesLocked 将两种不可直接比较的分数按分池 rank 做 RRF。
 // semantic 同一节点可有多个摘要记录，只取该节点的首个（最佳）rank。
-func (e *Engine) mergeRecallCandidatesLocked(lexical []index.Hit, semanticHits []vector.Hit, limit int) ([]recallCandidate, string) {
-	byNode := make(map[string]*recallCandidate, len(lexical)+len(semanticHits))
+func (e *Engine) mergeRecallCandidatesLocked(lexical, lexicalRisk []index.Hit, semanticHits semanticCandidateSet, limit int) (recallMerge, string) {
+	byNode := make(map[string]*recallCandidate, len(lexical)+len(semanticHits.current))
 	for i, hit := range lexical {
 		if e.rt.ix.Node(hit.NodeID) == nil {
 			continue
@@ -813,15 +960,13 @@ func (e *Engine) mergeRecallCandidatesLocked(lexical []index.Hit, semanticHits [
 
 	manifest, sourceErr := e.semanticManifestLocked()
 	semanticRank := 0
-	seenSemanticNode := make(map[string]bool, len(semanticHits))
 	if sourceErr == nil {
-		for _, hit := range semanticHits {
+		for _, hit := range semanticHits.current {
 			record, current := manifest.records[hit.ID]
 			if !current || record.NodeID != hit.NodeID || record.SourceHash != hit.SourceHash ||
-				e.rt.ix.Node(hit.NodeID) == nil || seenSemanticNode[hit.NodeID] {
+				record.Kind != semanticLaneCurrent || hit.Kind != semanticLaneCurrent || e.rt.ix.Node(hit.NodeID) == nil {
 				continue
 			}
-			seenSemanticNode[hit.NodeID] = true
 			semanticRank++
 			candidate := byNode[hit.NodeID]
 			if candidate == nil {
@@ -830,6 +975,10 @@ func (e *Engine) mergeRecallCandidatesLocked(lexical []index.Hit, semanticHits [
 			}
 			candidate.semanticRank = semanticRank
 			candidate.semanticScore = hit.Score
+			candidate.semanticID = hit.ID
+			candidate.semanticKind = record.Kind
+			candidate.semanticFacets = append([]string(nil), record.Facets...)
+			candidate.semanticRefs = append([]string(nil), record.References...)
 			candidate.fusedScore += 1 / float64(recallRRFK+semanticRank)
 		}
 	}
@@ -847,55 +996,186 @@ func (e *Engine) mergeRecallCandidatesLocked(lexical []index.Hit, semanticHits [
 	if limit > 0 && len(merged) > limit {
 		merged = merged[:limit]
 	}
+	result := recallMerge{current: merged}
+	if sourceErr == nil {
+		result.risk = e.semanticEvidenceLocked(manifest, semanticHits.risk, semanticLaneRisk, limit)
+		result.history = e.semanticEvidenceLocked(manifest, semanticHits.history, semanticLaneHistory, limit)
+	}
+	result.risk = e.mergeLexicalRiskEvidenceLocked(result.risk, lexicalRisk, limit)
 	warning := ""
-	if sourceErr != nil && len(semanticHits) > 0 {
+	if sourceErr != nil && semanticHits.len() > 0 {
 		warning = sourceErr.Error()
 	}
-	return merged, warning
+	return result, warning
 }
 
-func (e *Engine) renderRecallCandidatesLocked(hits []recallCandidate, semanticWarning string) string {
+// mergeLexicalRiskEvidenceLocked 把风险词面命中和 semantic risk 合并为同一条
+// advisory。它不进入 current RRF，也不会因为双路命中重复呈现节点。
+func (e *Engine) mergeLexicalRiskEvidenceLocked(semantic []semanticEvidence, lexical []index.Hit, limit int) []semanticEvidence {
+	out := append([]semanticEvidence(nil), semantic...)
+	byNode := make(map[string]int, len(out)+len(lexical))
+	for i := range out {
+		byNode[out[i].nodeID] = i
+	}
+	for i, hit := range lexical {
+		if e.rt.ix.Node(hit.NodeID) == nil {
+			continue
+		}
+		idx, ok := byNode[hit.NodeID]
+		if !ok {
+			idx = len(out)
+			byNode[hit.NodeID] = idx
+			out = append(out, semanticEvidence{nodeID: hit.NodeID, lane: semanticLaneRisk})
+		}
+		out[idx].lexicalRank = i + 1
+		out[idx].lexicalScore = hit.Score
+		if !slices.Contains(out[idx].facets, "lexical-risk") {
+			out[idx].facets = append(out[idx].facets, "lexical-risk")
+		}
+	}
+	sort.SliceStable(out, func(i, j int) bool {
+		left, right := evidenceBestRank(out[i]), evidenceBestRank(out[j])
+		if left != right {
+			return left < right
+		}
+		// 同 rank 时精确词面风险优先；双路命中再以节点 ID 稳定排序。
+		if (out[i].lexicalRank > 0) != (out[j].lexicalRank > 0) {
+			return out[i].lexicalRank > 0
+		}
+		return out[i].nodeID < out[j].nodeID
+	})
+	if limit > 0 && len(out) > limit {
+		out = out[:limit]
+	}
+	return out
+}
+
+func evidenceBestRank(item semanticEvidence) int {
+	rank := item.rank
+	if rank == 0 || (item.lexicalRank > 0 && item.lexicalRank < rank) {
+		rank = item.lexicalRank
+	}
+	if rank == 0 {
+		return int(^uint(0) >> 1)
+	}
+	return rank
+}
+
+func (e *Engine) semanticEvidenceLocked(manifest semanticSourceManifest, hits []vector.Hit, lane string, limit int) []semanticEvidence {
+	out := make([]semanticEvidence, 0, len(hits))
+	for _, hit := range hits {
+		record, ok := manifest.records[hit.ID]
+		if !ok || record.NodeID != hit.NodeID || record.SourceHash != hit.SourceHash ||
+			record.Kind != lane || hit.Kind != lane || e.rt.ix.Node(hit.NodeID) == nil {
+			continue
+		}
+		out = append(out, semanticEvidence{
+			nodeID: hit.NodeID, lane: lane, rank: len(out) + 1, score: hit.Score,
+			recordID: hit.ID, facets: append([]string(nil), record.Facets...),
+			references: append([]string(nil), record.References...),
+		})
+		if limit > 0 && len(out) >= limit {
+			break
+		}
+	}
+	return out
+}
+
+func (e *Engine) renderRecallCandidatesLocked(result recallMerge, semanticWarning string) string {
 	var b strings.Builder
 	hybrid := false
-	for _, hit := range hits {
+	for _, hit := range result.current {
 		hybrid = hybrid || hit.semanticRank > 0
 	}
-	if hybrid {
-		fmt.Fprintf(&b, "关键词 + semantic 混合命中 %d 个节点(RRF):\n", len(hits))
+	if len(result.current) > 0 {
+		if hybrid {
+			fmt.Fprintf(&b, "当前答案候选｜关键词 + semantic 混合命中 %d 个节点(RRF):\n", len(result.current))
+		} else {
+			fmt.Fprintf(&b, "当前答案候选｜关键词命中 %d 个节点:\n", len(result.current))
+		}
 	} else {
-		fmt.Fprintf(&b, "关键词命中 %d 个节点:\n", len(hits))
+		b.WriteString("当前答案候选｜无；以下仅为风险/历史线索，不可直接当作当前结论。\n")
 	}
-	ids := make([]string, 0, len(hits))
-	for _, hit := range hits {
+	ids := make([]string, 0, len(result.current)+len(result.risk)+len(result.history))
+	seenID := map[string]bool{}
+	for _, hit := range result.current {
 		ref := e.rt.ix.Node(hit.nodeID)
 		if ref == nil {
 			continue
 		}
-		fmt.Fprintf(&b, "- %s %s\n  ↳ 命中解释:", hit.nodeID, nodeLine(ref.Node))
+		fmt.Fprintf(&b, "- %s %s\n  ↳ 命中解释:", hit.nodeID, recallNodeStateLine(ref.Node))
 		if hit.lexicalRank > 0 {
 			fmt.Fprintf(&b, " keyword rank=%d score=%d", hit.lexicalRank, hit.lexicalScore)
 		}
 		if hit.semanticRank > 0 {
 			fmt.Fprintf(&b, " semantic rank=%d cosine=%.3f", hit.semanticRank, hit.semanticScore)
+			if len(hit.semanticFacets) > 0 {
+				fmt.Fprintf(&b, " facets=%s", strings.Join(hit.semanticFacets, ","))
+			}
+			if len(hit.semanticRefs) > 0 {
+				fmt.Fprintf(&b, " refs=%s", strings.Join(hit.semanticRefs, ","))
+			}
 		}
 		if hybrid {
 			fmt.Fprintf(&b, " RRF=%.6f", hit.fusedScore)
 		}
 		b.WriteString("\n")
-		ids = append(ids, hit.nodeID)
+		if !seenID[hit.nodeID] {
+			seenID[hit.nodeID] = true
+			ids = append(ids, hit.nodeID)
+		}
 	}
+	renderEvidenceLane := func(title string, evidence []semanticEvidence) {
+		if len(evidence) == 0 {
+			return
+		}
+		discovery := "相似度"
+		for _, item := range evidence {
+			if item.lexicalRank > 0 {
+				discovery = "关键词/相似度"
+				break
+			}
+		}
+		b.WriteString(title + "（" + discovery + "只负责发现，须按引用精确复核）：\n")
+		for _, item := range evidence {
+			ref := e.rt.ix.Node(item.nodeID)
+			if ref == nil {
+				continue
+			}
+			fmt.Fprintf(&b, "- %s %s\n  ↳", item.nodeID, recallNodeStateLine(ref.Node))
+			if item.lexicalRank > 0 {
+				fmt.Fprintf(&b, " keyword-risk rank=%d score=%d", item.lexicalRank, item.lexicalScore)
+			}
+			if item.rank > 0 {
+				fmt.Fprintf(&b, " semantic rank=%d cosine=%.3f", item.rank, item.score)
+			}
+			if len(item.facets) > 0 {
+				fmt.Fprintf(&b, " facets=%s", strings.Join(item.facets, ","))
+			}
+			if len(item.references) > 0 {
+				fmt.Fprintf(&b, " refs=%s", strings.Join(item.references, ","))
+			}
+			b.WriteString("\n")
+			if !seenID[item.nodeID] {
+				seenID[item.nodeID] = true
+				ids = append(ids, item.nodeID)
+			}
+		}
+	}
+	renderEvidenceLane("风险警示", result.risk)
+	renderEvidenceLane("历史来路 [historical]", result.history)
 	if nbs := e.structuralNeighborsLocked(ids, 5); len(nbs) > 0 {
 		b.WriteString("结构相邻(一跳,与命中节点相连):\n")
 		for _, nb := range nbs {
 			if ref := e.rt.ix.Node(nb.id); ref != nil {
-				fmt.Fprintf(&b, "- %s %s(%s)\n", nb.id, nodeLine(ref.Node), nb.via)
+				fmt.Fprintf(&b, "- %s %s(%s)\n", nb.id, recallNodeStateLine(ref.Node), nb.via)
 			}
 		}
 	}
 	if semanticWarning != "" {
-		fmt.Fprintf(&b, "⚠ semantic 已降级: %s；已继续使用关键词/结构检索。\n", semanticWarning)
+		fmt.Fprintf(&b, "⚠ semantic 已降级/状态提示: %s；关键词/结构检索保持可用。\n", semanticWarning)
 	}
-	b.WriteString("(用节点 ID 精确重查取快照/历史)")
+	b.WriteString("(用节点 ID 精确重查当前快照；风险/历史引用用 history/flow 下钻，知识只导航、源码定论)")
 	b.WriteString(e.wipAttachment(ids))
 	return framed(b.String())
 }
@@ -1486,7 +1766,7 @@ func (e *Engine) reconcileOnReadLocked(ref *index.NodeRef) autoInfo {
 //
 // 成本控制:只对"有活跃知识 且 (fresh|suspect|pending)"的节点做(纯骨架节点跳过),
 // 且每文件 parse 结果用 rcParse 缓存(同文件多符号共享,避免重复解析)。
-func (e *Engine) reconcileAllLocked() {
+func (e *Engine) reconcileAllLocked() bool {
 	repo := e.Store.RepoRoot()
 	type parsed struct {
 		syms []parser.Symbol
@@ -1560,7 +1840,7 @@ func (e *Engine) reconcileAllLocked() {
 		}
 		switch {
 		case n.Anchor.Hash != "" && curHash != n.Anchor.Hash &&
-			(n.Status == model.StatusFresh || n.Status == model.StatusSuspect) && hasActiveEntries(n):
+			n.Status == model.StatusFresh && hasActiveEntries(n):
 			n.Status = model.StatusSuspect
 			dirty[ref.ShardRel] = true
 		case n.Status == model.StatusSuspect && curHash == n.Anchor.Hash:
@@ -1574,6 +1854,7 @@ func (e *Engine) reconcileAllLocked() {
 			e.warnOpsLocked("reconcileAll 落盘失败(下次重试):" + err.Error())
 		}
 	}
+	return len(dirty) > 0
 }
 
 // saveNodeShardLocked 把 ref 所在分片写回(未知字段由 store 合并保留)。

@@ -1,65 +1,225 @@
-# 轮33:预编译二进制发布。打 v* tag 时 cross-compile 上传 GitHub Releases,
-# 让 install.sh 优先下二进制(去掉 Go 工具链门槛,扩大用户基数)。
-# 零第三方 action 依赖:用官方 actions/checkout + setup-go,纯 go build cross-compile。
+# 正式版发布：严格 semver tag 先在只读 job 完成验证、测试与跨平台构建，
+# 再通过 GitHub artifact 把固定资产交给唯一拥有 contents:write 的发布 job。
 name: release
 
 on:
   push:
     tags: ["v*"]
 
+# 同一时间只允许一条正式发布链运行。publish 仍会重新做版本检查，避免排队期间
+# 出现新 release/tag 后把较低版本发布成 releases/latest。
+concurrency:
+  group: iknowledge-production-release
+  cancel-in-progress: false
+
+# 默认最小权限；只有 publish job 在完成只读验证后覆盖为 write。
 permissions:
-  contents: write # 创建 Release 上传资产需要
+  contents: read
 
 jobs:
-  release:
+  verify:
+    name: Verify and build release assets
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-go@v6
+      # 精确 SHA 均对应下方注释版本；来源/核验方法见仓库发布审计记录。
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Validate production tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="$GITHUB_REF_NAME"
+          if [[ ! "$tag" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "error: production releases require vMAJOR.MINOR.PATCH without prerelease/build suffix: $tag" >&2
+            exit 1
+          fi
+
+          # checkout 不持久化 token；公开仓库可匿名刷新 main。tag 必须已进入 main，
+          # 不能从临时分支或游离提交直接发布。
+          git fetch --no-tags origin '+refs/heads/main:refs/remotes/origin/main'
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" refs/remotes/origin/main; then
+            echo "error: release tag $tag is not reachable from origin/main" >&2
+            exit 1
+          fi
+
+          candidates="$(mktemp)"
+          trap 'rm -f "$candidates"' EXIT
+          while IFS= read -r candidate; do
+            if [[ "$candidate" != "$tag" && "$candidate" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+              printf '%s\n' "$candidate" >> "$candidates"
+            fi
+          done < <(git tag --list 'v*')
+
+          release_tags="$(gh api --paginate "repos/$GITHUB_REPOSITORY/releases" \
+            --jq '.[] | select(.draft == false and .prerelease == false) | .tag_name')"
+          while IFS= read -r candidate; do
+            if [[ "$candidate" != "$tag" && "$candidate" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+              printf '%s\n' "$candidate" >> "$candidates"
+            fi
+          done <<< "$release_tags"
+
+          highest="$(LC_ALL=C sort -Vu "$candidates" | tail -n 1)"
+          if [[ -n "$highest" ]]; then
+            newest="$(printf '%s\n%s\n' "$highest" "$tag" | LC_ALL=C sort -Vu | tail -n 1)"
+            if [[ "$newest" != "$tag" || "$highest" == "$tag" ]]; then
+              echo "error: $tag must be strictly greater than current highest formal release/tag $highest" >&2
+              exit 1
+            fi
+          fi
+          echo "validated production tag: $tag (previous highest: ${highest:-none})"
+
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
         with:
           go-version-file: go.mod
-      # 三关:确保发布的二进制本身是通过全部测试的代码构建的。
+
+      # 三关：发布二进制必须来自通过全部测试的同一 tag；此 job 无写 token。
+      - run: sh -n install.sh uninstall.sh
       - run: go build ./...
       - run: go vet ./...
       - run: go test -race ./...
 
-      # cross-compile 6 个目标:darwin/linux/windows × amd64/arm64。
-      # CGO_DISABLED=1:纯 Go(yaml.v3 是纯 Go),静态二进制跨机可跑。
-      # -trimpath -ldflags="-s -w":去路径/去符号表,体积小且 reproducible。
-      - name: Build binaries
+      # cross-compile 6 个目标：darwin/linux/windows × amd64/arm64。
+      - name: Build release assets
+        shell: bash
         run: |
-          VERSION="${GITHUB_REF_NAME:-dev}"
+          set -euo pipefail
+          VERSION="$GITHUB_REF_NAME"
           LDFLAGS="-s -w -X github.com/zdypro888/iknowledge/internal/buildinfo.Version=${VERSION}"
           build_one() {
-            os="$1"; arch="$2"; ext="$3"
-            target="iknowledge-${os}-${arch}"
+            local os="$1" arch="$2" ext="$3"
+            local target="iknowledge-${os}-${arch}"
             GOOS="$os" GOARCH="$arch" CGO_ENABLED=0 \
               go build -trimpath -ldflags="$LDFLAGS" \
               -o "dist/${target}${ext}" ./cmd/iknowledge
             (cd dist && tar czf "${target}.tar.gz" "${target}${ext}" && rm "${target}${ext}")
-            echo "✓ ${target}"
+            echo "built ${target}"
           }
           mkdir -p dist
           build_one darwin amd64 ""
           build_one darwin arm64 ""
-          build_one linux  amd64 ""
-          build_one linux  arm64 ""
+          build_one linux amd64 ""
+          build_one linux arm64 ""
           build_one windows amd64 .exe
           build_one windows arm64 .exe
+          cp skills/kb-bootstrap/SKILL.md dist/kb-bootstrap-SKILL.md
 
-      # sha256 校验:install.sh 下完二进制校验完整性(防传输损坏/中间人)。
-      - name: Generate checksums
+      # checksum 与资产同通道，只负责完整性/资产匹配，不冒充签名或 attestation。
+      - name: Generate and verify checksums
+        shell: bash
         run: |
+          set -euo pipefail
           cd dist
-          sha256sum *.tar.gz > sha256sums.txt
-          cat sha256sums.txt
+          sha256sum *.tar.gz kb-bootstrap-SKILL.md > sha256sums.txt
+          sha256sum -c sha256sums.txt
 
-      # gh release create:把 dist/ 下全部资产附到 Release。--generate-notes 自动生成。
+      - name: Upload verified release assets
+        id: upload
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-assets-${{ github.run_id }}-${{ github.run_attempt }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+
+  publish:
+    name: Publish GitHub release
+    needs: verify
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      # 在唯一写权限 job 内重新验证；防止 verify 完成后的排队窗口产生更高版本。
+      - name: Revalidate production tag before publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="$GITHUB_REF_NAME"
+          if [[ ! "$tag" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "error: invalid production tag: $tag" >&2
+            exit 1
+          fi
+          git fetch --no-tags origin '+refs/heads/main:refs/remotes/origin/main'
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" refs/remotes/origin/main; then
+            echo "error: release tag $tag is not reachable from origin/main" >&2
+            exit 1
+          fi
+
+          candidates="$(mktemp)"
+          trap 'rm -f "$candidates"' EXIT
+          while IFS= read -r candidate; do
+            if [[ "$candidate" != "$tag" && "$candidate" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+              printf '%s\n' "$candidate" >> "$candidates"
+            fi
+          done < <(git tag --list 'v*')
+          release_tags="$(gh api --paginate "repos/$GITHUB_REPOSITORY/releases" \
+            --jq '.[] | select(.draft == false and .prerelease == false) | .tag_name')"
+          while IFS= read -r candidate; do
+            if [[ "$candidate" != "$tag" && "$candidate" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+              printf '%s\n' "$candidate" >> "$candidates"
+            fi
+          done <<< "$release_tags"
+          highest="$(LC_ALL=C sort -Vu "$candidates" | tail -n 1)"
+          if [[ -n "$highest" ]]; then
+            newest="$(printf '%s\n%s\n' "$highest" "$tag" | LC_ALL=C sort -Vu | tail -n 1)"
+            if [[ "$newest" != "$tag" || "$highest" == "$tag" ]]; then
+              echo "error: $tag must be strictly greater than current highest formal release/tag $highest" >&2
+              exit 1
+            fi
+          fi
+
+      - name: Download verified release assets
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
+        with:
+          name: release-assets-${{ github.run_id }}-${{ github.run_attempt }}
+          path: dist
+
+      - name: Verify downloaded asset set
+        shell: bash
+        run: |
+          set -euo pipefail
+          expected="$(printf '%s\n' \
+            iknowledge-darwin-amd64.tar.gz \
+            iknowledge-darwin-arm64.tar.gz \
+            iknowledge-linux-amd64.tar.gz \
+            iknowledge-linux-arm64.tar.gz \
+            iknowledge-windows-amd64.tar.gz \
+            iknowledge-windows-arm64.tar.gz \
+            kb-bootstrap-SKILL.md \
+            sha256sums.txt | LC_ALL=C sort)"
+          actual="$(find dist -mindepth 1 -maxdepth 1 -type f -printf '%f\n' | LC_ALL=C sort)"
+          if [[ "$actual" != "$expected" ]]; then
+            echo "error: downloaded artifact set differs from the verified release manifest" >&2
+            diff -u <(printf '%s\n' "$expected") <(printf '%s\n' "$actual") || true
+            exit 1
+          fi
+          (cd dist && sha256sum -c sha256sums.txt)
+
+      # 先建 draft 并随一次 create 上传全部资产，再公开；latest 不会观察到半发布。
       - name: Create release
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
         run: |
-          gh release create "${GITHUB_REF_NAME}" \
-            --title "${GITHUB_REF_NAME}" \
+          set -euo pipefail
+          gh release create "$GITHUB_REF_NAME" \
+            --verify-tag \
+            --draft \
+            --title "$GITHUB_REF_NAME" \
             --generate-notes \
             dist/*
+          gh release edit "$GITHUB_REF_NAME" --draft=false

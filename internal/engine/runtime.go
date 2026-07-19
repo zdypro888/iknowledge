@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"context"
 	"fmt"
 	"slices"
 	"strings"
@@ -20,14 +21,17 @@ import (
 // 会话台账与 job 走独立小锁),用 RLock 并发;写路径(remember/record_change/verify/
 // adopt/task/flow/maintain/init)与 reloadLocked 用 Lock。
 type runtime struct {
-	mu    sync.RWMutex
+	mu    contextRWMutex
 	cache *store.Cache
 	ix    *index.Index
-	// semanticSourceVersion 只在健康 tree/project 视图变化时递增。
+	// semanticSourceVersion 只在参与 typed knowledge cards 的 tree/project/
+	// journal/flows 真相视图变化时递增。
 	// manifest 由 semantic_source.go 在主锁外构造，再按 version 原子发布；
 	// recall 稳态只读取不可变 map/fingerprint，不再逐次全库脱敏扫描。
-	semanticSourceVersion uint64
-	semanticManifest      semanticSourceManifest
+	semanticSourceVersion  uint64
+	semanticManifest       semanticSourceManifest
+	semanticFlowsHash      [32]byte
+	semanticFlowsHashReady bool
 	// truthTxActive 只在 rt.mu 写锁下访问。事务中途的内部 reload 必须跳过
 	// 崩溃恢复；新进程/下次请求则在加载缓存前恢复仓外 prepared WAL。
 	truthTxActive bool
@@ -50,7 +54,7 @@ type runtime struct {
 	// 生命周期独立于 ix:reloadLocked 重建索引不清它,指纹自会对账。
 	// R29 批次2:cg 走独立锁 cgMu——它是派生值(只读文件系统+自身 files map,不依赖
 	// rt.mu 保护的 cache/ix),读路径增量刷新它不必持 rt.mu 写锁,多读并发可同时建图。
-	cgMu sync.Mutex
+	cgMu contextMutex
 	cg   *callGraph
 
 	// gitCounts 热区频率因子缓存(60s TTL;git log 大仓库百毫秒级)。
@@ -103,10 +107,21 @@ type pfEntry struct {
 // 文件复用上次结果,不重读不重解析——子进程解析器(Python)在稳态零成本)。
 // 不持 rt.mu 调用。
 func (e *Engine) parseFailedCached() int {
+	n, _ := e.parseFailedCachedContext(context.Background())
+	return n
+}
+
+func (e *Engine) parseFailedCachedContext(ctx context.Context) (int, error) {
+	if ctx == nil {
+		return 0, fmt.Errorf("parse failed cache: nil context")
+	}
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
 	e.rt.pfMu.Lock()
 	if !e.rt.parseFailedAt.IsZero() && e.now().Sub(e.rt.parseFailedAt) < time.Minute {
 		defer e.rt.pfMu.Unlock()
-		return e.rt.parseFailedN
+		return e.rt.parseFailedN, nil
 	}
 	prev := e.rt.pfFiles
 	e.rt.pfMu.Unlock()
@@ -117,51 +132,84 @@ func (e *Engine) parseFailedCached() int {
 	n := 0
 	next := map[string]pfEntry{}
 	// R29 批次3:用缓存源文件列表(60s TTL,cachedSourceFiles 内部用 cachedConfig)。
-	files, err := e.cachedSourceFiles()
-	if err == nil {
-		for _, rel := range files {
-			st, err := safeRepoFileInfo(e.Store.RepoRoot(), rel)
-			if err != nil {
-				continue
-			}
-			if pe, ok := prev[rel]; ok && pe.mtimeNS == st.ModTime().UnixNano() && pe.size == st.Size() {
-				next[rel] = pe
-				if pe.failed {
-					n++
-				}
-				continue
-			}
-			src, err := safeRepoRead(e.Store.RepoRoot(), rel)
-			if err != nil || parser.IsGenerated(src) {
-				continue
-			}
-			_, perr := e.Reg.ForFile(rel).Parse(rel, src)
-			pe := pfEntry{mtimeNS: st.ModTime().UnixNano(), size: st.Size(), failed: perr != nil}
+	files, err := e.cachedSourceFilesContext(ctx)
+	if err != nil {
+		return 0, err
+	}
+	for i, rel := range files {
+		if err := contextCheckpoint(ctx, i); err != nil {
+			return 0, err
+		}
+		st, err := safeRepoFileInfo(e.Store.RepoRoot(), rel)
+		if err != nil {
+			continue
+		}
+		if pe, ok := prev[rel]; ok && pe.mtimeNS == st.ModTime().UnixNano() && pe.size == st.Size() {
 			next[rel] = pe
 			if pe.failed {
 				n++
 			}
+			continue
 		}
+		src, err := safeRepoRead(e.Store.RepoRoot(), rel)
+		if err != nil || parser.IsGenerated(src) {
+			continue
+		}
+		p := e.Reg.ForFile(rel)
+		var perr error
+		if cp, ok := p.(parser.ContextParser); ok {
+			_, perr = cp.ParseContext(ctx, rel, src)
+		} else {
+			_, perr = p.Parse(rel, src)
+		}
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return 0, ctxErr
+		}
+		pe := pfEntry{mtimeNS: st.ModTime().UnixNano(), size: st.Size(), failed: perr != nil}
+		next[rel] = pe
+		if pe.failed {
+			n++
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		return 0, err
 	}
 	e.rt.pfMu.Lock()
 	e.rt.parseFailedN, e.rt.parseFailedAt, e.rt.pfFiles = n, e.now(), next
 	e.rt.pfMu.Unlock()
-	return n
+	return n, nil
 }
 
 // gitCountsCached 返回近 90 天每文件改动计数(60s TTL)。不持 rt.mu 调用。
 func (e *Engine) gitCountsCached() map[string]int {
+	counts, _ := e.gitCountsCachedContext(context.Background())
+	return counts
+}
+
+func (e *Engine) gitCountsCachedContext(ctx context.Context) (map[string]int, error) {
+	if ctx == nil {
+		return nil, fmt.Errorf("git counts cache: nil context")
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	e.rt.gitCountsMu.Lock()
 	if e.rt.gitCounts != nil && e.now().Sub(e.rt.gitCountsAt) < time.Minute {
 		defer e.rt.gitCountsMu.Unlock()
-		return e.rt.gitCounts
+		return e.rt.gitCounts, nil
 	}
 	e.rt.gitCountsMu.Unlock()
-	counts := gitChangeCounts(e.Store.RepoRoot(), "90.days")
+	counts, err := gitChangeCountsContext(ctx, e.Store.RepoRoot(), "90.days")
+	if err != nil {
+		return nil, err
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	e.rt.gitCountsMu.Lock()
 	e.rt.gitCounts, e.rt.gitCountsAt = counts, e.now()
 	e.rt.gitCountsMu.Unlock()
-	return counts
+	return counts, nil
 }
 
 // cachedConfig 返回 config(60s TTL,缓存解析结果)。R29 批次3:原先 4 个调用点
@@ -193,6 +241,16 @@ func (e *Engine) configError() error {
 // ensureCallGraphLocked 各自调 listSourceFiles(git ls-files + os.Stat 每文件),
 // 单请求重复付。现共享缓存。不持 rt.mu 调用。
 func (e *Engine) cachedSourceFiles() ([]string, error) {
+	return e.cachedSourceFilesContext(context.Background())
+}
+
+func (e *Engine) cachedSourceFilesContext(ctx context.Context) ([]string, error) {
+	if ctx == nil {
+		return nil, fmt.Errorf("source files cache: nil context")
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	e.rt.filesMu.Lock()
 	if e.rt.filesList != nil && e.rt.filesErr == nil && e.now().Sub(e.rt.filesAt) < time.Minute {
 		defer e.rt.filesMu.Unlock()
@@ -200,7 +258,13 @@ func (e *Engine) cachedSourceFiles() ([]string, error) {
 	}
 	e.rt.filesMu.Unlock()
 	cfg := e.cachedConfig()
-	files, err := listSourceFiles(e.Store.RepoRoot(), e.Reg, cfg)
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	files, err := listSourceFilesContext(ctx, e.Store.RepoRoot(), e.Reg, cfg)
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return nil, ctxErr
+	}
 	e.rt.filesMu.Lock()
 	e.rt.filesList, e.rt.filesErr, e.rt.filesAt = files, err, e.now()
 	e.rt.filesMu.Unlock()
@@ -273,13 +337,34 @@ func (e *Engine) EnsureRuntime() error {
 // Sync 每次 MCP 请求前的惰性重载(impl §4):目录清单+mtime+size 对账,
 // 变了才重建索引。加锁调用。
 func (e *Engine) Sync() error {
-	e.rt.mu.Lock()
+	return e.SyncContext(context.Background())
+}
+
+// SyncContext performs the same coherent refresh as Sync, but cancellation can
+// interrupt waiting for another request's runtime transaction. Once the write
+// lock is acquired, reload remains an atomic transaction. Cancellation that
+// races the transaction is reported after the coherent generation is fully
+// published; it can never leave cache/index/source versions out of step.
+func (e *Engine) SyncContext(ctx context.Context) error {
+	if ctx == nil {
+		return fmt.Errorf("sync: nil context")
+	}
+	if err := e.rt.mu.LockContext(ctx); err != nil {
+		return err
+	}
 	defer e.rt.mu.Unlock()
-	return e.reloadLocked()
+	return e.reloadLockedContext(ctx)
 }
 
 // reloadLocked 前提:已持锁。
 func (e *Engine) reloadLocked() error {
+	return e.reloadLockedContext(context.Background())
+}
+
+func (e *Engine) reloadLockedContext(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if !e.rt.truthTxActive {
 		recovered, err := e.Store.RecoverTruthTransactionWithStatus()
 		if recovered {
@@ -316,6 +401,8 @@ func (e *Engine) reloadLocked() error {
 	if err != nil {
 		return err
 	}
+	flowsHash := semanticFlowsFingerprint(flows)
+	flowsChanged := e.rt.semanticFlowsHashReady && flowsHash != e.rt.semanticFlowsHash
 	e.rt.flows, e.rt.warns, e.rt.wips = flows, warns, wips
 	// flow/wip 变化无 mtime 追踪,索引重建成本毫秒级,始终重建保正确。
 	changes, _ := e.rt.cache.Journal()
@@ -336,21 +423,35 @@ func (e *Engine) reloadLocked() error {
 	// R29 批次2:读路径状态对账预算(从 reconcileOnReadLocked 外移)。写锁内做,
 	// 使读路径变纯读——失配降 suspect、pending_anchor 补全、回到锚定恢复 fresh。
 	// 只对有活跃知识且 fresh/suspect/pending 的节点做,成本受限。
-	e.reconcileAllLocked()
-	if newCache || refreshChangesSemanticSource(refresh) {
+	reconciled := e.reconcileAllLocked()
+	if reconciled {
+		// Build happened from the pre-reconcile status snapshot. Rebuild in the
+		// same Sync turn so a just-suspect/pending node cannot spend one request
+		// in the current lexical lane, and flow/source DTOs observe the same truth.
+		e.rt.ix = index.Build(healthy, changes, flows)
+	}
+	if newCache || refreshChangesSemanticSource(refresh) || flowsChanged || reconciled {
+		e.semantic.sourceResidentMu.Lock()
 		e.rt.semanticSourceVersion++
 		if e.rt.semanticSourceVersion == 0 { // 理论上的 uint64 回绕也不能复用旧 manifest。
 			e.rt.semanticSourceVersion = 1
 		}
 		e.rt.semanticManifest = semanticSourceManifest{}
+		// process is installed before the first semantic operation and is immutable
+		// thereafter. Retire the generation and its charge under the same lifetime
+		// barrier, so a reader can observe neither an uncharged old map nor a charged
+		// empty manifest.
+		e.semantic.process.releaseSourceResident(e)
+		e.semantic.sourceResidentMu.Unlock()
 	}
-	return nil
+	e.rt.semanticFlowsHash, e.rt.semanticFlowsHashReady = flowsHash, true
+	return ctx.Err()
 }
 
 func refreshChangesSemanticSource(rep store.RefreshReport) bool {
 	for _, paths := range [][]string{rep.Added, rep.Changed, rep.Removed} {
 		for _, rel := range paths {
-			if rel == "project.yaml" || strings.HasPrefix(rel, "tree/") {
+			if rel == "project.yaml" || strings.HasPrefix(rel, "tree/") || strings.HasPrefix(rel, "journal/") {
 				return true
 			}
 		}

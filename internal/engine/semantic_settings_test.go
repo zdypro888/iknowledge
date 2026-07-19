@@ -5,6 +5,7 @@ import (
 	"os"
 	"testing"
 
+	"github.com/zdypro888/iknowledge/internal/semantic"
 	"github.com/zdypro888/iknowledge/internal/store"
 )
 
@@ -26,6 +27,8 @@ func TestSemanticSettingsRoundTrip(t *testing.T) {
 	cfg.Model = "qwen3-embedding:0.6b"
 	cfg.Dimensions = 1024
 	cfg.Revision = "ollama-local-v1"
+	cfg.QueryProfile = semantic.QueryProfileQwen3CodeV1
+	cfg.RebuildPolicy = SemanticRebuildAILocal
 	if err := SaveSemanticSettings(s, cfg); err != nil {
 		t.Fatal(err)
 	}
@@ -34,8 +37,30 @@ func TestSemanticSettingsRoundTrip(t *testing.T) {
 		t.Fatal(err)
 	}
 	if !got.Enabled || got.Endpoint != "http://127.0.0.1:11434/v1" ||
-		got.Model != cfg.Model || got.Dimensions != 1024 || got.TopK != semanticDefaultTopK {
+		got.Model != cfg.Model || got.Dimensions != 1024 || got.TopK != semanticDefaultTopK ||
+		got.QueryProfile != semantic.QueryProfileQwen3CodeV1 {
 		t.Fatalf("roundtrip=%+v", got)
+	}
+	if got.RebuildPolicy != SemanticRebuildAILocal {
+		t.Fatalf("roundtrip rebuild_policy=%q", got.RebuildPolicy)
+	}
+}
+
+func TestSemanticSettingsLegacyMissingQueryProfileUsesPlain(t *testing.T) {
+	s := semanticStore(t)
+	raw := `{"schema":1,"enabled":true,"endpoint":"http://127.0.0.1:11434/v1","model":"legacy-model","top_k":20,"min_score":0.35,"max_vector_mib":512,"timeout_seconds":30}`
+	if err := s.WriteSemanticConfig([]byte(raw)); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := LoadSemanticSettings(s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.QueryProfile != semantic.QueryProfilePlain {
+		t.Fatalf("legacy query_profile=%q, want plain", cfg.QueryProfile)
+	}
+	if cfg.RebuildPolicy != SemanticRebuildManual {
+		t.Fatalf("legacy rebuild_policy=%q, want manual", cfg.RebuildPolicy)
 	}
 }
 
@@ -80,6 +105,53 @@ func TestSemanticSettingsRejectsExplicitZeroResourceBounds(t *testing.T) {
 				t.Fatalf("显式零值应被拒绝: %+v", cfg)
 			}
 		})
+	}
+}
+
+func TestSemanticSettingsRejectsUnknownQueryProfile(t *testing.T) {
+	cfg := DefaultSemanticSettings()
+	cfg.QueryProfile = semantic.QueryProfile("future-profile")
+	if err := ValidateSemanticSettings(cfg); err == nil {
+		t.Fatal("unknown query profile succeeded")
+	}
+}
+
+func TestSemanticSettingsRebuildPolicyEndpointBoundary(t *testing.T) {
+	base := DefaultSemanticSettings()
+	base.Enabled = true
+	base.Model = "embed"
+	tests := []struct {
+		name     string
+		policy   SemanticRebuildPolicy
+		endpoint string
+		wantErr  bool
+	}{
+		{name: "manual local", policy: SemanticRebuildManual, endpoint: "http://127.0.0.1:11434/v1"},
+		{name: "manual remote", policy: SemanticRebuildManual, endpoint: "https://embed.example.com/v1"},
+		{name: "ai local loopback http", policy: SemanticRebuildAILocal, endpoint: "http://localhost:11434/v1"},
+		{name: "ai local loopback https", policy: SemanticRebuildAILocal, endpoint: "https://[::1]:11434/v1"},
+		{name: "ai local rejects remote", policy: SemanticRebuildAILocal, endpoint: "https://embed.example.com/v1", wantErr: true},
+		{name: "ai remote https", policy: SemanticRebuildAIRemote, endpoint: "https://embed.example.com/v1"},
+		{name: "ai remote rejects loopback", policy: SemanticRebuildAIRemote, endpoint: "https://127.0.0.1:11434/v1", wantErr: true},
+		{name: "ai remote rejects http", policy: SemanticRebuildAIRemote, endpoint: "http://127.0.0.1:11434/v1", wantErr: true},
+		{name: "unknown", policy: SemanticRebuildPolicy("future"), endpoint: "https://embed.example.com/v1", wantErr: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			cfg := base
+			cfg.RebuildPolicy = test.policy
+			cfg.Endpoint = test.endpoint
+			err := ValidateSemanticSettings(cfg)
+			if (err != nil) != test.wantErr {
+				t.Fatalf("ValidateSemanticSettings() error=%v, wantErr=%v", err, test.wantErr)
+			}
+		})
+	}
+
+	unconfigured := DefaultSemanticSettings()
+	unconfigured.RebuildPolicy = SemanticRebuildAILocal
+	if err := ValidateSemanticSettings(unconfigured); err == nil {
+		t.Fatal("ai-local without endpoint succeeded")
 	}
 }
 
@@ -140,6 +212,7 @@ func TestSemanticFingerprintCoversVectorSpace(t *testing.T) {
 		func(c *SemanticSettings) { c.Model = "model-b" },
 		func(c *SemanticSettings) { c.Dimensions = 768 },
 		func(c *SemanticSettings) { c.Revision = "r2" },
+		func(c *SemanticSettings) { c.QueryProfile = semantic.QueryProfileQwen3CodeV1 },
 	}
 	for i, mutate := range mutations {
 		copy := cfg
@@ -170,5 +243,27 @@ func TestSemanticAPIKeyNeverPersistedBySettings(t *testing.T) {
 	}
 	if len(data) == 0 || bytes.Contains(data, []byte("sk-test-secret-value")) {
 		t.Fatalf("semantic 配置泄露 API key: %q", data)
+	}
+}
+
+func TestCanonicalSemanticCredentialOrigin(t *testing.T) {
+	for input, want := range map[string]string{
+		"https://EMBED.example.com:443/": "https://embed.example.com",
+		"https://embed.example.com:8443": "https://embed.example.com:8443",
+		"https://[::1]:443":              "https://[::1]",
+	} {
+		got, err := canonicalSemanticCredentialOrigin(input)
+		if err != nil || got != want {
+			t.Errorf("canonicalSemanticCredentialOrigin(%q)=(%q,%v), want %q", input, got, err, want)
+		}
+	}
+	for _, input := range []string{
+		"", "embed.example.com", "https://user@embed.example.com",
+		"https://embed.example.com/v1", "https://embed.example.com?tenant=b",
+		"https://embed.example.com#fragment",
+	} {
+		if got, err := canonicalSemanticCredentialOrigin(input); err == nil {
+			t.Errorf("invalid credential origin %q accepted as %q", input, got)
+		}
 	}
 }

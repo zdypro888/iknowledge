@@ -28,6 +28,11 @@ var ErrSymlinkPath = errors.New("knowledge 路径包含符号链接")
 // ErrSemanticLocked 表示另一个进程正在提交/清理同仓语义派生 generation。
 var ErrSemanticLocked = errors.New("semantic rebuild/clear 正在运行，请稍后重试")
 
+// ErrSemanticConfigLocked 表示 provider 配置与一个已授权的网络操作正在交接。
+// 读锁可由 query/rebuild 并存；configure/enable/disable 取写锁，保证其成功
+// 返回后不会再有旧配置下尚未发出的 provider 请求。
+var ErrSemanticConfigLocked = errors.New("semantic provider 配置正在被使用或修改，请稍后重试")
+
 // Store 是一个仓库的 .knowledge/ 存取器。
 type Store struct {
 	repo       string // 仓库根(绝对路径)
@@ -132,6 +137,55 @@ func (s *Store) WritePrivateKnowledgeFileStreamChecked(rel string, write func(io
 		return err
 	}
 	return s.atomicWriteStreamModeChecked(target, 0o600, write, beforeCommit)
+}
+
+const semanticIndexTempPattern = ".vector.idx-*.tmp"
+
+// WriteSemanticIndexStreamChecked is the fixed-path streaming writer for the
+// large derived vector generation. Its recognizable private temp prefix lets
+// the next lock owner reclaim files left by SIGKILL or power loss without
+// guessing which generic *.tmp belongs to semantic data.
+func (s *Store) WriteSemanticIndexStreamChecked(write func(io.Writer) error, beforeCommit func() error) error {
+	target, err := s.knowledgePath("local/vector.idx")
+	if err != nil {
+		return err
+	}
+	return s.atomicWriteStreamModeCheckedPattern(target, 0o600, semanticIndexTempPattern, write, beforeCommit)
+}
+
+// CleanupSemanticIndexTemps removes only regular files created by
+// WriteSemanticIndexStreamChecked. Callers must hold AcquireSemanticLock, so a
+// matching file cannot belong to a live rebuild. Symlinks/directories fail
+// closed and unrelated temp files are never touched.
+func (s *Store) CleanupSemanticIndexTemps() error {
+	dir, err := s.knowledgePath("local")
+	if err != nil {
+		return err
+	}
+	entries, err := s.readKnowledgeDir(dir)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("store: 扫描 semantic 临时文件: %w", err)
+	}
+	for _, entry := range entries {
+		name := entry.Name()
+		if !strings.HasPrefix(name, ".vector.idx-") || !strings.HasSuffix(name, ".tmp") {
+			continue
+		}
+		info, err := entry.Info()
+		if err != nil {
+			return fmt.Errorf("store: 检查 semantic 临时文件 %s: %w", name, err)
+		}
+		if !info.Mode().IsRegular() {
+			return fmt.Errorf("store: semantic 临时路径不是普通文件: %s", name)
+		}
+		if err := s.removeKnowledgeFile(filepath.Join(dir, name)); err != nil {
+			return fmt.Errorf("store: 清理 semantic 临时文件 %s: %w", name, err)
+		}
+	}
+	return nil
 }
 
 // ReadKnowledgeFile 安全读取 .knowledge 内的相对路径；与写入口共用同一套
@@ -356,8 +410,15 @@ func (s *Store) atomicWriteStreamMode(path string, perm os.FileMode, write func(
 }
 
 func (s *Store) atomicWriteStreamModeChecked(path string, perm os.FileMode, write func(io.Writer) error, beforeCommit func() error) error {
+	return s.atomicWriteStreamModeCheckedPattern(path, perm, "*.tmp", write, beforeCommit)
+}
+
+func (s *Store) atomicWriteStreamModeCheckedPattern(path string, perm os.FileMode, tempPattern string, write func(io.Writer) error, beforeCommit func() error) error {
 	if path == "" {
 		return fmt.Errorf("store: 拒绝写空路径(疑似不安全的节点 ID/文件路径,铁律二)")
+	}
+	if tempPattern == "" || filepath.Base(tempPattern) != tempPattern || !strings.HasSuffix(tempPattern, ".tmp") {
+		return fmt.Errorf("store: 非法临时文件模式")
 	}
 	if write == nil {
 		return fmt.Errorf("store: 拒绝空的流式写入函数")
@@ -369,7 +430,7 @@ func (s *Store) atomicWriteStreamModeChecked(path string, perm os.FileMode, writ
 	if err := s.checkKnowledgePath(path); err != nil {
 		return err
 	}
-	tmp, err := os.CreateTemp(dir, "*.tmp")
+	tmp, err := os.CreateTemp(dir, tempPattern)
 	if err != nil {
 		return fmt.Errorf("store: 建临时文件: %w", err)
 	}
@@ -509,6 +570,50 @@ func (s *Store) readKnowledgeFile(path string) ([]byte, error) {
 		return nil, err
 	}
 	return os.ReadFile(path)
+}
+
+// readKnowledgeFileLimit is the bounded counterpart used for advisory local
+// telemetry. It revalidates the opened file identity so a concurrent replace
+// cannot turn a preflight size check into an unbounded read.
+func (s *Store) readKnowledgeFileLimit(path string, maxBytes int64) ([]byte, error) {
+	if maxBytes < 0 {
+		return nil, fmt.Errorf("store: 文件读取上限非法: %d", maxBytes)
+	}
+	if err := s.checkKnowledgePath(path); err != nil {
+		return nil, err
+	}
+	before, err := os.Lstat(path)
+	if err != nil {
+		return nil, err
+	}
+	if !before.Mode().IsRegular() {
+		return nil, fmt.Errorf("store: knowledge 路径不是普通文件: %s", path)
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	opened, statErr := f.Stat()
+	if statErr != nil || !opened.Mode().IsRegular() || !os.SameFile(before, opened) {
+		_ = f.Close()
+		if statErr != nil {
+			return nil, statErr
+		}
+		return nil, fmt.Errorf("store: knowledge 文件在打开期间被替换: %s", path)
+	}
+	data, readErr := io.ReadAll(io.LimitReader(f, maxBytes+1))
+	closeErr := f.Close()
+	after, afterErr := os.Lstat(path)
+	if afterErr == nil && !os.SameFile(opened, after) {
+		afterErr = fmt.Errorf("store: knowledge 文件在读取期间被替换: %s", path)
+	}
+	if err := errors.Join(readErr, closeErr, afterErr); err != nil {
+		return nil, err
+	}
+	if int64(len(data)) > maxBytes {
+		return nil, fmt.Errorf("store: knowledge 文件超过 %d bytes 读取上限: %s", maxBytes, path)
+	}
+	return data, nil
 }
 
 func (s *Store) readKnowledgeDir(path string) ([]os.DirEntry, error) {

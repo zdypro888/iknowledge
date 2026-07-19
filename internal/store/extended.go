@@ -1,6 +1,7 @@
 package store
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -325,6 +326,24 @@ func (s *Store) AppendUsage(month string, rec UsageRecord) {
 
 // LoadUsage 读全部使用日志(kb_status 汇总用)。
 func (s *Store) LoadUsage() ([]UsageRecord, error) {
+	return s.LoadUsageContext(context.Background())
+}
+
+const (
+	statusUsageMaxBytes   = 64 << 20
+	statusUsageMaxRecords = 250_000
+)
+
+// LoadUsageContext keeps kb_status cancellation responsive and bounds the
+// process-local telemetry input. Usage is advisory; an accidentally huge local
+// log must not be able to consume unbounded memory in the MCP daemon.
+func (s *Store) LoadUsageContext(ctx context.Context) ([]UsageRecord, error) {
+	if ctx == nil {
+		return nil, fmt.Errorf("store: load usage: nil context")
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	dir := filepath.Join(s.dir, "local")
 	entries, err := s.readKnowledgeDir(dir)
 	if os.IsNotExist(err) {
@@ -334,15 +353,30 @@ func (s *Store) LoadUsage() ([]UsageRecord, error) {
 		return nil, err
 	}
 	var recs []UsageRecord
-	for _, e := range entries {
+	totalBytes := int64(0)
+	for i, e := range entries {
+		if i&63 == 0 {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+		}
 		if e.IsDir() || !strings.HasPrefix(e.Name(), "usage-") || !strings.HasSuffix(e.Name(), ".jsonl") {
 			continue
 		}
-		data, err := s.readKnowledgeFile(filepath.Join(dir, e.Name()))
+		remaining := int64(statusUsageMaxBytes) - totalBytes
+		data, err := s.readKnowledgeFileLimit(filepath.Join(dir, e.Name()), remaining)
 		if err != nil {
 			return nil, err
 		}
+		totalBytes += int64(len(data))
+		lineN := 0
 		for line := range strings.SplitSeq(string(data), "\n") {
+			if lineN&63 == 0 {
+				if err := ctx.Err(); err != nil {
+					return nil, err
+				}
+			}
+			lineN++
 			line = strings.TrimSpace(line)
 			if line == "" {
 				continue
@@ -350,8 +384,14 @@ func (s *Store) LoadUsage() ([]UsageRecord, error) {
 			var r UsageRecord
 			if json.Unmarshal([]byte(line), &r) == nil {
 				recs = append(recs, r)
+				if len(recs) > statusUsageMaxRecords {
+					return nil, fmt.Errorf("store: usage 记录超过 %d 条状态读取上限", statusUsageMaxRecords)
+				}
 			}
 		}
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 	return recs, nil
 }

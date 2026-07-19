@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -112,8 +113,18 @@ func initialize(t *testing.T, url string) string {
 	if out.Result["protocolVersion"] != "2025-06-18" {
 		t.Fatalf("protocolVersion 错:%+v", out.Result)
 	}
-	if _, ok := out.Result["instructions"]; !ok {
+	instructions, ok := out.Result["instructions"].(string)
+	if !ok || instructions == "" {
 		t.Error("initialize 缺 instructions")
+	} else {
+		for _, required := range []string{
+			"每个会话先 kb_status", "provider=unchecked", "next_action=kb_semantic action=sync",
+			"policy=ai-local/ai-remote", "本会话最多同步一次", "绝不替用户配置、下载或切换模型",
+		} {
+			if !strings.Contains(instructions, required) {
+				t.Errorf("initialize instructions 缺 %q: %s", required, instructions)
+			}
+		}
 	}
 	if _, ok := out.Result["repoRoot"]; !ok {
 		t.Error("initialize 缺 repoRoot(连错仓库防护)")
@@ -293,11 +304,17 @@ func TestToolVisibilityByEndpoint(t *testing.T) {
 		return names
 	}
 	mainTools := list(ts.URL + "/mcp/main")
-	if len(mainTools) != 16 { // 轮30-B:+kb_diagnose
-		t.Errorf("main 端点应 16 个工具,got %d: %v", len(mainTools), mainTools)
+	if len(mainTools) != 17 { // 16 个存量工具 + 授权内的 kb_semantic
+		t.Errorf("main 端点应 17 个工具,got %d: %v", len(mainTools), mainTools)
+	}
+	if !mainTools["kb_semantic"] {
+		t.Error("main 端点应可见 kb_semantic")
 	}
 	scoutTools := list(ts.URL + "/mcp/scout/job_x")
-	for _, banned := range []string{"kb_investigate", "kb_record_change", "kb_init", "kb_adopt", "kb_verify", "kb_revert", "kb_maintain", "kb_status", "kb_session"} {
+	if len(scoutTools) != 7 {
+		t.Errorf("scout 端点应仅 7 个受限工具,got %d: %v", len(scoutTools), scoutTools)
+	}
+	for _, banned := range []string{"kb_investigate", "kb_record_change", "kb_init", "kb_adopt", "kb_verify", "kb_revert", "kb_maintain", "kb_status", "kb_semantic", "kb_session"} {
 		if scoutTools[banned] {
 			t.Errorf("scout 端点不应可见 %s(防套娃/侦察兵不改码)", banned)
 		}
@@ -307,11 +324,13 @@ func TestToolVisibilityByEndpoint(t *testing.T) {
 			t.Errorf("scout 端点应可见 %s", allowed)
 		}
 	}
-	// scout 端点调 main 专属工具 → -32601。
-	out, _ := call(t, ts.URL+"/mcp/scout/job_x", "", "tools/call",
-		map[string]any{"name": "kb_record_change", "arguments": map[string]any{}})
-	if out.Error == nil || out.Error.Code != -32601 {
-		t.Errorf("scout 越权应 -32601:%+v", out.Error)
+	// scout 端点调 main 专属工具 → -32601，semantic sync 不得借侦察端点绕过授权。
+	for _, name := range []string{"kb_record_change", "kb_semantic"} {
+		out, _ := call(t, ts.URL+"/mcp/scout/job_x", "", "tools/call",
+			map[string]any{"name": name, "arguments": map[string]any{"action": "sync"}})
+		if out.Error == nil || out.Error.Code != -32601 {
+			t.Errorf("scout 越权调 %s 应 -32601:%+v", name, out.Error)
+		}
 	}
 }
 
@@ -323,7 +342,8 @@ func TestFullAgentLoop(t *testing.T) {
 
 	// ① kb_status / kb_map 导航。
 	text, isErr := toolCall(t, main, sid, "kb_status", map[string]any{})
-	if isErr || !strings.Contains(text, "节点:") {
+	if isErr || !strings.Contains(text, "节点:") ||
+		!strings.Contains(text, "semantic: unconfigured | provider: unchecked | next_action:") {
 		t.Fatalf("status: %s", text)
 	}
 	text, isErr = toolCall(t, main, sid, "kb_map", map[string]any{})
@@ -416,6 +436,265 @@ func TestFullAgentLoop(t *testing.T) {
 	}
 	if resp.StatusCode != 200 || !strings.Contains(string(body), "不要在调用方加密") {
 		t.Fatalf("inject: %d %s", resp.StatusCode, body)
+	}
+}
+
+func TestKBStatusToolDescribesSemanticNextAction(t *testing.T) {
+	def, ok := allTools["kb_status"].(map[string]any)
+	if !ok {
+		t.Fatalf("kb_status definition=%T", allTools["kb_status"])
+	}
+	description, _ := def["description"].(string)
+	for _, required := range []string{
+		"semantic", "每会话先读", "provider=unchecked", "next_action", "kb_semantic action=sync",
+		"policy=ai-local/ai-remote", "不要重复配置或同步",
+	} {
+		if !strings.Contains(description, required) {
+			t.Fatalf("kb_status description missing %q: %s", required, description)
+		}
+	}
+}
+
+func TestKBSemanticToolSchemaAndDiscipline(t *testing.T) {
+	def, ok := allTools["kb_semantic"].(map[string]any)
+	if !ok {
+		t.Fatalf("kb_semantic definition=%T", allTools["kb_semantic"])
+	}
+	description, _ := def["description"].(string)
+	for _, required := range []string{
+		"next_action", "kb_semantic action=sync", "ai-local/ai-remote", "每会话最多 sync 一次",
+		"ready/none", "绝不修改 endpoint/model/profile/policy", "下载或切换模型",
+	} {
+		if !strings.Contains(description, required) {
+			t.Fatalf("kb_semantic description missing %q: %s", required, description)
+		}
+	}
+	schema, ok := def["inputSchema"].(map[string]any)
+	if !ok {
+		t.Fatalf("kb_semantic inputSchema=%T", def["inputSchema"])
+	}
+	required, _ := schema["required"].([]string)
+	if len(required) != 1 || required[0] != "action" {
+		t.Fatalf("kb_semantic required=%v", required)
+	}
+	properties, _ := schema["properties"].(map[string]any)
+	action, _ := properties["action"].(map[string]any)
+	enum, _ := action["enum"].([]string)
+	if len(enum) != 2 || enum[0] != "status" || enum[1] != "sync" {
+		t.Fatalf("kb_semantic action enum=%v", enum)
+	}
+}
+
+func TestKBFlowSchemaAllowsActionSpecificShapes(t *testing.T) {
+	def, ok := allTools["kb_flow"].(map[string]any)
+	if !ok {
+		t.Fatalf("kb_flow definition=%T", allTools["kb_flow"])
+	}
+	schema, _ := def["inputSchema"].(map[string]any)
+	required, _ := schema["required"].([]string)
+	if len(required) != 1 || required[0] != "action" {
+		t.Fatalf("kb_flow top-level required=%v; get must allow action-only", required)
+	}
+	properties, _ := schema["properties"].(map[string]any)
+	flow, _ := properties["flow"].(map[string]any)
+	if nested, exists := flow["required"]; exists {
+		t.Fatalf("kb_flow nested required=%v; engine validates id/title by action", nested)
+	}
+}
+
+func TestSemanticAutomationDisciplinePrompt(t *testing.T) {
+	for name, prompt := range map[string]string{
+		"initialize": engine.InitializeInstructions,
+		"repository": engine.DisciplinePrompt,
+	} {
+		t.Run(name, func(t *testing.T) {
+			for _, required := range []string{
+				"每个会话先 kb_status", "provider=unchecked", "kb_semantic action=sync",
+				"policy=ai-local/ai-remote", "最多", "一次", "绝不替用户配置、下载或切换模型",
+			} {
+				if !strings.Contains(prompt, required) {
+					t.Fatalf("%s prompt missing %q:\n%s", name, required, prompt)
+				}
+			}
+		})
+	}
+}
+
+func newMCPSemanticProvider(t *testing.T) (*httptest.Server, *atomic.Int64) {
+	t.Helper()
+	requests := &atomic.Int64{}
+	provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		var input struct {
+			Input []string `json:"input"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&input); err != nil || len(input.Input) == 0 {
+			http.Error(w, "bad request", http.StatusBadRequest)
+			return
+		}
+		data := make([]map[string]any, len(input.Input))
+		for i := range input.Input {
+			data[i] = map[string]any{"index": i, "embedding": []float64{1, 0, 0}}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"data": data})
+	}))
+	t.Cleanup(provider.Close)
+	return provider, requests
+}
+
+func TestKBSemanticStatusInputAndManualAuthorization(t *testing.T) {
+	t.Setenv("IKNOWLEDGE_STATE_HOME", t.TempDir())
+	ts, repo := newTestServer(t)
+	main := ts.URL + "/mcp/main"
+	sid := initialize(t, main)
+
+	text, isErr := toolCall(t, main, sid, "kb_semantic", map[string]any{"action": "status"})
+	if isErr || !strings.Contains(text, "status: unconfigured") || !strings.Contains(text, "provider: unchecked") {
+		t.Fatalf("unconfigured semantic status isErr=%v:\n%s", isErr, text)
+	}
+	for name, args := range map[string]map[string]any{
+		"missing-action": {},
+		"unknown-action": {"action": "configure"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			text, isErr := toolCall(t, main, sid, "kb_semantic", args)
+			if !isErr || !strings.Contains(text, "KB_ERR:INVALID_ARGUMENT") || !strings.Contains(text, "status|sync") {
+				t.Fatalf("invalid input isErr=%v text=%s", isErr, text)
+			}
+		})
+	}
+
+	s, err := store.Open(repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := engine.DefaultSemanticSettings()
+	cfg.Enabled = true
+	cfg.Endpoint = "http://127.0.0.1:1/v1"
+	cfg.Model = "manual-model"
+	cfg.Dimensions = 3
+	cfg.RebuildPolicy = engine.SemanticRebuildManual
+	if err := engine.SaveSemanticSettings(s, cfg); err != nil {
+		t.Fatal(err)
+	}
+	text, isErr = toolCall(t, main, sid, "kb_semantic", map[string]any{"action": "sync"})
+	if !isErr || !strings.Contains(text, "KB_ERR:SEMANTIC_SYNC_NOT_AUTHORIZED") || !strings.Contains(text, "rebuild_policy=manual") {
+		t.Fatalf("manual sync isErr=%v:\n%s", isErr, text)
+	}
+}
+
+func TestKBSemanticAuthorizedSyncIsProviderIdempotent(t *testing.T) {
+	t.Setenv("IKNOWLEDGE_STATE_HOME", t.TempDir())
+	provider, requests := newMCPSemanticProvider(t)
+	ts, repo := newTestServer(t)
+	main := ts.URL + "/mcp/main"
+	sid := initialize(t, main)
+
+	s, err := store.Open(repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := engine.DefaultSemanticSettings()
+	cfg.Enabled = true
+	cfg.Endpoint = provider.URL
+	cfg.Model = "mcp-test-model"
+	cfg.Dimensions = 3
+	cfg.TimeoutSec = 2
+	cfg.RebuildPolicy = engine.SemanticRebuildAILocal
+	if err := engine.SaveSemanticSettings(s, cfg); err != nil {
+		t.Fatal(err)
+	}
+
+	text, isErr := toolCall(t, main, sid, "kb_remember", map[string]any{
+		"node": "internal/auth/login.go#Login",
+		"entries": []map[string]any{{
+			"kind": "summary", "text": "登录入口使用服务端锁定策略",
+		}},
+	})
+	if isErr {
+		t.Fatalf("remember before semantic sync: %s", text)
+	}
+	text, isErr = toolCall(t, main, sid, "kb_status", map[string]any{})
+	if isErr || !strings.Contains(text, "semantic: configured-no-index") ||
+		!strings.Contains(text, "next_action: kb_semantic action=sync") || !strings.Contains(text, "policy=ai-local") {
+		t.Fatalf("pre-sync status isErr=%v:\n%s", isErr, text)
+	}
+	if got := requests.Load(); got != 0 {
+		t.Fatalf("kb_status contacted provider %d times", got)
+	}
+
+	text, isErr = toolCall(t, main, sid, "kb_semantic", map[string]any{"action": "sync"})
+	if isErr || !strings.Contains(text, "semantic 索引已重建") {
+		t.Fatalf("authorized sync isErr=%v:\n%s", isErr, text)
+	}
+	afterSync := requests.Load()
+	if afterSync == 0 {
+		t.Fatal("authorized sync did not contact configured provider")
+	}
+	text, isErr = toolCall(t, main, sid, "kb_status", map[string]any{})
+	if isErr || !strings.Contains(text, "semantic: ready") || !strings.Contains(text, "next_action: none") {
+		t.Fatalf("post-sync status isErr=%v:\n%s", isErr, text)
+	}
+	if got := requests.Load(); got != afterSync {
+		t.Fatalf("post-sync kb_status contacted provider: before=%d after=%d", afterSync, got)
+	}
+
+	// “每会话最多同步一次”是服务端不变量，不只依赖提示词纪律。
+	// 误调第二次必须零 provider 请求而非再次付费/占用本机模型。
+	text, isErr = toolCall(t, main, sid, "kb_semantic", map[string]any{"action": "sync"})
+	if !isErr || !strings.Contains(text, "KB_ERR:SEMANTIC_SYNC_ALREADY_ATTEMPTED") {
+		t.Fatalf("duplicate sync isErr=%v:\n%s", isErr, text)
+	}
+	if got := requests.Load(); got != afterSync {
+		t.Fatalf("duplicate ready sync contacted provider: before=%d after=%d", afterSync, got)
+	}
+}
+
+func TestKBSemanticFailedSyncCannotRetryProviderInSameSession(t *testing.T) {
+	t.Setenv("IKNOWLEDGE_STATE_HOME", t.TempDir())
+	requests := &atomic.Int64{}
+	provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		requests.Add(1)
+		http.Error(w, "temporary provider failure", http.StatusServiceUnavailable)
+	}))
+	t.Cleanup(provider.Close)
+	ts, repo := newTestServer(t)
+	main := ts.URL + "/mcp/main"
+	sid := initialize(t, main)
+
+	s, err := store.Open(repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := engine.DefaultSemanticSettings()
+	cfg.Enabled = true
+	cfg.Endpoint = provider.URL
+	cfg.Model = "mcp-failing-model"
+	cfg.Dimensions = 3
+	cfg.TimeoutSec = 2
+	cfg.RebuildPolicy = engine.SemanticRebuildAILocal
+	if err := engine.SaveSemanticSettings(s, cfg); err != nil {
+		t.Fatal(err)
+	}
+
+	out, _ := call(t, main, sid, "tools/call", map[string]any{
+		"name": "kb_semantic", "arguments": map[string]any{"action": "sync"},
+	})
+	if out.Error == nil {
+		t.Fatalf("first failing sync unexpectedly succeeded: %+v", out.Result)
+	}
+	afterFirst := requests.Load()
+	if afterFirst == 0 {
+		t.Fatalf("first sync did not reach provider: %+v", out.Error)
+	}
+
+	text, isErr := toolCall(t, main, sid, "kb_semantic", map[string]any{"action": "sync"})
+	if !isErr || !strings.Contains(text, "KB_ERR:SEMANTIC_SYNC_ALREADY_ATTEMPTED") {
+		t.Fatalf("second sync isErr=%v:\n%s", isErr, text)
+	}
+	if got := requests.Load(); got != afterFirst {
+		t.Fatalf("second sync retried provider: before=%d after=%d", afterFirst, got)
 	}
 }
 

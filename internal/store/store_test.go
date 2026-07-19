@@ -462,6 +462,36 @@ func TestSemanticLockIsIndependentAndExclusive(t *testing.T) {
 	releaseAgain()
 }
 
+func TestSemanticConfigLockAllowsReadersAndExcludesWriter(t *testing.T) {
+	s := newStore(t)
+	other, err := Open(s.RepoRoot())
+	if err != nil {
+		t.Fatal(err)
+	}
+	readOne, err := s.AcquireSemanticConfigReadLock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer readOne()
+	readTwo, err := other.AcquireSemanticConfigReadLock()
+	if err != nil {
+		t.Fatalf("semantic provider read locks should coexist: %v", err)
+	}
+	if _, err := other.AcquireSemanticConfigWriteLock(); !errors.Is(err, ErrSemanticConfigLocked) {
+		t.Fatalf("config writer with active readers=%v, want ErrSemanticConfigLocked", err)
+	}
+	readTwo()
+	readOne()
+	write, err := other.AcquireSemanticConfigWriteLock()
+	if err != nil {
+		t.Fatalf("config writer after readers release: %v", err)
+	}
+	if _, err := s.AcquireSemanticConfigReadLock(); !errors.Is(err, ErrSemanticConfigLocked) {
+		t.Fatalf("provider reader with active writer=%v, want ErrSemanticConfigLocked", err)
+	}
+	write()
+}
+
 func TestCheckedPrivateStreamKeepsOldFileWhenValidationFails(t *testing.T) {
 	s := newStore(t)
 	if err := s.WritePrivateKnowledgeFile("local/derived.bin", []byte("old")); err != nil {
@@ -478,6 +508,52 @@ func TestCheckedPrivateStreamKeepsOldFileWhenValidationFails(t *testing.T) {
 	got, err := s.ReadKnowledgeFile("local/derived.bin")
 	if err != nil || string(got) != "old" {
 		t.Fatalf("old generation not preserved: %q err=%v", got, err)
+	}
+}
+
+func TestSemanticTempFilesUseDedicatedPrefixAndCleanupIsScoped(t *testing.T) {
+	s := newStore(t)
+	local := filepath.Join(s.Dir(), "local")
+	for name, data := range map[string]string{
+		".vector.idx-crash-a.tmp": "partial-a",
+		".vector.idx-crash-b.tmp": "partial-b",
+		"unrelated.tmp":           "keep",
+		"derived.bin.tmp":         "keep-too",
+	} {
+		if err := os.WriteFile(filepath.Join(local, name), []byte(data), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := s.CleanupSemanticIndexTemps(); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{".vector.idx-crash-a.tmp", ".vector.idx-crash-b.tmp"} {
+		if _, err := os.Stat(filepath.Join(local, name)); !os.IsNotExist(err) {
+			t.Fatalf("semantic orphan %s remains: %v", name, err)
+		}
+	}
+	for _, name := range []string{"unrelated.tmp", "derived.bin.tmp"} {
+		if data, err := os.ReadFile(filepath.Join(local, name)); err != nil || len(data) == 0 {
+			t.Fatalf("unrelated temp %s was touched: data=%q err=%v", name, data, err)
+		}
+	}
+
+	wantErr := errors.New("generation changed")
+	err := s.WriteSemanticIndexStreamChecked(func(w io.Writer) error {
+		_, err := io.WriteString(w, "new-generation")
+		return err
+	}, func() error { return wantErr })
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("checked semantic write error=%v", err)
+	}
+	entries, err := os.ReadDir(local)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range entries {
+		if strings.HasPrefix(entry.Name(), ".vector.idx-") && strings.HasSuffix(entry.Name(), ".tmp") {
+			t.Fatalf("failed semantic write leaked temp %s", entry.Name())
+		}
 	}
 }
 
@@ -624,5 +700,21 @@ func TestSrcRelOfShard(t *testing.T) {
 		if got := s.SrcRelOfShard(tt.path); got != tt.want {
 			t.Errorf("SrcRelOfShard(%q) = %q, want %q", tt.path, got, tt.want)
 		}
+	}
+}
+
+func TestReadKnowledgeFileLimitRejectsOversizeWithoutReturningPrefix(t *testing.T) {
+	s := newStore(t)
+	path := filepath.Join(s.dir, "local", "usage-test.jsonl")
+	if err := os.WriteFile(path, []byte("12345"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	data, err := s.readKnowledgeFileLimit(path, 4)
+	if err == nil || data != nil {
+		t.Fatalf("bounded read = %q, %v; want nil oversize error", data, err)
+	}
+	data, err = s.readKnowledgeFileLimit(path, 5)
+	if err != nil || string(data) != "12345" {
+		t.Fatalf("exact bounded read = %q, %v", data, err)
 	}
 }

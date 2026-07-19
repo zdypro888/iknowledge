@@ -13,12 +13,15 @@ import (
 	"time"
 
 	"github.com/zdypro888/iknowledge/internal/engine"
+	"github.com/zdypro888/iknowledge/internal/semantic"
 	"github.com/zdypro888/iknowledge/internal/store"
 )
 
 const semanticUsage = `用法:
   iknowledge semantic configure --repo <path> --endpoint <url> --model <name>
-      [--dimensions 0] [--revision <id>] [--top-k 20] [--min-score 0.35]
+      [--dimensions 0] [--revision <id>] [--query-profile auto|plain|qwen3-code-v1]
+      [--rebuild-policy manual|ai-local|ai-remote]
+      [--top-k 20] [--min-score 0.35]
       [--max-vector-mib 512] [--timeout 30]
   iknowledge semantic enable  --repo <path>
   iknowledge semantic disable --repo <path>
@@ -28,7 +31,8 @@ const semanticUsage = `用法:
 
 configure 只保存并启用本机配置，不会调用 embedding 服务或自动重建索引。
 rebuild 是唯一会显式调用 embedding 服务的子命令。
-API key 如需仅从 IKNOWLEDGE_EMBEDDING_API_KEY 环境变量读取。
+远程 API key 如需仅从 IKNOWLEDGE_EMBEDDING_API_KEY 读取；非空时还须用
+IKNOWLEDGE_EMBEDDING_API_ORIGIN 绑定唯一 scheme://host[:port]。
 `
 
 const semanticRebuildTimeout = 30 * time.Minute
@@ -76,6 +80,8 @@ func runSemanticConfigure(args []string, out, errOut io.Writer) int {
 	model := fs.String("model", "", "embedding 模型名")
 	dimensions := fs.Int("dimensions", 0, "输出维度;0 表示使用模型缺省值")
 	revision := fs.String("revision", "", "用户维护的模型修订标识(换模型时更新)")
+	queryProfile := fs.String("query-profile", "auto", "query 预处理: auto|plain|qwen3-code-v1")
+	rebuildPolicy := fs.String("rebuild-policy", "", "MCP 显式同步授权: manual|ai-local|ai-remote")
 	topK := fs.Int("top-k", 0, "语义候选数")
 	minScore := fs.Float64("min-score", 0, "最低余弦相似度")
 	maxVectorMiB := fs.Int("max-vector-mib", 0, "连续向量 payload 上限(MiB)")
@@ -111,6 +117,27 @@ func runSemanticConfigure(args []string, out, errOut io.Writer) int {
 	if seen["revision"] {
 		cfg.Revision = *revision
 	}
+	if seen["query-profile"] || seen["model"] {
+		// Changing the model without an explicit profile deliberately re-runs
+		// auto selection. This prevents a Qwen-only instruction from silently
+		// surviving a switch to an unrelated model (and vice versa).
+		requested := *queryProfile
+		if !seen["query-profile"] {
+			requested = "auto"
+		}
+		cfg.QueryProfile, err = resolveSemanticQueryProfile(requested, cfg.Model)
+		if err != nil {
+			fmt.Fprintln(errOut, "错误: semantic 配置无效:", err)
+			return 1
+		}
+	}
+	if seen["rebuild-policy"] {
+		cfg.RebuildPolicy, err = parseSemanticRebuildPolicy(*rebuildPolicy)
+		if err != nil {
+			fmt.Fprintln(errOut, "错误: semantic 配置无效:", err)
+			return 1
+		}
+	}
 	if seen["top-k"] {
 		cfg.TopK = *topK
 	}
@@ -135,10 +162,37 @@ func runSemanticConfigure(args []string, out, errOut io.Writer) int {
 		fmt.Fprintln(errOut, "错误: semantic 配置回读失败:", err)
 		return 1
 	}
-	fmt.Fprintf(out, "已保存并启用 semantic 本机配置(未重建索引，未调用 embedding 服务)。\nendpoint: %s\nmodel: %s\ndimensions: %d(auto=0)\n", cfg.Endpoint, cfg.Model, cfg.Dimensions)
-	fmt.Fprintf(out, "API key 如需仅从 %s 读取，不会写入仓库或配置文件。\n", engine.SemanticAPIKeyEnv)
+	fmt.Fprintf(out, "已保存并启用 semantic 本机配置(未重建索引，未调用 embedding 服务)。\nendpoint: %s\nmodel: %s\nquery_profile: %s\nrebuild_policy: %s\ndimensions: %d(auto=0)\n", cfg.Endpoint, cfg.Model, cfg.QueryProfile, cfg.RebuildPolicy, cfg.Dimensions)
+	fmt.Fprintf(out, "远程 API key 如需仅从 %s 读取，不会写入仓库或配置文件；非空时须用 %s 绑定唯一 provider origin。\n",
+		engine.SemanticAPIKeyEnv, engine.SemanticAPIOriginEnv)
 	fmt.Fprintf(out, "确认服务/模型后显式执行: iknowledge semantic rebuild --repo %s\n", s.RepoRoot())
 	return 0
+}
+
+func resolveSemanticQueryProfile(requested, model string) (semantic.QueryProfile, error) {
+	switch strings.ToLower(strings.TrimSpace(requested)) {
+	case "auto":
+		if strings.Contains(strings.ToLower(strings.TrimSpace(model)), "qwen3-embedding") {
+			return semantic.QueryProfileQwen3CodeV1, nil
+		}
+		return semantic.QueryProfilePlain, nil
+	case string(semantic.QueryProfilePlain):
+		return semantic.QueryProfilePlain, nil
+	case string(semantic.QueryProfileQwen3CodeV1):
+		return semantic.QueryProfileQwen3CodeV1, nil
+	default:
+		return "", fmt.Errorf("query-profile=%q 不受支持；可选 auto、plain、qwen3-code-v1", requested)
+	}
+}
+
+func parseSemanticRebuildPolicy(raw string) (engine.SemanticRebuildPolicy, error) {
+	policy := engine.SemanticRebuildPolicy(strings.ToLower(strings.TrimSpace(raw)))
+	switch policy {
+	case engine.SemanticRebuildManual, engine.SemanticRebuildAILocal, engine.SemanticRebuildAIRemote:
+		return policy, nil
+	default:
+		return "", fmt.Errorf("rebuild-policy=%q 不受支持；可选 manual、ai-local、ai-remote", raw)
+	}
 }
 
 func runSemanticToggle(args []string, enabled bool, out, errOut io.Writer) int {

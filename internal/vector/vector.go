@@ -28,6 +28,7 @@ const (
 	defaultMaxVectorBytes   = uint64(512 << 20)
 	defaultMaxMetadataBytes = uint64(64 << 20)
 	defaultMaxStringBytes   = uint32(4 << 10)
+	maxSearchKinds          = 64
 )
 
 // Limits bounds both Snapshot construction and binary decoding. Every field
@@ -72,6 +73,21 @@ type Hit struct {
 	SourceHash [32]byte
 	Score      float32
 }
+
+// RecordMetadata is the immutable subset of a stored record exposed to search
+// filters. It deliberately omits the vector so a filter cannot retain or
+// mutate Snapshot matrix storage.
+type RecordMetadata struct {
+	ID         string
+	NodeID     string
+	Kind       string
+	SourceHash [32]byte
+}
+
+// RecordFilter decides whether a stored record may compete for its node's
+// winning slot and the final Top-K. Returning true keeps the record. Filters
+// are called synchronously in snapshot order and should be cheap.
+type RecordFilter func(RecordMetadata) bool
 
 // Status describes the logical payload owned by a Snapshot. VectorBytes is the
 // exact contiguous matrix size; MetadataBytes is its encoded size and excludes
@@ -428,6 +444,226 @@ func (s *Snapshot) Search(ctx context.Context, query []float32, limit int) ([]Hi
 	return result, nil
 }
 
+// SearchDistinctNodes performs the same exact cosine scan as Search, but
+// returns at most one record per node. When several records for a node have
+// the same score, the record with the lexicographically smaller ID wins.
+// Results are sorted by descending score, then by ascending winning record ID.
+func (s *Snapshot) SearchDistinctNodes(ctx context.Context, query []float32, limit int) ([]Hit, error) {
+	groups, err := s.searchDistinctNodeGroups(ctx, query, limit, nil, true, nil)
+	if err != nil {
+		return nil, err
+	}
+	return groups[""], nil
+}
+
+// SearchDistinctNodesByKind is SearchDistinctNodes restricted to records whose
+// Kind exactly equals kind. The filter is applied before records compete for a
+// node's winning slot.
+func (s *Snapshot) SearchDistinctNodesByKind(ctx context.Context, query []float32, limit int, kind string) ([]Hit, error) {
+	groups, err := s.SearchDistinctNodesByKindsFiltered(ctx, query, limit, []string{kind}, nil)
+	if err != nil {
+		return nil, err
+	}
+	return groups[kind], nil
+}
+
+// SearchDistinctNodesByKinds performs one exact matrix scan for all requested
+// kinds. Each result independently applies the same per-node winner and stable
+// Top-K rules as SearchDistinctNodesByKind. Every requested kind is present in
+// the returned map, including kinds with no matching records.
+func (s *Snapshot) SearchDistinctNodesByKinds(ctx context.Context, query []float32, limit int, kinds []string) (map[string][]Hit, error) {
+	return s.SearchDistinctNodesByKindsFiltered(ctx, query, limit, kinds, nil)
+}
+
+// SearchDistinctNodesByKindsFiltered is SearchDistinctNodesByKinds with a
+// metadata filter applied before dot-product work, per-node winner selection,
+// and Top-K competition. This ordering lets callers exclude stale records
+// without allowing them to displace a valid record from the same or another
+// node. A nil filter keeps every record. The filter is called only for records
+// whose Kind was requested.
+func (s *Snapshot) SearchDistinctNodesByKindsFiltered(ctx context.Context, query []float32, limit int, kinds []string, filter RecordFilter) (map[string][]Hit, error) {
+	return s.searchDistinctNodeGroups(ctx, query, limit, kinds, false, filter)
+}
+
+func (s *Snapshot) searchDistinctNodeGroups(ctx context.Context, query []float32, limit int, kinds []string, allKinds bool, filter RecordFilter) (map[string][]Hit, error) {
+	if s == nil {
+		return nil, fmt.Errorf("%w: nil snapshot", ErrInvalidInput)
+	}
+	if ctx == nil {
+		return nil, fmt.Errorf("%w: nil context", ErrInvalidInput)
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if limit <= 0 {
+		return nil, fmt.Errorf("%w: limit must be positive", ErrInvalidInput)
+	}
+	groupOrder := []string{""}
+	requestedKinds := make(map[string]struct{}, 1)
+	if allKinds {
+		requestedKinds[""] = struct{}{}
+	} else {
+		if len(kinds) == 0 {
+			return nil, fmt.Errorf("%w: kinds must not be empty", ErrInvalidInput)
+		}
+		if len(kinds) > maxSearchKinds {
+			return nil, fmt.Errorf("%w: requested kinds %d exceed maximum %d", ErrLimitExceeded, len(kinds), maxSearchKinds)
+		}
+		groupOrder = make([]string, 0, len(kinds))
+		requestedKinds = make(map[string]struct{}, len(kinds))
+		for i, kind := range kinds {
+			if i&255 == 0 {
+				if err := ctx.Err(); err != nil {
+					return nil, err
+				}
+			}
+			if kind == "" || !utf8.ValidString(kind) {
+				return nil, fmt.Errorf("%w: kind at index %d must be non-empty valid UTF-8", ErrInvalidInput, i)
+			}
+			if len(kind) > int(defaultMaxStringBytes) {
+				return nil, fmt.Errorf("%w: kind at index %d exceeds %d bytes", ErrLimitExceeded, i, defaultMaxStringBytes)
+			}
+			if _, duplicate := requestedKinds[kind]; duplicate {
+				return nil, fmt.Errorf("%w: duplicate kind %q", ErrInvalidInput, kind)
+			}
+			requestedKinds[kind] = struct{}{}
+			groupOrder = append(groupOrder, kind)
+		}
+	}
+	if len(query) != s.dimensions {
+		return nil, fmt.Errorf("%w: query has dimension %d, want %d", ErrInvalidInput, len(query), s.dimensions)
+	}
+	normalized := make([]float32, s.dimensions)
+	if err := normalizeVectorContext(ctx, normalized, query); err != nil {
+		return nil, fmt.Errorf("query: %w", err)
+	}
+	effectiveLimit := limit
+	if effectiveLimit > len(s.records) {
+		effectiveLimit = len(s.records)
+	}
+	bestByKind := make(map[string]*distinctTopK, len(groupOrder))
+	for _, kind := range groupOrder {
+		bestByKind[kind] = newDistinctTopK(effectiveLimit)
+	}
+
+	for i, record := range s.records {
+		if i&255 == 0 {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+		}
+		groupKey := ""
+		if !allKinds {
+			if _, requested := requestedKinds[record.kind]; !requested {
+				continue
+			}
+			groupKey = record.kind
+		}
+		if filter != nil {
+			keep := filter(RecordMetadata{
+				ID:         record.id,
+				NodeID:     record.nodeID,
+				Kind:       record.kind,
+				SourceHash: record.sourceHash,
+			})
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+			if !keep {
+				continue
+			}
+		}
+		start := i * s.dimensions
+		var score64 float64
+		for j, value := range s.vectors[start : start+s.dimensions] {
+			score64 += float64(value) * float64(normalized[j])
+		}
+		score := float32(score64)
+		if score > 1 {
+			score = 1
+		} else if score < -1 {
+			score = -1
+		}
+		candidate := Hit{
+			ID:         record.id,
+			NodeID:     record.nodeID,
+			Kind:       record.kind,
+			SourceHash: record.sourceHash,
+			Score:      score,
+		}
+		bestByKind[groupKey].consider(candidate)
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
+	results := make(map[string][]Hit, len(groupOrder))
+	for _, kind := range groupOrder {
+		results[kind] = bestByKind[kind].sorted()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return results, nil
+}
+
+// distinctTopK maintains the exact Top-K node winners for every processed
+// prefix. Nodes outside the retained K need no state: once a winner is evicted,
+// K other node winners are already better and can only improve. A later record
+// for that node is considered normally and can re-enter only if it is itself
+// better than the current worst retained winner.
+type distinctTopK struct {
+	limit int
+	heap  distinctHitHeap
+}
+
+func newDistinctTopK(limit int) *distinctTopK {
+	initialCapacity := limit
+	if initialCapacity > 16 {
+		initialCapacity = 16
+	}
+	return &distinctTopK{
+		limit: limit,
+		heap: distinctHitHeap{
+			hits:      make([]Hit, 0, initialCapacity),
+			positions: make(map[string]int, initialCapacity),
+		},
+	}
+}
+
+func (d *distinctTopK) consider(candidate Hit) {
+	if d.limit == 0 {
+		return
+	}
+	if position, retained := d.heap.positions[candidate.NodeID]; retained {
+		if hitBetter(candidate, d.heap.hits[position]) {
+			d.heap.hits[position] = candidate
+			heap.Fix(&d.heap, position)
+		}
+		return
+	}
+	if d.heap.Len() < d.limit {
+		heap.Push(&d.heap, candidate)
+		return
+	}
+	if !hitBetter(candidate, d.heap.hits[0]) {
+		return
+	}
+	delete(d.heap.positions, d.heap.hits[0].NodeID)
+	d.heap.hits[0] = candidate
+	d.heap.positions[candidate.NodeID] = 0
+	heap.Fix(&d.heap, 0)
+}
+
+func (d *distinctTopK) sorted() []Hit {
+	if d == nil || d.heap.Len() == 0 {
+		return []Hit{}
+	}
+	result := append([]Hit(nil), d.heap.hits...)
+	sort.Slice(result, func(i, j int) bool { return hitBetter(result[i], result[j]) })
+	return result
+}
+
 func validateLimits(limits Limits) error {
 	if limits.MaxRecords == 0 || limits.MaxDimensions == 0 || limits.MaxVectorBytes == 0 ||
 		limits.MaxMetadataBytes == 0 || limits.MaxStringBytes == 0 {
@@ -572,4 +808,38 @@ func (h *hitHeap) Pop() any {
 	value := old[last]
 	*h = old[:last]
 	return value
+}
+
+// distinctHitHeap is ordered with the worst retained node winner at its root.
+// positions is updated by every heap swap, allowing a later record to update
+// a retained node winner in O(log limit) without a map for discarded nodes.
+type distinctHitHeap struct {
+	hits      []Hit
+	positions map[string]int
+}
+
+func (h *distinctHitHeap) Len() int { return len(h.hits) }
+func (h *distinctHitHeap) Less(i, j int) bool {
+	if h.hits[i].Score != h.hits[j].Score {
+		return h.hits[i].Score < h.hits[j].Score
+	}
+	return h.hits[i].ID > h.hits[j].ID
+}
+func (h *distinctHitHeap) Swap(i, j int) {
+	h.hits[i], h.hits[j] = h.hits[j], h.hits[i]
+	h.positions[h.hits[i].NodeID] = i
+	h.positions[h.hits[j].NodeID] = j
+}
+func (h *distinctHitHeap) Push(value any) {
+	hit := value.(Hit)
+	h.positions[hit.NodeID] = len(h.hits)
+	h.hits = append(h.hits, hit)
+}
+func (h *distinctHitHeap) Pop() any {
+	last := len(h.hits) - 1
+	hit := h.hits[last]
+	delete(h.positions, hit.NodeID)
+	h.hits[last] = Hit{}
+	h.hits = h.hits[:last]
+	return hit
 }

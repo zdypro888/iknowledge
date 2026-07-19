@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/zdypro888/iknowledge/internal/engine"
+	"github.com/zdypro888/iknowledge/internal/semantic"
 	"github.com/zdypro888/iknowledge/internal/store"
 )
 
@@ -54,7 +55,8 @@ func TestSemanticConfigurePersistsWithoutCallingProvider(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("configure code=%d stderr=%q", code, errOut)
 	}
-	if !strings.Contains(out, "未调用 embedding 服务") || !strings.Contains(out, engine.SemanticAPIKeyEnv) {
+	if !strings.Contains(out, "未调用 embedding 服务") || !strings.Contains(out, engine.SemanticAPIKeyEnv) ||
+		!strings.Contains(out, engine.SemanticAPIOriginEnv) {
 		t.Fatalf("configure 未明示费用/密钥边界: %q", out)
 	}
 	if strings.Contains(out, secret) || strings.Contains(errOut, secret) {
@@ -66,11 +68,133 @@ func TestSemanticConfigurePersistsWithoutCallingProvider(t *testing.T) {
 	}
 	if !cfg.Enabled || cfg.Endpoint != "http://127.0.0.1:1/v1" || cfg.Model != "test-embedding" ||
 		cfg.Dimensions != 768 || cfg.Revision != "local-r1" || cfg.TopK != 7 ||
-		cfg.MinScore != 0.42 || cfg.MaxVectorMiB != 32 || cfg.TimeoutSec != 5 {
+		cfg.MinScore != 0.42 || cfg.MaxVectorMiB != 32 || cfg.TimeoutSec != 5 ||
+		cfg.QueryProfile != semantic.QueryProfilePlain || cfg.RebuildPolicy != engine.SemanticRebuildManual {
 		t.Fatalf("configure 落盘不完整: %+v", cfg)
 	}
 	if _, err := s.ReadKnowledgeFile("local/vector.idx"); !os.IsNotExist(err) {
 		t.Fatalf("configure 不得自动重建索引: %v", err)
+	}
+}
+
+func TestSemanticConfigureRebuildPolicyPersistsAndValidatesEndpoint(t *testing.T) {
+	repo, s := semanticCLIRepo(t)
+	code, out, errOut := runSemanticForTest(t,
+		"configure", "--repo", repo,
+		"--endpoint", "http://127.0.0.1:11434/v1", "--model", "local-model",
+		"--rebuild-policy", "ai-local",
+	)
+	if code != 0 {
+		t.Fatalf("ai-local configure code=%d stderr=%q", code, errOut)
+	}
+	cfg, err := engine.LoadSemanticSettings(s)
+	if err != nil || cfg.RebuildPolicy != engine.SemanticRebuildAILocal || !strings.Contains(out, "rebuild_policy: ai-local") {
+		t.Fatalf("ai-local cfg=%+v out=%q err=%v", cfg, out, err)
+	}
+
+	// Flags omitted on a later configure preserve the user's authorization.
+	code, _, errOut = runSemanticForTest(t, "configure", "--repo", repo, "--top-k", "9")
+	if code != 0 {
+		t.Fatalf("partial configure code=%d stderr=%q", code, errOut)
+	}
+	cfg, err = engine.LoadSemanticSettings(s)
+	if err != nil || cfg.RebuildPolicy != engine.SemanticRebuildAILocal {
+		t.Fatalf("omitted policy not preserved: cfg=%+v err=%v", cfg, err)
+	}
+
+	// Changing only the policy to a remote authorization must fail against a
+	// local endpoint and leave the last valid settings on disk.
+	code, _, errOut = runSemanticForTest(t,
+		"configure", "--repo", repo, "--rebuild-policy", "ai-remote",
+	)
+	if code != 1 || !strings.Contains(errOut, "HTTPS 非 loopback") {
+		t.Fatalf("invalid ai-remote code=%d stderr=%q", code, errOut)
+	}
+	cfg, err = engine.LoadSemanticSettings(s)
+	if err != nil || cfg.RebuildPolicy != engine.SemanticRebuildAILocal {
+		t.Fatalf("invalid policy overwrote settings: cfg=%+v err=%v", cfg, err)
+	}
+
+	code, _, errOut = runSemanticForTest(t,
+		"configure", "--repo", repo, "--rebuild-policy", "future",
+	)
+	if code != 1 || !strings.Contains(errOut, "不受支持") {
+		t.Fatalf("unknown policy code=%d stderr=%q", code, errOut)
+	}
+}
+
+func TestSemanticConfigureQueryProfileAutoAndPersistence(t *testing.T) {
+	repo, s := semanticCLIRepo(t)
+	code, out, errOut := runSemanticForTest(t,
+		"configure", "--repo", repo,
+		"--endpoint", "http://127.0.0.1:11434/v1",
+		"--model", "Qwen/Qwen3-Embedding-0.6B",
+	)
+	if code != 0 {
+		t.Fatalf("qwen configure code=%d stderr=%q", code, errOut)
+	}
+	cfg, err := engine.LoadSemanticSettings(s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.QueryProfile != semantic.QueryProfileQwen3CodeV1 || !strings.Contains(out, "query_profile: qwen3-code-v1") {
+		t.Fatalf("auto qwen profile cfg=%+v out=%q", cfg, out)
+	}
+	path, err := s.SemanticConfigFile()
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(data, []byte(`"query_profile": "auto"`)) || !bytes.Contains(data, []byte(`"query_profile": "qwen3-code-v1"`)) {
+		t.Fatalf("query profile 未具体化持久化: %s", data)
+	}
+
+	// Explicit plain wins over model-name inference.
+	code, _, errOut = runSemanticForTest(t,
+		"configure", "--repo", repo, "--query-profile", "plain",
+	)
+	if code != 0 {
+		t.Fatalf("plain override code=%d stderr=%q", code, errOut)
+	}
+	cfg, err = engine.LoadSemanticSettings(s)
+	if err != nil || cfg.QueryProfile != semantic.QueryProfilePlain {
+		t.Fatalf("plain override cfg=%+v err=%v", cfg, err)
+	}
+
+	// A subsequent model change without a flag performs auto selection again.
+	code, _, errOut = runSemanticForTest(t,
+		"configure", "--repo", repo, "--model", "text-embedding-3-small",
+	)
+	if code != 0 {
+		t.Fatalf("model switch code=%d stderr=%q", code, errOut)
+	}
+	cfg, err = engine.LoadSemanticSettings(s)
+	if err != nil || cfg.QueryProfile != semantic.QueryProfilePlain {
+		t.Fatalf("model switch cfg=%+v err=%v", cfg, err)
+	}
+}
+
+func TestSemanticConfigureRejectsUnknownQueryProfileWithoutOverwrite(t *testing.T) {
+	repo, s := semanticCLIRepo(t)
+	code, _, errOut := runSemanticForTest(t,
+		"configure", "--repo", repo,
+		"--endpoint", "http://127.0.0.1:11434/v1", "--model", "model-a",
+	)
+	if code != 0 {
+		t.Fatalf("initial configure code=%d stderr=%q", code, errOut)
+	}
+	code, _, errOut = runSemanticForTest(t,
+		"configure", "--repo", repo, "--query-profile", "invented",
+	)
+	if code != 1 || !strings.Contains(errOut, "不受支持") {
+		t.Fatalf("unknown profile code=%d stderr=%q", code, errOut)
+	}
+	cfg, err := engine.LoadSemanticSettings(s)
+	if err != nil || cfg.Model != "model-a" || cfg.QueryProfile != semantic.QueryProfilePlain {
+		t.Fatalf("invalid configure overwrote settings: cfg=%+v err=%v", cfg, err)
 	}
 }
 

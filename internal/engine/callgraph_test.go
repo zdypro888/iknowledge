@@ -1,12 +1,17 @@
 package engine
 
 import (
+	"context"
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/zdypro888/iknowledge/internal/parser"
 )
 
 // cgRepo 建一个带 go.mod 的临时仓库并返回已持锁构建好的调用图。
@@ -432,5 +437,97 @@ func TestDisplayEdges(t *testing.T) {
 	}
 	if displayEdges(nil, "a/a.go", 12) != nil {
 		t.Error("空边应返回 nil")
+	}
+}
+
+func TestCallGraphDerivedPhasesHonorCancellation(t *testing.T) {
+	t.Run("clone", func(t *testing.T) {
+		src := &callGraph{files: map[string]*fileCallsEntry{}}
+		for i := range 4096 {
+			src.files[fmt.Sprintf("p/%04d.go", i)] = &fileCallsEntry{}
+		}
+		_, err := cloneCallGraphContext(&cancelAfterErrContext{after: 3}, src)
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("cloneCallGraphContext error = %v, want context.Canceled", err)
+		}
+	})
+
+	t.Run("resolve does not publish partial graph", func(t *testing.T) {
+		decls := make([]string, 4096)
+		for i := range decls {
+			decls[i] = fmt.Sprintf("F%04d", i)
+		}
+		oldEdges := map[string][]string{"sentinel": {"old"}}
+		oldReverse := map[string][]string{"old": {"sentinel"}}
+		cg := &callGraph{
+			files: map[string]*fileCallsEntry{"p/p.go": {fc: &parser.FileCalls{Package: "p", Decls: decls}}},
+			edges: oldEdges, reverse: oldReverse,
+		}
+		err := cg.resolveContext(&cancelAfterErrContext{after: 3})
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("resolveContext error = %v, want context.Canceled", err)
+		}
+		if !reflect.DeepEqual(cg.edges, oldEdges) || !reflect.DeepEqual(cg.reverse, oldReverse) {
+			t.Fatal("canceled resolve published a partial graph")
+		}
+	})
+
+	t.Run("interfaces", func(t *testing.T) {
+		interfaces := make([]parser.IfaceDecl, 4096)
+		for i := range interfaces {
+			interfaces[i] = parser.IfaceDecl{Name: fmt.Sprintf("I%04d", i), Methods: []string{"A", "B"}}
+		}
+		cg := &callGraph{files: map[string]*fileCallsEntry{
+			"p/p.go": {fc: &parser.FileCalls{Package: "p", Interfaces: interfaces}},
+		}}
+		_, _, _, err := cg.resolveInterfacesContext(
+			&cancelAfterErrContext{after: 3},
+			map[packageKey]map[string][]string{},
+			func(packageKey, string, string) (string, error) { return "", nil },
+			func(string) (packageKey, bool) { return packageKey{}, false },
+		)
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("resolveInterfacesContext error = %v, want context.Canceled", err)
+		}
+	})
+
+	t.Run("centrality", func(t *testing.T) {
+		cg := &callGraph{reverse: map[string][]string{}}
+		for i := range 4096 {
+			cg.reverse[fmt.Sprintf("p/p.go#F%04d", i)] = []string{"q/q.go#Q"}
+		}
+		_, err := cg.fileCentralityContext(&cancelAfterErrContext{after: 3})
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("fileCentralityContext error = %v, want context.Canceled", err)
+		}
+	})
+}
+
+func TestCallGraphDeduplicatesHighFanoutEdges(t *testing.T) {
+	const targets = 2000
+	decls := make([]string, 1, targets+1)
+	decls[0] = "Root"
+	refs := make([]parser.CallRef, 0, targets*2)
+	for i := range targets {
+		name := fmt.Sprintf("F%04d", i)
+		decls = append(decls, name)
+		refs = append(refs, parser.CallRef{Name: name}, parser.CallRef{Name: name})
+	}
+	cg := &callGraph{files: map[string]*fileCallsEntry{
+		"p/p.go": {fc: &parser.FileCalls{
+			Package: "p",
+			Decls:   decls,
+			Calls:   map[string][]parser.CallRef{"Root": refs},
+		}},
+	}}
+	if err := cg.resolveContext(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	got := cg.edges["p/p.go#Root"]
+	if len(got) != targets {
+		t.Fatalf("high-fanout edge count = %d, want %d unique edges", len(got), targets)
+	}
+	if got[0] != "p/p.go#F0000" || got[len(got)-1] != "p/p.go#F1999" {
+		t.Fatalf("high-fanout edges not sorted: first=%q last=%q", got[0], got[len(got)-1])
 	}
 }

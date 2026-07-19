@@ -20,6 +20,29 @@ type Embedder interface {
 	EmbedDocuments(ctx context.Context, documents []string) ([][]float32, error)
 }
 
+// CanaryEmbedder pairs an ordinary embedding result with an observed canary
+// fingerprint in the same provider request. Engine uses this capability to
+// detect common accidental drift between index generations or queries.
+// A canary is not remote attestation: an adversarial endpoint can route inputs
+// differently or spoof a fixed canary. Strong model identity still requires a
+// trusted endpoint and immutable revision. Safety-sensitive engine paths fail
+// closed when an implementation cannot provide this same-request check.
+type CanaryEmbedder interface {
+	Embedder
+	EmbedQueryWithCanary(ctx context.Context, query, canary string) (queryVector, canaryVector []float32, err error)
+	EmbedDocumentsWithCanary(ctx context.Context, documents []string, canary string) (documentVectors [][]float32, canaryVector []float32, err error)
+}
+
+// DualModeCanaryEmbedder checks a rebuild batch against both sides of an
+// asymmetric retrieval contract in one provider request. This matters for
+// instruction-aware models: a document-only canary cannot even detect common
+// query-mode drift. It still does not prove a remote model's identity.
+type DualModeCanaryEmbedder interface {
+	CanaryEmbedder
+	EmbedDocumentsWithDualCanary(ctx context.Context, documents []string, documentCanary, queryCanary string) (
+		documentVectors [][]float32, documentCanaryVector, queryCanaryVector []float32, err error)
+}
+
 func fingerprint(namespace string, parts ...string) string {
 	h := sha256.New()
 	writeFingerprintPart(h, namespace)

@@ -2,6 +2,7 @@ package engine
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -10,7 +11,6 @@ import (
 	"path"
 	"path/filepath"
 	"slices"
-	"sort"
 	"strings"
 
 	"github.com/zdypro888/iknowledge/internal/model"
@@ -24,17 +24,29 @@ import (
 // 之后按注册扩展名 + 默认排除段 + config include/exclude 过滤;生成代码在读内容后另筛。
 // 返回正斜杠相对路径,字典序。
 func listSourceFiles(repo string, reg *parser.Registry, cfg *store.Config) ([]string, error) {
-	rels, gitOK := gitListFiles(repo)
+	return listSourceFilesContext(context.Background(), repo, reg, cfg)
+}
+
+func listSourceFilesContext(ctx context.Context, repo string, reg *parser.Registry, cfg *store.Config) ([]string, error) {
+	if ctx == nil {
+		return nil, fmt.Errorf("list source files: nil context")
+	}
+	rels, gitOK, err := gitListFilesContext(ctx, repo)
+	if err != nil {
+		return nil, err
+	}
 	if !gitOK {
-		var err error
-		rels, err = walkListFiles(repo)
+		rels, err = walkListFilesContext(ctx, repo)
 		if err != nil {
 			return nil, err
 		}
 	}
 
 	var out []string
-	for _, rel := range rels {
+	for i, rel := range rels {
+		if err := contextCheckpoint(ctx, i); err != nil {
+			return nil, err
+		}
 		if rel == "" || reg.ForFile(rel) == nil || parser.ExcludedPath(rel) {
 			continue
 		}
@@ -47,7 +59,9 @@ func listSourceFiles(repo string, reg *parser.Registry, cfg *store.Config) ([]st
 		}
 		out = append(out, rel)
 	}
-	sort.Strings(out)
+	if err := contextSortStrings(ctx, out); err != nil {
+		return nil, err
+	}
 	return out, nil
 }
 
@@ -124,18 +138,34 @@ func safeRepoRead(repo, rel string) ([]byte, error) {
 // knowledge.md §12.1)。git 不可用/非仓库返回 nil——热度退化为纯中心度。
 // rename 只计新路径(近似:旧路径热度沉底,新路径从头计,可接受)。
 func gitChangeCounts(repo, since string) map[string]int {
-	cmd := exec.Command("git", "-C", repo, "log", "--since="+since, "--name-only", "--pretty=format:")
+	counts, _ := gitChangeCountsContext(context.Background(), repo, since)
+	return counts
+}
+
+func gitChangeCountsContext(ctx context.Context, repo, since string) (map[string]int, error) {
+	if ctx == nil {
+		return nil, fmt.Errorf("git change counts: nil context")
+	}
+	cmd := exec.CommandContext(ctx, "git", "-C", repo, "log", "--since="+since, "--name-only", "--pretty=format:")
 	out, err := cmd.Output()
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return nil, ctxErr
+	}
 	if err != nil {
-		return nil
+		return nil, nil
 	}
 	counts := map[string]int{}
+	i := 0
 	for line := range strings.SplitSeq(string(out), "\n") {
+		if err := contextCheckpoint(ctx, i); err != nil {
+			return nil, err
+		}
+		i++
 		if line = strings.TrimSpace(line); line != "" {
 			counts[filepath.ToSlash(line)]++
 		}
 	}
-	return counts
+	return counts, nil
 }
 
 // gitTrail 取文件的近期提交线索(knowledge.md §15 三期"git 历史挖掘初始来时路"的
@@ -161,23 +191,48 @@ func gitTrail(repo string, files []string) string {
 
 // gitListFiles 用 -z 输出防路径含特殊字符;git 不可用/非仓库返回 ok=false。
 func gitListFiles(repo string) ([]string, bool) {
-	cmd := exec.Command("git", "-C", repo, "ls-files", "-co", "--exclude-standard", "-z")
+	rels, ok, _ := gitListFilesContext(context.Background(), repo)
+	return rels, ok
+}
+
+func gitListFilesContext(ctx context.Context, repo string) ([]string, bool, error) {
+	if ctx == nil {
+		return nil, false, fmt.Errorf("git list files: nil context")
+	}
+	cmd := exec.CommandContext(ctx, "git", "-C", repo, "ls-files", "-co", "--exclude-standard", "-z")
 	out, err := cmd.Output()
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return nil, false, ctxErr
+	}
 	if err != nil {
-		return nil, false
+		return nil, false, nil
 	}
 	var rels []string
+	i := 0
 	for b := range bytes.SplitSeq(out, []byte{0}) {
+		if err := contextCheckpoint(ctx, i); err != nil {
+			return nil, false, err
+		}
+		i++
 		if len(b) > 0 {
 			rels = append(rels, filepath.ToSlash(string(b)))
 		}
 	}
-	return rels, true
+	return rels, true, nil
 }
 
 func walkListFiles(repo string) ([]string, error) {
+	return walkListFilesContext(context.Background(), repo)
+}
+
+func walkListFilesContext(ctx context.Context, repo string) ([]string, error) {
 	var rels []string
+	i := 0
 	err := filepath.WalkDir(repo, func(p string, d os.DirEntry, err error) error {
+		if err := contextCheckpoint(ctx, i); err != nil {
+			return err
+		}
+		i++
 		if err != nil {
 			return err
 		}

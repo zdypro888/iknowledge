@@ -4,6 +4,7 @@ package parser
 
 import (
 	"bytes"
+	"context"
 	"path"
 	"regexp"
 	"strings"
@@ -28,6 +29,14 @@ type Parser interface {
 	Language() string     // "go"
 	Extensions() []string // [".go"]
 	Parse(path string, src []byte) ([]Symbol, error)
+}
+
+// ContextParser is an optional parser capability for implementations that may
+// block in an external tool. Engine request paths prefer it so MCP
+// cancellation can terminate the child process instead of waiting for the
+// parser's independent timeout.
+type ContextParser interface {
+	ParseContext(ctx context.Context, path string, src []byte) ([]Symbol, error)
 }
 
 // FileHasher 是插件的可选能力:自定义文件级锚定哈希(2026-07-04 多语言修订)。

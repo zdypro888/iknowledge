@@ -2,6 +2,8 @@ package engine
 
 import (
 	"bytes"
+	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -23,6 +25,22 @@ func (c countingParser) Parse(path string, src []byte) ([]parser.Symbol, error) 
 		return nil, fmt.Errorf("bad content")
 	}
 	return nil, nil
+}
+
+type blockingContextParser struct{ started chan struct{} }
+
+func (blockingContextParser) Language() string     { return "blocking" }
+func (blockingContextParser) Extensions() []string { return []string{".blocking"} }
+func (blockingContextParser) Parse(string, []byte) ([]parser.Symbol, error) {
+	return nil, fmt.Errorf("non-context Parse must not be used")
+}
+func (p blockingContextParser) ParseContext(ctx context.Context, _ string, _ []byte) ([]parser.Symbol, error) {
+	select {
+	case p.started <- struct{}{}:
+	default:
+	}
+	<-ctx.Done()
+	return nil, ctx.Err()
 }
 
 // parseFailed 指纹缓存(多语言加固):TTL 过期重扫时,指纹没变的文件不重解析
@@ -67,5 +85,69 @@ func TestParseFailedFingerprintCache(t *testing.T) {
 	}
 	if calls != 3 {
 		t.Fatalf("只应重解析改动的 1 个文件(总 calls=%d,想要 3)", calls)
+	}
+}
+
+func TestParseFailedCacheCancellationStopsContextParserAndDoesNotPublishPartialCache(t *testing.T) {
+	e, _ := newRepo(t, map[string]string{"slow.blocking": "content\n"})
+	started := make(chan struct{}, 1)
+	e.Reg.Register(blockingContextParser{started: started})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		_, err := e.parseFailedCachedContext(ctx)
+		done <- err
+	}()
+	select {
+	case <-started:
+		cancel()
+	case <-time.After(5 * time.Second):
+		cancel()
+		t.Fatal("context parser did not start")
+	}
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("parseFailedCachedContext error=%v, want context.Canceled", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("parseFailedCachedContext ignored cancellation")
+	}
+	e.rt.pfMu.Lock()
+	defer e.rt.pfMu.Unlock()
+	if !e.rt.parseFailedAt.IsZero() || e.rt.pfFiles != nil {
+		t.Fatal("cancelled parse scan published a partial cache generation")
+	}
+}
+
+func TestStatusContextCancellationStopsParseStage(t *testing.T) {
+	e, _ := initEngine(t, map[string]string{
+		"worker.go":     "package worker\n\nfunc Run() {}\n",
+		"slow.blocking": "content\n",
+	})
+	started := make(chan struct{}, 1)
+	e.Reg.Register(blockingContextParser{started: started})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		_, err := e.StatusContext(ctx)
+		done <- err
+	}()
+	select {
+	case <-started:
+		cancel()
+	case <-time.After(5 * time.Second):
+		cancel()
+		t.Fatal("kb_status did not reach context parser")
+	}
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("StatusContext error=%v, want context.Canceled", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("StatusContext ignored cancellation during parse scan")
 	}
 }

@@ -16,3 +16,11 @@ func (s *Store) AcquireWriterLock() (release func(), err error) {
 func (s *Store) AcquireSemanticLock() (release func(), err error) {
 	return nil, errors.New("store: 本平台暂不支持 semantic 锁(支持 macOS/Linux/Windows)")
 }
+
+func (s *Store) AcquireSemanticConfigReadLock() (release func(), err error) {
+	return nil, errors.New("store: 本平台暂不支持 semantic 配置锁(支持 macOS/Linux/Windows)")
+}
+
+func (s *Store) AcquireSemanticConfigWriteLock() (release func(), err error) {
+	return nil, errors.New("store: 本平台暂不支持 semantic 配置锁(支持 macOS/Linux/Windows)")
+}

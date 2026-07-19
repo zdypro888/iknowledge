@@ -1,13 +1,33 @@
 package index
 
 import (
+	"context"
+	"errors"
+	"fmt"
 	"reflect"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/zdypro888/iknowledge/internal/model"
 )
+
+type cancelAfterIndexErrContext struct {
+	calls int
+	after int
+}
+
+func (c *cancelAfterIndexErrContext) Deadline() (time.Time, bool) { return time.Time{}, false }
+func (c *cancelAfterIndexErrContext) Done() <-chan struct{}       { return nil }
+func (c *cancelAfterIndexErrContext) Value(any) any               { return nil }
+func (c *cancelAfterIndexErrContext) Err() error {
+	c.calls++
+	if c.calls >= c.after {
+		return context.Canceled
+	}
+	return nil
+}
 
 func TestTokenize(t *testing.T) {
 	tests := []struct {
@@ -47,6 +67,76 @@ func TestSplitIdent(t *testing.T) {
 	for _, tt := range tests {
 		if got := SplitIdent(tt.in); !reflect.DeepEqual(got, tt.want) {
 			t.Errorf("SplitIdent(%q) = %v, want %v", tt.in, got, tt.want)
+		}
+	}
+}
+
+func TestSearchSeparatesCurrentNavigationFromRiskText(t *testing.T) {
+	const targetRef = "target.go#Target#e_target"
+	ix := Build(map[string][]model.Node{
+		"tree/safe.go.yaml": {{
+			ID: "safe.go#Safe", Level: model.LevelFunction, Status: model.StatusFresh,
+			Keywords: []string{"navicular"},
+			Entries: []model.Entry{
+				{ID: "e_current", Kind: model.KindContract, Text: "zephyrquartz", Confidence: model.ConfidenceInferred},
+				{ID: "e_pitfall", Kind: model.KindPitfall, Text: "toxoplasmosis", Confidence: model.ConfidenceInferred},
+				{ID: "e_suspect", Kind: model.KindUsage, Text: "susurration", Confidence: model.ConfidenceSuspect},
+				{ID: "e_disputer", Kind: model.KindContract, Text: "xylophonic", Confidence: model.ConfidenceInferred, Disputes: []string{targetRef}},
+			},
+		}},
+		"tree/target.go.yaml": {{
+			ID: "target.go#Target", Level: model.LevelFunction, Status: model.StatusFresh,
+			Entries: []model.Entry{{ID: "e_target", Kind: model.KindContract, Text: "bibliophilic", Confidence: model.ConfidenceInferred}},
+		}},
+		"tree/suspect.go.yaml": {{
+			ID: "suspect.go#Uncertain", Level: model.LevelFunction, Status: model.StatusSuspect,
+			Entries: []model.Entry{{ID: "e_node", Kind: model.KindContract, Text: "numinous", Confidence: model.ConfidenceVerified}},
+		}},
+		"tree/pending.go.yaml": {{
+			ID: "pending.go#Pending", Level: model.LevelFunction, Status: model.StatusFresh, PendingAnchor: true,
+			Entries: []model.Entry{{ID: "e_pending", Kind: model.KindContract, Text: "quokkawattle", Confidence: model.ConfidenceVerified}},
+		}},
+		"tree/orphan.go.yaml": {{
+			ID: "orphan.go#Gone", Level: model.LevelFunction, Status: model.StatusOrphaned,
+			Entries: []model.Entry{{ID: "e_orphan", Kind: model.KindContract, Text: "ghosttoken", Confidence: model.ConfidenceVerified}},
+		}},
+	}, nil, nil)
+
+	has := func(hits []Hit, nodeID string) bool {
+		for _, hit := range hits {
+			if hit.NodeID == nodeID {
+				return true
+			}
+		}
+		return false
+	}
+	assertLane := func(query, nodeID string, current, risk bool) {
+		t.Helper()
+		if got := has(ix.SearchCurrent(query, 20), nodeID); got != current {
+			t.Errorf("SearchCurrent(%q) contains %s = %v, want %v", query, nodeID, got, current)
+		}
+		if got := has(ix.SearchRisk(query, 20), nodeID); got != risk {
+			t.Errorf("SearchRisk(%q) contains %s = %v, want %v", query, nodeID, got, risk)
+		}
+		if !has(ix.Search(query, 20), nodeID) {
+			t.Errorf("legacy Search(%q) lost %s", query, nodeID)
+		}
+	}
+
+	assertLane("zephyrquartz", "safe.go#Safe", true, false)
+	assertLane("toxoplasmosis", "safe.go#Safe", false, true)
+	assertLane("susurration", "safe.go#Safe", false, true)
+	assertLane("xylophonic", "safe.go#Safe", false, true)
+	assertLane("bibliophilic", "target.go#Target", false, true)
+	assertLane("numinous", "suspect.go#Uncertain", false, true)
+	assertLane("quokkawattle", "pending.go#Pending", false, true)
+	if has(ix.SearchCurrent("ghosttoken", 20), "orphan.go#Gone") || has(ix.SearchRisk("ghosttoken", 20), "orphan.go#Gone") {
+		t.Fatal("orphan entry body leaked into a live lexical lane")
+	}
+	// 即使节点只有风险条目，身份/路径/符号/keywords 仍是当前导航。
+	for _, query := range []string{"safe", "Safe", "navicular"} {
+		if !has(ix.SearchCurrent(query, 20), "safe.go#Safe") {
+			t.Errorf("navigation token %q must stay in current lane", query)
 		}
 	}
 }
@@ -146,6 +236,74 @@ func TestResolveEntryRefFollowsLineageWhenOldNodeIDWasReused(t *testing.T) {
 	}
 	if got, want := ix.ResolveEntryRef(old+"#e_new"), old+"#e_new"; got != want {
 		t.Fatalf("现任 exact entry 应优先: got %q want %q", got, want)
+	}
+}
+
+func TestResolveEntryContextReturnsFinalEntryAndBoundsUniqueCandidates(t *testing.T) {
+	old := "svc.go#Old"
+	targetNode := "svc.go#BTarget"
+	ix := Build(map[string][]model.Node{
+		"tree/current.yaml": {{ID: old, Entries: []model.Entry{{
+			ID: "e_current", Text: "current", Confidence: model.ConfidenceInferred,
+		}}}},
+		"tree/heirs.yaml": {
+			// A repeated flat-lineage declaration must not consume two candidate slots.
+			{ID: "svc.go#AEmpty", Lineage: []string{old, old}},
+			{ID: targetNode, Lineage: []string{old}, Entries: []model.Entry{
+				{ID: "e_target", SupersededBy: "e_final", Confidence: model.ConfidenceInferred},
+				{ID: "e_final", Text: "winner", Confidence: model.ConfidenceInferred},
+			}},
+			{ID: "svc.go#ZEmpty", Lineage: []string{old}},
+		},
+	}, nil, nil)
+
+	resolved, entry, err := ix.ResolveEntryContext(context.Background(), old+"#e_target", 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := targetNode + "#e_final"; resolved != want {
+		t.Fatalf("resolved ref=%q want %q", resolved, want)
+	}
+	if entry == nil || entry.ID != "e_final" || entry.Text != "winner" {
+		t.Fatalf("final entry=%+v", entry)
+	}
+	resolved, entry, err = ix.ResolveEntryContext(context.Background(), old+"#e_current", 4)
+	if err != nil || resolved != old+"#e_current" || entry == nil || entry.ID != "e_current" {
+		t.Fatalf("exact current entry lost priority: ref=%q entry=%+v err=%v", resolved, entry, err)
+	}
+	if _, _, err := ix.ResolveEntryContext(context.Background(), old+"#e_target", 3); err == nil || !strings.Contains(err.Error(), "limit 3") {
+		t.Fatalf("candidate overflow must fail explicitly: %v", err)
+	}
+}
+
+func TestContextResolversAreCancellableAndNeverTruncateLineage(t *testing.T) {
+	const old = "legacy.go#Run"
+	at := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	nodes := make([]model.Node, 256)
+	for i := range nodes {
+		nodes[i] = model.Node{
+			ID:      fmt.Sprintf("worker_%03d.go#Run", i),
+			Since:   at,
+			Lineage: []string{old},
+		}
+	}
+	ix := Build(map[string][]model.Node{"tree/workers.yaml": nodes}, nil, nil)
+
+	if resolved, err := ix.ResolveNodeIDsAtContext(context.Background(), old, at, 255); err == nil || resolved != nil || !strings.Contains(err.Error(), "256") {
+		t.Fatalf("lineage overflow was truncated instead of rejected: len=%d err=%v", len(resolved), err)
+	}
+	resolved, err := ix.ResolveNodeIDsAtContext(context.Background(), old, at, 256)
+	if err != nil || len(resolved) != 256 {
+		t.Fatalf("bounded lineage resolution len=%d err=%v", len(resolved), err)
+	}
+
+	nodeCtx := &cancelAfterIndexErrContext{after: 4}
+	if _, err := ix.ResolveNodeIDsAtContext(nodeCtx, old, at, 0); !errors.Is(err, context.Canceled) {
+		t.Fatalf("node lineage cancellation=%v", err)
+	}
+	entryCtx := &cancelAfterIndexErrContext{after: 4}
+	if _, _, err := ix.ResolveEntryContext(entryCtx, old+"#e_missing", 0); !errors.Is(err, context.Canceled) {
+		t.Fatalf("entry lineage cancellation=%v", err)
 	}
 }
 

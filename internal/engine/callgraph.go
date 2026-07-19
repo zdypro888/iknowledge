@@ -2,9 +2,9 @@ package engine
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"path"
-	"slices"
 	"sort"
 	"strings"
 
@@ -56,25 +56,47 @@ type packageKey struct {
 // files map,不依赖 rt.mu 保护的 cache/ix;读路径可并发刷新它而不互斥。
 // 图是尽力而为的派生值:清单/解析失败返回 nil,调用方按"无图"降级,不阻断读路径。
 func (e *Engine) ensureCallGraphLocked() *callGraph {
-	e.rt.cgMu.Lock()
+	cg, _ := e.ensureCallGraphContext(context.Background())
+	return cg
+}
+
+func (e *Engine) ensureCallGraphContext(ctx context.Context) (*callGraph, error) {
+	if ctx == nil {
+		return nil, fmt.Errorf("call graph: nil context")
+	}
+	if err := e.rt.cgMu.LockContext(ctx); err != nil {
+		return nil, err
+	}
 	defer e.rt.cgMu.Unlock()
 	repo := e.Store.RepoRoot()
 	// R29 批次3:callgraph 不走 cachedSourceFiles——它的增量语义依赖实时文件清单
 	// 检测增删(cachedSourceFiles 的 60s TTL 会让删除的文件滞留,破坏增量)。config 用缓存。
 	cfg := e.cachedConfig()
-	rels, err := listSourceFiles(repo, e.Reg, cfg)
+	rels, err := listSourceFilesContext(ctx, repo, e.Reg, cfg)
 	if err != nil {
-		return nil
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		return nil, nil
 	}
 
 	// 已发布给读者的 callGraph 视为不可变快照。刷新必须在副本上进行:
 	// 调用方拿到返回值后不再持 cgMu,若这里原地改 edges/reverse/files,
 	// 另一个并发 Recall/Map 会与刷新形成 data race。
-	cg := cloneCallGraph(e.rt.cg)
-	changed := cg.refreshModule(repo)
+	cg, err := cloneCallGraphContext(ctx, e.rt.cg)
+	if err != nil {
+		return nil, err
+	}
+	changed, err := cg.refreshModuleContext(ctx, repo)
+	if err != nil {
+		return nil, err
+	}
 
-	alive := make(map[string]bool, len(rels))
-	for _, rel := range rels {
+	alive := make(map[string]bool)
+	for i, rel := range rels {
+		if err := contextCheckpoint(ctx, i); err != nil {
+			return nil, err
+		}
 		alive[rel] = true
 		st, err := safeRepoFileInfo(repo, rel)
 		if err != nil {
@@ -92,9 +114,15 @@ func (e *Engine) ensureCallGraphLocked() *callGraph {
 		entry := &fileCallsEntry{mtimeNS: st.ModTime().UnixNano(), size: st.Size()}
 		if ex, ok := e.Reg.ForFile(rel).(parser.CallExtractor); ok {
 			src, err := safeRepoRead(repo, rel)
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return nil, ctxErr
+			}
 			if err == nil && !parser.IsGenerated(src) {
 				if fc, err := ex.FileCalls(rel, src); err == nil {
 					entry.fc = fc
+				}
+				if ctxErr := ctx.Err(); ctxErr != nil {
+					return nil, ctxErr
 				}
 			}
 		}
@@ -102,7 +130,12 @@ func (e *Engine) ensureCallGraphLocked() *callGraph {
 		cg.files[rel] = entry
 		changed = true
 	}
+	i := 0
 	for rel := range cg.files {
+		if err := contextCheckpoint(ctx, i); err != nil {
+			return nil, err
+		}
+		i++
 		if !alive[rel] {
 			delete(cg.files, rel)
 			changed = true
@@ -110,42 +143,74 @@ func (e *Engine) ensureCallGraphLocked() *callGraph {
 	}
 
 	if changed || cg.edges == nil {
-		cg.resolve()
+		if err := cg.resolveContext(ctx); err != nil {
+			return nil, err
+		}
 	}
 	e.rt.cg = cg
-	return cg
+	return cg, nil
 }
 
 // cloneCallGraph 建可变的下一版。fileCallsEntry 与边切片在构建后均只读,
 // 未发生变化时可共享;files map 会在增量刷新中增删,必须复制。
 func cloneCallGraph(src *callGraph) *callGraph {
+	dst, _ := cloneCallGraphContext(context.Background(), src)
+	return dst
+}
+
+func cloneCallGraphContext(ctx context.Context, src *callGraph) (*callGraph, error) {
+	if ctx == nil {
+		return nil, fmt.Errorf("call graph clone: nil context")
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if src == nil {
-		return &callGraph{files: map[string]*fileCallsEntry{}}
+		return &callGraph{files: map[string]*fileCallsEntry{}}, nil
 	}
 	dst := &callGraph{
 		module: src.module, modMtime: src.modMtime, modSize: src.modSize,
-		files: make(map[string]*fileCallsEntry, len(src.files)),
+		files: make(map[string]*fileCallsEntry),
 		edges: src.edges, reverse: src.reverse,
 		implsOf: src.implsOf, ifacesOf: src.ifacesOf,
 	}
+	i := 0
 	for rel, entry := range src.files {
+		if err := contextCheckpoint(ctx, i); err != nil {
+			return nil, err
+		}
+		i++
 		dst.files[rel] = entry
 	}
-	return dst
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return dst, nil
 }
 
 // refreshModule 按 go.mod 指纹重读模块路径;变更返回 true。
 func (cg *callGraph) refreshModule(repo string) bool {
+	changed, _ := cg.refreshModuleContext(context.Background(), repo)
+	return changed
+}
+
+func (cg *callGraph) refreshModuleContext(ctx context.Context, repo string) (bool, error) {
+	if ctx == nil {
+		return false, fmt.Errorf("call graph module refresh: nil context")
+	}
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
 	st, err := safeRepoFileInfo(repo, "go.mod")
 	if err != nil {
 		if cg.module == "" && cg.modMtime == 0 {
-			return false
+			return false, nil
 		}
 		cg.module, cg.modMtime, cg.modSize = "", 0, 0
-		return true
+		return true, nil
 	}
 	if st.ModTime().UnixNano() == cg.modMtime && st.Size() == cg.modSize {
-		return false
+		return false, nil
 	}
 	cg.modMtime, cg.modSize = st.ModTime().UnixNano(), st.Size()
 	data, err := safeRepoRead(repo, "go.mod")
@@ -153,10 +218,15 @@ func (cg *callGraph) refreshModule(repo string) bool {
 		// 安全读取失败（含 stat/open/read 间被替换）时不能继续沿用旧 module，
 		// 也不能缓存本次指纹，否则同一文件恢复可读后将永不重试。
 		cg.module, cg.modMtime, cg.modSize = "", 0, 0
-		return true
+		return true, nil
 	}
 	mod := ""
+	i := 0
 	for line := range bytes.Lines(data) {
+		if err := contextCheckpoint(ctx, i); err != nil {
+			return false, err
+		}
+		i++
 		if rest, ok := bytes.CutPrefix(bytes.TrimSpace(line), []byte("module")); ok {
 			mod = strings.TrimSpace(strings.Trim(strings.TrimSpace(string(rest)), `"`))
 			break
@@ -165,21 +235,44 @@ func (cg *callGraph) refreshModule(repo string) bool {
 	if mod != cg.module {
 		cg.module = mod
 	}
-	return true
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 // resolve 由提取结果连边(纯内存)。
 func (cg *callGraph) resolve() {
+	_ = cg.resolveContext(context.Background())
+}
+
+func (cg *callGraph) resolveContext(ctx context.Context) error {
+	if ctx == nil {
+		return fmt.Errorf("call graph resolve: nil context")
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	steps := 0
+	check := func() error {
+		steps++
+		return contextCheckpoint(ctx, steps)
+	}
+
 	// 包符号表:(目录, package 声明名) → 符号名 → 声明它的文件集。
 	// 同目录的 package p / package p_test 必须物理隔离；同一 package 内 build
 	// tag 双版本仍会形成多声明，继续走既有“调用方文件优先，否则丢边”规则。
 	pkgDecls := map[packageKey]map[string][]string{}
 	// 方法基名启发表:(目录, package) → 基名 → 规范名集合。
 	pkgMethodBase := map[packageKey]map[string][]string{}
+	pkgMethodSeen := map[packageKey]map[string]map[string]struct{}{}
 	// import 只可落到目标目录唯一的可导入 package。external-test package 只有
 	// *_test.go 文件，不可被普通 import；多个非测试 package 则按歧义丢边。
 	hasNonTestFile := map[packageKey]bool{}
 	for rel, entry := range cg.files {
+		if err := check(); err != nil {
+			return err
+		}
 		if entry.fc == nil {
 			continue
 		}
@@ -197,10 +290,24 @@ func (cg *callGraph) resolve() {
 			mb = map[string][]string{}
 			pkgMethodBase[key] = mb
 		}
+		seenByBase := pkgMethodSeen[key]
+		if seenByBase == nil {
+			seenByBase = map[string]map[string]struct{}{}
+			pkgMethodSeen[key] = seenByBase
+		}
 		for _, name := range entry.fc.Decls {
+			if err := check(); err != nil {
+				return err
+			}
 			decls[name] = append(decls[name], rel)
 			if t, m, ok := strings.Cut(name, "."); ok && t != "" && m != "" {
-				if !slices.Contains(mb[m], name) {
+				seen := seenByBase[m]
+				if seen == nil {
+					seen = map[string]struct{}{}
+					seenByBase[m] = seen
+				}
+				if _, duplicate := seen[name]; !duplicate {
+					seen[name] = struct{}{}
 					mb[m] = append(mb[m], name)
 				}
 			}
@@ -208,31 +315,46 @@ func (cg *callGraph) resolve() {
 	}
 
 	// lookup 归位一个 package 内的符号名:调用方文件优先,否则包内唯一。
-	lookup := func(key packageKey, name, callerRel string) string {
+	lookup := func(key packageKey, name, callerRel string) (string, error) {
 		sites := pkgDecls[key][name]
 		switch {
 		case len(sites) == 0:
-			return ""
+			return "", nil
 		case len(sites) == 1:
-			return sites[0] + "#" + name
+			return sites[0] + "#" + name, nil
 		}
 		for _, s := range sites {
+			if err := check(); err != nil {
+				return "", err
+			}
 			if s == callerRel {
-				return s + "#" + name
+				return s + "#" + name, nil
 			}
 		}
-		return "" // 跨文件歧义(build tag 双版本等):宁缺毋错
+		return "", nil // 跨文件歧义(build tag 双版本等):宁缺毋错
+	}
+	type importPackage struct {
+		key   packageKey
+		count int
+	}
+	importPackages := make(map[string]importPackage)
+	for key := range pkgDecls {
+		if err := check(); err != nil {
+			return err
+		}
+		if !hasNonTestFile[key] {
+			continue
+		}
+		state := importPackages[key.dir]
+		if state.count == 0 {
+			state.key = key
+		}
+		state.count++
+		importPackages[key.dir] = state
 	}
 	importKey := func(dir string) (packageKey, bool) {
-		var found packageKey
-		count := 0
-		for key := range pkgDecls {
-			if key.dir == dir && hasNonTestFile[key] {
-				found = key
-				count++
-			}
-		}
-		return found, count == 1
+		state := importPackages[dir]
+		return state.key, state.count == 1
 	}
 
 	// 接口→实现(2026-07-04,codegraph 启发的方法集匹配;AST 近似,无类型检查):
@@ -240,34 +362,72 @@ func (cg *callGraph) resolve() {
 	// 元素)整个接口弃;≥2 方法才严格匹配,单方法接口仅唯一实现者才认;同包同名
 	// 接口多文件声明(build tag)弃。已知低估留痕:结构体内嵌带来的方法提升 AST
 	// 看不见,漏配不误配。
-	ifaceMethodTargets := cg.resolveInterfaces(pkgDecls, lookup, importKey)
+	ifaceMethodTargets, implsOf, ifacesOf, err := cg.resolveInterfacesContext(ctx, pkgDecls, lookup, importKey)
+	if err != nil {
+		return err
+	}
 
 	edges := map[string][]string{}
 	reverse := map[string][]string{}
-	addEdge := func(from, to string) {
-		if to == "" || to == from || slices.Contains(edges[from], to) {
-			return
+	edgeSeen := map[string]map[string]struct{}{}
+	addEdge := func(from, to string) error {
+		if err := check(); err != nil {
+			return err
 		}
+		if to == "" || to == from {
+			return nil
+		}
+		seen := edgeSeen[from]
+		if seen == nil {
+			seen = map[string]struct{}{}
+			edgeSeen[from] = seen
+		}
+		if _, duplicate := seen[to]; duplicate {
+			return nil
+		}
+		seen[to] = struct{}{}
 		edges[from] = append(edges[from], to)
 		reverse[to] = append(reverse[to], from)
+		return nil
 	}
 
 	for rel, entry := range cg.files {
+		if err := check(); err != nil {
+			return err
+		}
 		if entry.fc == nil {
 			continue
 		}
 		key := packageKey{dir: path.Dir(rel), pkg: entry.fc.Package}
 		for caller, refs := range entry.fc.Calls {
+			if err := check(); err != nil {
+				return err
+			}
 			from := rel + "#" + caller
 			for _, ref := range refs {
+				if err := check(); err != nil {
+					return err
+				}
 				switch ref.Qual {
 				case "":
-					addEdge(from, lookup(key, ref.Name, rel))
+					to, err := lookup(key, ref.Name, rel)
+					if err != nil {
+						return err
+					}
+					if err := addEdge(from, to); err != nil {
+						return err
+					}
 				default:
 					if imp, ok := entry.fc.Imports[ref.Qual]; ok {
 						if tdir := cg.moduleDir(imp); tdir != "" {
 							if targetKey, ok := importKey(tdir); ok {
-								addEdge(from, lookup(targetKey, ref.Name, rel))
+								to, err := lookup(targetKey, ref.Name, rel)
+								if err != nil {
+									return err
+								}
+								if err := addEdge(from, to); err != nil {
+									return err
+								}
 							}
 						}
 						continue // import 命中但库外/未归位:丢弃,不落启发
@@ -276,10 +436,18 @@ func (cg *callGraph) resolve() {
 					// ② 接口分发兜底(codegraph 启发):该方法名属于仓内接口的
 					// 方法集 → 连到全部实现(扇出 ≤5,过则视为过度歧义丢弃)。
 					if cands := pkgMethodBase[key][ref.Name]; len(cands) == 1 {
-						addEdge(from, lookup(key, cands[0], rel))
+						to, err := lookup(key, cands[0], rel)
+						if err != nil {
+							return err
+						}
+						if err := addEdge(from, to); err != nil {
+							return err
+						}
 					} else if ts := ifaceMethodTargets[ref.Name]; len(ts) >= 1 && len(ts) <= 5 {
 						for _, t := range ts {
-							addEdge(from, t)
+							if err := addEdge(from, t); err != nil {
+								return err
+							}
 						}
 					}
 				}
@@ -288,19 +456,42 @@ func (cg *callGraph) resolve() {
 	}
 	for _, m := range []map[string][]string{edges, reverse} {
 		for k := range m {
-			sort.Strings(m[k])
+			if err := check(); err != nil {
+				return err
+			}
+			if err := contextSortStrings(ctx, m[k]); err != nil {
+				return err
+			}
 		}
 	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	cg.edges, cg.reverse = edges, reverse
+	cg.implsOf, cg.ifacesOf = implsOf, ifacesOf
+	return nil
 }
 
-// resolveInterfaces 建接口→实现关系,返回"接口方法名 → 实现方法节点"分发表。
-// 输入沿用 resolve 的包符号表与归位闭包;结果写 cg.implsOf/ifacesOf。
-func (cg *callGraph) resolveInterfaces(
+// resolveInterfacesContext 建接口→实现关系,返回"接口方法名 →
+// 实现方法节点"分发表。它只构造局部结果;调用方在整个 resolve
+// 成功后才发布，因此取消不会留下半张接口图。
+func (cg *callGraph) resolveInterfacesContext(
+	ctx context.Context,
 	pkgDecls map[packageKey]map[string][]string,
-	lookup func(key packageKey, name, callerRel string) string,
+	lookup func(key packageKey, name, callerRel string) (string, error),
 	importKey func(dir string) (packageKey, bool),
-) map[string][]string {
+) (map[string][]string, map[string][]string, map[string][]string, error) {
+	if ctx == nil {
+		return nil, nil, nil, fmt.Errorf("call graph interfaces: nil context")
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, nil, nil, err
+	}
+	steps := 0
+	check := func() error {
+		steps++
+		return contextCheckpoint(ctx, steps)
+	}
 	type iface struct {
 		key          packageKey
 		name, nodeID string
@@ -314,11 +505,17 @@ func (cg *callGraph) resolveInterfaces(
 	// 是两个 package，不得互相杀死。
 	byKey := map[string]*iface{} // dir + "\x00" + package + "\x00" + name
 	for rel, entry := range cg.files {
+		if err := check(); err != nil {
+			return nil, nil, nil, err
+		}
 		if entry.fc == nil {
 			continue
 		}
 		pkgKey := packageKey{dir: path.Dir(rel), pkg: entry.fc.Package}
 		for _, d := range entry.fc.Interfaces {
+			if err := check(); err != nil {
+				return nil, nil, nil, err
+			}
 			key := pkgKey.dir + "\x00" + pkgKey.pkg + "\x00" + d.Name
 			if prev, ok := byKey[key]; ok {
 				prev.dead = true
@@ -327,6 +524,9 @@ func (cg *callGraph) resolveInterfaces(
 			it := &iface{key: pkgKey, name: d.Name, nodeID: rel + "#" + d.Name,
 				methods: map[string]bool{}, embeds: d.Embeds, imports: entry.fc.Imports}
 			for _, m := range d.Methods {
+				if err := check(); err != nil {
+					return nil, nil, nil, err
+				}
 				it.methods[m] = true
 			}
 			byKey[key] = it
@@ -338,11 +538,17 @@ func (cg *callGraph) resolveInterfaces(
 	for range 5 {
 		progressed := false
 		for _, it := range byKey {
+			if err := check(); err != nil {
+				return nil, nil, nil, err
+			}
 			if it.dead || len(it.embeds) == 0 {
 				continue
 			}
 			var rest []parser.CallRef
 			for _, em := range it.embeds {
+				if err := check(); err != nil {
+					return nil, nil, nil, err
+				}
 				targetKey := packageKey{}
 				targetOK := false
 				switch {
@@ -368,6 +574,9 @@ func (cg *callGraph) resolveInterfaces(
 					rest = append(rest, em) // 目标自身未展开完,下一轮再并
 				default:
 					for m := range target.methods {
+						if err := check(); err != nil {
+							return nil, nil, nil, err
+						}
 						it.methods[m] = true
 					}
 					progressed = true
@@ -388,7 +597,13 @@ func (cg *callGraph) resolveInterfaces(
 	// ③ 类型方法集(dir → 类型名 → 方法基名集;来源是 "T.M" 形态的声明)。
 	typeMethods := map[packageKey]map[string]map[string]bool{}
 	for key, decls := range pkgDecls {
+		if err := check(); err != nil {
+			return nil, nil, nil, err
+		}
 		for name := range decls {
+			if err := check(); err != nil {
+				return nil, nil, nil, err
+			}
 			t, m, ok := strings.Cut(name, ".")
 			if !ok || t == "" || m == "" {
 				continue
@@ -410,6 +625,9 @@ func (cg *callGraph) resolveInterfaces(
 	ifacesOf := map[string][]string{}
 	targets := map[string]map[string]bool{} // 方法名 → 实现方法节点集
 	for _, it := range byKey {
+		if err := check(); err != nil {
+			return nil, nil, nil, err
+		}
 		if it.dead || len(it.embeds) > 0 || len(it.methods) == 0 {
 			continue
 		}
@@ -420,12 +638,21 @@ func (cg *callGraph) resolveInterfaces(
 		}
 		var implTargets []implTarget
 		for key, tm := range typeMethods {
+			if err := check(); err != nil {
+				return nil, nil, nil, err
+			}
 			for t, ms := range tm {
+				if err := check(); err != nil {
+					return nil, nil, nil, err
+				}
 				if key == it.key && t == it.name {
 					continue // 接口自身
 				}
 				ok := true
 				for m := range it.methods {
+					if err := check(); err != nil {
+						return nil, nil, nil, err
+					}
 					if !ms[m] {
 						ok = false
 						break
@@ -434,7 +661,11 @@ func (cg *callGraph) resolveInterfaces(
 				if !ok {
 					continue
 				}
-				if tn := lookup(key, t, ""); tn != "" {
+				tn, err := lookup(key, t, "")
+				if err != nil {
+					return nil, nil, nil, err
+				}
+				if tn != "" {
 					impls = append(impls, tn)
 					implTargets = append(implTargets, implTarget{key: key, typ: t})
 				}
@@ -444,11 +675,21 @@ func (cg *callGraph) resolveInterfaces(
 		if len(impls) == 0 || (len(it.methods) == 1 && len(impls) != 1) {
 			continue
 		}
-		implsOf[it.nodeID] = append(implsOf[it.nodeID], impls...)
+		implsOf[it.nodeID] = impls
 		for i, tn := range impls {
+			if err := check(); err != nil {
+				return nil, nil, nil, err
+			}
 			ifacesOf[tn] = append(ifacesOf[tn], it.nodeID)
 			for m := range it.methods {
-				if mn := lookup(implTargets[i].key, implTargets[i].typ+"."+m, ""); mn != "" {
+				if err := check(); err != nil {
+					return nil, nil, nil, err
+				}
+				mn, err := lookup(implTargets[i].key, implTargets[i].typ+"."+m, "")
+				if err != nil {
+					return nil, nil, nil, err
+				}
+				if mn != "" {
 					if targets[m] == nil {
 						targets[m] = map[string]bool{}
 					}
@@ -459,19 +700,71 @@ func (cg *callGraph) resolveInterfaces(
 	}
 	for _, m := range []map[string][]string{implsOf, ifacesOf} {
 		for k := range m {
-			sort.Strings(m[k])
-			m[k] = slices.Compact(m[k])
+			if err := check(); err != nil {
+				return nil, nil, nil, err
+			}
+			if err := contextSortStrings(ctx, m[k]); err != nil {
+				return nil, nil, nil, err
+			}
+			compacted, err := compactCallGraphStringsContext(ctx, m[k])
+			if err != nil {
+				return nil, nil, nil, err
+			}
+			m[k] = compacted
 		}
 	}
 	out := map[string][]string{}
 	for m, set := range targets {
+		if err := check(); err != nil {
+			return nil, nil, nil, err
+		}
 		for t := range set {
+			if err := check(); err != nil {
+				return nil, nil, nil, err
+			}
 			out[m] = append(out[m], t)
 		}
-		sort.Strings(out[m])
+		if err := contextSortStrings(ctx, out[m]); err != nil {
+			return nil, nil, nil, err
+		}
 	}
-	cg.implsOf, cg.ifacesOf = implsOf, ifacesOf
-	return out
+	if err := ctx.Err(); err != nil {
+		return nil, nil, nil, err
+	}
+	return out, implsOf, ifacesOf, nil
+}
+
+func compactCallGraphStringsContext(ctx context.Context, values []string) ([]string, error) {
+	if ctx == nil {
+		return nil, fmt.Errorf("call graph compact: nil context")
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if len(values) < 2 {
+		return values, nil
+	}
+	write := 1
+	for read := 1; read < len(values); read++ {
+		if err := contextCheckpoint(ctx, read); err != nil {
+			return nil, err
+		}
+		if values[read] == values[write-1] {
+			continue
+		}
+		values[write] = values[read]
+		write++
+	}
+	for i := write; i < len(values); i++ {
+		if err := contextCheckpoint(ctx, i-write+1); err != nil {
+			return nil, err
+		}
+		values[i] = ""
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return values[:write], nil
 }
 
 // implementationsOf / interfacesOf 返回接口↔实现关系(node ID 升序;无则 nil)。
@@ -499,16 +792,39 @@ func (cg *callGraph) calledByOf(nodeID string) []string { return cg.reverse[node
 // fileCentrality 统计每文件的跨文件被调入边数(热区排序的中心度因子,
 // knowledge.md §12.1)。同文件内部调用不计——helper 密集的文件会虚高。
 func (cg *callGraph) fileCentrality() map[string]int {
+	out, _ := cg.fileCentralityContext(context.Background())
+	return out
+}
+
+func (cg *callGraph) fileCentralityContext(ctx context.Context) (map[string]int, error) {
+	if ctx == nil {
+		return nil, fmt.Errorf("call graph centrality: nil context")
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	out := map[string]int{}
+	i := 0
 	for to, froms := range cg.reverse {
+		if err := contextCheckpoint(ctx, i); err != nil {
+			return nil, err
+		}
+		i++
 		tf, _ := model.SplitNodeID(to)
 		for _, from := range froms {
+			if err := contextCheckpoint(ctx, i); err != nil {
+				return nil, err
+			}
+			i++
 			if ff, _ := model.SplitNodeID(from); ff != tf {
 				out[tf]++
 			}
 		}
 	}
-	return out
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 
 // neighbor 是结构扩展的一个候选(检索三级递进第 2 级,knowledge.md §10.2)。
@@ -568,7 +884,13 @@ func (e *Engine) structuralNeighborsLocked(hitIDs []string, limit int) []neighbo
 				continue
 			}
 			for _, st := range f.Steps {
-				add(e.rt.ix.ResolveNodeID(st.Node), "同流程 "+fid)
+				at := st.Since
+				if at.IsZero() {
+					at = f.Since
+				}
+				for _, nodeID := range e.rt.ix.ResolveNodeIDsAt(st.Node, at) {
+					add(nodeID, "同流程 "+fid)
+				}
 			}
 		}
 	}

@@ -32,7 +32,10 @@ func (e *Engine) Brief(tokenBudget int) (string, error) {
 	defer e.rt.mu.RUnlock()
 	debts := e.computeDebtsLocked()
 	changes := append([]model.Change(nil), e.rt.ix.Changes()...)
-	inactive := inactiveChanges(changes)
+	inactive, err := inactiveChanges(changes)
+	if err != nil {
+		return "", err
+	}
 
 	var b strings.Builder
 	b.WriteString("# iknowledge briefing\n\n")

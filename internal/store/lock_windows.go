@@ -85,3 +85,35 @@ func (s *Store) AcquireSemanticLock() (release func(), err error) {
 		})
 	}, nil
 }
+
+func (s *Store) AcquireSemanticConfigReadLock() (release func(), err error) {
+	return s.acquireSemanticConfigLock(lockfileFailImmediately)
+}
+
+func (s *Store) AcquireSemanticConfigWriteLock() (release func(), err error) {
+	return s.acquireSemanticConfigLock(lockfileExclusiveLock | lockfileFailImmediately)
+}
+
+func (s *Store) acquireSemanticConfigLock(flags int) (release func(), err error) {
+	path := filepath.Join(s.dir, "local", ".semantic-config.lock")
+	f, err := s.openKnowledgeFile(path, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return nil, fmt.Errorf("store: 开 semantic 配置锁文件: %w", err)
+	}
+	ol := new(syscall.Overlapped)
+	r, _, errno := procLockFileEx.Call(f.Fd(), uintptr(flags), 0, 1, 0, uintptr(unsafe.Pointer(ol)))
+	if r == 0 {
+		_ = f.Close()
+		if errors.Is(errno, errorLockViolation) {
+			return nil, ErrSemanticConfigLocked
+		}
+		return nil, fmt.Errorf("store: semantic config LockFileEx: %w", errno)
+	}
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			procUnlockFileEx.Call(f.Fd(), 0, 1, 0, uintptr(unsafe.Pointer(ol)))
+			_ = f.Close()
+		})
+	}, nil
+}

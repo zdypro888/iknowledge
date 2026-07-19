@@ -16,6 +16,7 @@ import (
 )
 
 var _ Embedder = (*OpenAICompatible)(nil)
+var _ DualModeCanaryEmbedder = (*OpenAICompatible)(nil)
 
 func TestOpenAICompatibleEmbedsAndReordersBatch(t *testing.T) {
 	type requestBody struct {
@@ -82,6 +83,69 @@ func TestOpenAICompatibleEmbedsAndReordersBatch(t *testing.T) {
 	}
 	if got := requests.Load(); got != 2 {
 		t.Fatalf("requests = %d", got)
+	}
+}
+
+func TestOpenAICompatibleQueryProfileWireInputs(t *testing.T) {
+	requests := make(chan []string, 4)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Input []string `json:"input"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			http.Error(w, "bad json", http.StatusBadRequest)
+			return
+		}
+		requests <- body.Input
+		data := make([]map[string]any, len(body.Input))
+		for i := range data {
+			data[i] = map[string]any{"index": i, "embedding": []float64{1, float64(i + 1)}}
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"data": data})
+	}))
+	defer server.Close()
+
+	client, err := NewOpenAICompatible(OpenAIConfig{
+		BaseURL: server.URL, Model: "qwen3-embedding:0.6b", QueryProfile: QueryProfileQwen3CodeV1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	documents := []string{"first document", "第二份文档"}
+	if _, err := client.EmbedDocuments(context.Background(), documents); err != nil {
+		t.Fatal(err)
+	}
+	if got := <-requests; !reflect.DeepEqual(got, documents) {
+		t.Fatalf("document wire input = %#v, want unchanged %#v", got, documents)
+	}
+	query := "where is authentication checked?"
+	if _, err := client.EmbedQuery(context.Background(), query); err != nil {
+		t.Fatal(err)
+	}
+	want := "Instruct: " + qwen3CodeV1Instruction + "\nQuery:" + query
+	if got := <-requests; !reflect.DeepEqual(got, []string{want}) {
+		t.Fatalf("qwen query wire input = %#v, want %#v", got, []string{want})
+	}
+	if _, _, _, err := client.EmbedDocumentsWithDualCanary(context.Background(),
+		[]string{"batch document"}, "document canary", "query canary"); err != nil {
+		t.Fatal(err)
+	}
+	wantQueryCanary := "Instruct: " + qwen3CodeV1Instruction + "\nQuery:query canary"
+	if got := <-requests; !reflect.DeepEqual(got, []string{"batch document", "document canary", wantQueryCanary}) {
+		t.Fatalf("dual-canary wire input = %#v", got)
+	}
+
+	plain, err := NewOpenAICompatible(OpenAIConfig{
+		BaseURL: server.URL, Model: "plain-model", QueryProfile: QueryProfilePlain,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := plain.EmbedQuery(context.Background(), query); err != nil {
+		t.Fatal(err)
+	}
+	if got := <-requests; !reflect.DeepEqual(got, []string{query}) {
+		t.Fatalf("plain query wire input = %#v, want unchanged %#v", got, []string{query})
 	}
 }
 
@@ -160,6 +224,9 @@ func TestOpenAICompatibleFingerprintIsStableAndCredentialFree(t *testing.T) {
 	base.Revision = "r"
 	base.Dimensions = 4
 	differentDimensions, _ := NewOpenAICompatible(base)
+	base.Dimensions = 8
+	base.QueryProfile = QueryProfileQwen3CodeV1
+	differentProfile, _ := NewOpenAICompatible(base)
 	equivalent, _ := NewOpenAICompatible(OpenAIConfig{
 		BaseURL: "https://EXAMPLE.com:443/v1/embeddings/", Model: "m", Revision: "r", APIKey: "third", Dimensions: 8,
 	})
@@ -169,7 +236,8 @@ func TestOpenAICompatibleFingerprintIsStableAndCredentialFree(t *testing.T) {
 	if first.Fingerprint() != equivalent.Fingerprint() {
 		t.Fatalf("equivalent endpoints changed fingerprint: %q %q", first.Fingerprint(), equivalent.Fingerprint())
 	}
-	if strings.Contains(first.Fingerprint(), "first") || first.Fingerprint() == different.Fingerprint() || first.Fingerprint() == differentDimensions.Fingerprint() {
+	if strings.Contains(first.Fingerprint(), "first") || first.Fingerprint() == different.Fingerprint() ||
+		first.Fingerprint() == differentDimensions.Fingerprint() || first.Fingerprint() == differentProfile.Fingerprint() {
 		t.Fatalf("bad fingerprint separation: %q %q", first.Fingerprint(), different.Fingerprint())
 	}
 }
@@ -362,6 +430,34 @@ func TestOpenAICompatibleRejectsMalformedResponses(t *testing.T) {
 	}
 }
 
+func TestOpenAICompatibleBoundsUnknownJSONNesting(t *testing.T) {
+	nested := func(depth int) string {
+		return strings.Repeat("[", depth) + "0" + strings.Repeat("]", depth)
+	}
+	validData := `"data":[{"index":0,"embedding":[1]}]`
+
+	t.Run("boundary accepted", func(t *testing.T) {
+		body := []byte(`{"extra":` + nested(maxJSONSkipDepth) + `,` + validData + `}`)
+		if _, err := decodeOpenAIEmbeddingResponse(body, 1, 1); err != nil {
+			t.Fatalf("depth %d rejected: %v", maxJSONSkipDepth, err)
+		}
+	})
+
+	for _, test := range []struct {
+		name string
+		body string
+	}{
+		{name: "top-level unknown", body: `{"extra":` + nested(maxJSONSkipDepth+1) + `,` + validData + `}`},
+		{name: "item unknown", body: `{"data":[{"index":0,"extra":` + nested(maxJSONSkipDepth+1) + `,"embedding":[1]}]}`},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if _, err := decodeOpenAIEmbeddingResponse([]byte(test.body), 1, 1); err == nil {
+				t.Fatalf("depth %d unexpectedly accepted", maxJSONSkipDepth+1)
+			}
+		})
+	}
+}
+
 func TestOpenAICompatibleRejectsNonFiniteVector(t *testing.T) {
 	client, err := NewOpenAICompatible(OpenAIConfig{BaseURL: "https://example.com", Model: "m"})
 	if err != nil {
@@ -446,6 +542,7 @@ func TestOpenAICompatibleRejectsInvalidConfiguration(t *testing.T) {
 		{BaseURL: "https://example.com", Model: "m", MaxResponseBytes: hardMaxResponseBytes + 1},
 		{BaseURL: "https://example.com", Model: "m", MaxDimensions: hardMaxDimensions + 1},
 		{BaseURL: "https://example.com", Model: "m", Dimensions: defaultMaxDimensions + 1},
+		{BaseURL: "https://example.com", Model: "m", QueryProfile: QueryProfile("future-profile")},
 	}
 	for i, config := range tests {
 		t.Run(fmt.Sprint(i), func(t *testing.T) {

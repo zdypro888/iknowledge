@@ -33,6 +33,10 @@ const (
 	hardMaxRequestBytes  = int64(1 << 20)
 	hardMaxResponseBytes = int64(64 << 20)
 	hardMaxDimensions    = 4_096
+	// Unknown provider response fields are ignored for compatibility, but their
+	// JSON nesting must remain bounded independently of the byte limit. Without
+	// this guard a small adversarial response can exhaust the goroutine stack.
+	maxJSONSkipDepth = 64
 )
 
 var (
@@ -43,6 +47,35 @@ var (
 	// ErrResponseTooLarge reports a response that exceeds MaxResponseBytes.
 	ErrResponseTooLarge = errors.New("semantic: embedding response exceeds body limit")
 )
+
+// QueryProfile identifies the query-side preprocessing contract. Documents
+// are never rewritten: a profile only prepares retrieval queries for models
+// whose embedding space was trained with asymmetric instructions.
+type QueryProfile string
+
+const (
+	// QueryProfilePlain sends queries exactly as supplied by the caller.
+	QueryProfilePlain QueryProfile = "plain"
+	// QueryProfileQwen3CodeV1 applies iknowledge's versioned software-knowledge
+	// retrieval instruction using Qwen3 Embedding's documented wire format.
+	QueryProfileQwen3CodeV1 QueryProfile = "qwen3-code-v1"
+
+	qwen3CodeV1Instruction = "Given a software engineering question, retrieve relevant code knowledge passages about behavior, contracts, dependencies, pitfalls, historical decisions, rejected approaches, and troubleshooting evidence."
+)
+
+// CanonicalQueryProfile maps the legacy zero value to plain and rejects every
+// unknown value. Callers must never silently fall back when a persisted
+// preprocessing contract is misspelled or comes from a newer binary.
+func CanonicalQueryProfile(profile QueryProfile) (QueryProfile, error) {
+	switch profile {
+	case "", QueryProfilePlain:
+		return QueryProfilePlain, nil
+	case QueryProfileQwen3CodeV1:
+		return QueryProfileQwen3CodeV1, nil
+	default:
+		return "", fmt.Errorf("semantic: unknown query profile %q", profile)
+	}
+}
 
 // HTTPStatusError reports only the response status. Provider response bodies
 // are deliberately excluded because they may echo documents or credentials.
@@ -63,6 +96,9 @@ type OpenAIConfig struct {
 	Model    string
 	Revision string
 	APIKey   string
+	// QueryProfile is credential-free query preprocessing. The zero value is
+	// retained as a compatibility alias for plain.
+	QueryProfile QueryProfile
 
 	// Dimensions, when non-zero, is sent to providers that support the
 	// standard dimensions option and is enforced on every returned vector.
@@ -87,6 +123,7 @@ type OpenAICompatible struct {
 	endpoint         string
 	model            string
 	apiKey           string
+	queryProfile     QueryProfile
 	dimensions       int
 	maxBatchSize     int
 	maxTextBytes     int64
@@ -124,6 +161,10 @@ func NewOpenAICompatible(config OpenAIConfig) (*OpenAICompatible, error) {
 	if len(config.APIKey) > maxCredentialBytes || containsInvalidHeaderByte(config.APIKey) {
 		// Never include the rejected value in the error: it is a credential.
 		return nil, fmt.Errorf("semantic: embedding API key is not a valid header value")
+	}
+	queryProfile, err := CanonicalQueryProfile(config.QueryProfile)
+	if err != nil {
+		return nil, err
 	}
 
 	timeout := config.Timeout
@@ -193,6 +234,7 @@ func NewOpenAICompatible(config OpenAIConfig) (*OpenAICompatible, error) {
 		endpoint:         endpoint,
 		model:            model,
 		apiKey:           config.APIKey,
+		queryProfile:     queryProfile,
 		dimensions:       config.Dimensions,
 		maxBatchSize:     maxBatchSize,
 		maxTextBytes:     maxTextBytes,
@@ -203,18 +245,61 @@ func NewOpenAICompatible(config OpenAIConfig) (*OpenAICompatible, error) {
 		client:           client,
 		fingerprint: fingerprint("openai-compatible-v1",
 			providerMode(endpoint), endpoint, model, strconv.Itoa(config.Dimensions), revision,
-			"dimensions-omitted-when-zero"),
+			"dimensions-omitted-when-zero", string(queryProfile)),
 	}, nil
 }
 
 func (c *OpenAICompatible) Fingerprint() string { return c.fingerprint }
 
 func (c *OpenAICompatible) EmbedQuery(ctx context.Context, query string) ([]float32, error) {
-	vectors, err := c.embed(ctx, []string{query})
+	prepared, err := prepareQuery(c.queryProfile, query)
+	if err != nil {
+		return nil, err
+	}
+	vectors, err := c.embed(ctx, []string{prepared})
 	if err != nil {
 		return nil, err
 	}
 	return vectors[0], nil
+}
+
+// EmbedQueryWithCanary embeds the query and a fixed query-mode canary in one
+// HTTP request. Both receive the configured query profile, so the observed
+// fingerprint covers both the actual model and query preprocessing contract.
+func (c *OpenAICompatible) EmbedQueryWithCanary(ctx context.Context, query, canary string) ([]float32, []float32, error) {
+	preparedQuery, err := prepareQuery(c.queryProfile, query)
+	if err != nil {
+		return nil, nil, err
+	}
+	preparedCanary, err := prepareQuery(c.queryProfile, canary)
+	if err != nil {
+		return nil, nil, err
+	}
+	vectors, err := c.embed(ctx, []string{preparedQuery, preparedCanary})
+	if err != nil {
+		return nil, nil, err
+	}
+	return vectors[0], vectors[1], nil
+}
+
+func prepareQuery(profile QueryProfile, query string) (string, error) {
+	profile, err := CanonicalQueryProfile(profile)
+	if err != nil {
+		return "", err
+	}
+	switch profile {
+	case QueryProfilePlain:
+		return query, nil
+	case QueryProfileQwen3CodeV1:
+		// Qwen3 Embedding's official asymmetric retrieval form is:
+		// Instruct: {task_description}\nQuery:{query}. Documents intentionally
+		// remain unmodified in EmbedDocuments.
+		return "Instruct: " + qwen3CodeV1Instruction + "\nQuery:" + query, nil
+	default:
+		// CanonicalQueryProfile already rejects this; keep the switch fail closed
+		// if another canonical value is added without its wire implementation.
+		return "", fmt.Errorf("semantic: unsupported query profile %q", profile)
+	}
 }
 
 func (c *OpenAICompatible) EmbedDocuments(ctx context.Context, documents []string) ([][]float32, error) {
@@ -228,6 +313,38 @@ func (c *OpenAICompatible) EmbedDocuments(ctx context.Context, documents []strin
 		return nil, nil
 	}
 	return c.embed(ctx, documents)
+}
+
+// EmbedDocumentsWithCanary embeds one rebuild batch and its document-mode
+// canary atomically at the provider boundary. Documents remain unmodified.
+func (c *OpenAICompatible) EmbedDocumentsWithCanary(ctx context.Context, documents []string, canary string) ([][]float32, []float32, error) {
+	inputs := make([]string, 0, len(documents)+1)
+	inputs = append(inputs, documents...)
+	inputs = append(inputs, canary)
+	vectors, err := c.embed(ctx, inputs)
+	if err != nil {
+		return nil, nil, err
+	}
+	return vectors[:len(documents)], vectors[len(documents)], nil
+}
+
+// EmbedDocumentsWithDualCanary keeps the document batch, an unmodified
+// document-mode canary, and a profile-prepared query-mode canary in one HTTP
+// request. An OpenAI-compatible endpoint selects one model for the whole
+// batch, so the two observed fingerprints form an atomic cross-mode binding.
+func (c *OpenAICompatible) EmbedDocumentsWithDualCanary(ctx context.Context, documents []string, documentCanary, queryCanary string) ([][]float32, []float32, []float32, error) {
+	preparedQueryCanary, err := prepareQuery(c.queryProfile, queryCanary)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	inputs := make([]string, 0, len(documents)+2)
+	inputs = append(inputs, documents...)
+	inputs = append(inputs, documentCanary, preparedQueryCanary)
+	vectors, err := c.embed(ctx, inputs)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	return vectors[:len(documents)], vectors[len(documents)], vectors[len(documents)+1], nil
 }
 
 type openAIEmbeddingRequest struct {
@@ -474,6 +591,10 @@ func consumeJSONDelimiter(decoder *json.Decoder, want json.Delim) error {
 }
 
 func skipJSONValue(decoder *json.Decoder) error {
+	return skipJSONValueAtDepth(decoder, 0)
+}
+
+func skipJSONValueAtDepth(decoder *json.Decoder, depth int) error {
 	token, err := decoder.Token()
 	if err != nil {
 		return err
@@ -482,10 +603,13 @@ func skipJSONValue(decoder *json.Decoder) error {
 	if !ok {
 		return nil
 	}
+	if depth >= maxJSONSkipDepth {
+		return fmt.Errorf("semantic: embedding response JSON nesting exceeds limit %d", maxJSONSkipDepth)
+	}
 	switch delimiter {
 	case '[':
 		for decoder.More() {
-			if err := skipJSONValue(decoder); err != nil {
+			if err := skipJSONValueAtDepth(decoder, depth+1); err != nil {
 				return err
 			}
 		}
@@ -495,7 +619,7 @@ func skipJSONValue(decoder *json.Decoder) error {
 			if _, err := decoder.Token(); err != nil {
 				return err
 			}
-			if err := skipJSONValue(decoder); err != nil {
+			if err := skipJSONValueAtDepth(decoder, depth+1); err != nil {
 				return err
 			}
 		}

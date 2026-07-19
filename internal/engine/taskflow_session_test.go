@@ -1,14 +1,50 @@
 package engine
 
 import (
+	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	gort "runtime"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/zdypro888/iknowledge/internal/model"
 )
+
+func TestTaskContextCancellationNeverCreatesWIP(t *testing.T) {
+	e, _ := initEngine(t, map[string]string{"a.go": "package p\n\nfunc A() {}\n"})
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := e.TaskContext(ctx, TaskArgs{Action: "start", WIP: model.WIP{Task: "不得落盘"}}, "canceled", "codex"); !errors.Is(err, context.Canceled) {
+		t.Fatalf("TaskContext error=%v, want context.Canceled", err)
+	}
+	wips, err := e.Store.LoadWIPs()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(wips) != 0 {
+		t.Fatalf("canceled task mutated WIP state: %+v", wips)
+	}
+}
+
+func TestDecisionFirewallLockWaitHonorsContext(t *testing.T) {
+	e, _ := initEngine(t, map[string]string{"a.go": "package p\n\nfunc A() {}\n"})
+	e.rt.mu.Lock()
+	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Millisecond)
+	defer cancel()
+	started := time.Now()
+	out := e.semanticDecisionFirewall(ctx, "change A", []string{"a.go#A"})
+	elapsed := time.Since(started)
+	e.rt.mu.Unlock()
+	if out != "" || !errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		t.Fatalf("firewall canceled output=%q context=%v", out, ctx.Err())
+	}
+	if elapsed > time.Second {
+		t.Fatalf("firewall lock wait ignored context for %v", elapsed)
+	}
+}
 
 func TestTaskWIPIsolatedBySession(t *testing.T) {
 	e, _ := initEngine(t, map[string]string{"a.go": "package p\n\nfunc A() {}\n"})

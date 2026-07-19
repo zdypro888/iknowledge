@@ -4,6 +4,8 @@
 package index
 
 import (
+	"context"
+	"fmt"
 	"slices"
 	"sort"
 	"strings"
@@ -28,19 +30,23 @@ type ChangeRef struct {
 
 // Index 由一次快照(shards+journal+flows)构建;只读,重载后整体重建。
 type Index struct {
-	nodes        map[string]*NodeRef
-	lineage      map[string][]string        // 旧节点 ID → 现任节点 ID(拆分可多个,#8)
-	inverted     map[string]map[string]bool // token → 节点 ID 集合
-	trigram      map[string]map[string]bool // 三字母组 → 节点 ID 集合(R29 批次5:近似命中回退)
-	fileNodes    map[string][]string        // 文件路径 → 该文件的所有节点 ID(R29 批次3:文件域查询免扫全表)
-	basedOnRev   map[string][]string        // 归一化 "node#entry" → 依赖它的 "node#entry"
-	disputesRev  map[string][]string        // 归一化 "node#entry" → 声明与它矛盾的 "node#entry"
-	flowsByNode  map[string][]string        // 节点 ID → flow IDs(反向链接,现算不落盘)
-	journalBy    map[string][]ChangeRef     // 现任节点 ID → 变更引用
-	landmine     map[string]int             // 轮30-C:节点 ID → 雷区分(变更频次 + 推翻次数×2 + refute 数)
-	duplicateIDs []string                   // 跨分片重复 node ID:隔离,避免 map 遍历 last-write-wins
-	changes      []model.Change
-	flows        []model.Flow
+	nodes           map[string]*NodeRef
+	lineage         map[string][]string        // 旧节点 ID → 现任节点 ID(拆分可多个,#8)
+	inverted        map[string]map[string]bool // token → 节点 ID 集合
+	trigram         map[string]map[string]bool // 三字母组 → 节点 ID 集合(R29 批次5:近似命中回退)
+	invertedCurrent map[string]map[string]bool // 当前事实/导航 token → 节点 ID
+	trigramCurrent  map[string]map[string]bool // 当前事实/导航近似索引
+	invertedRisk    map[string]map[string]bool // 风险文本 token → 节点 ID
+	trigramRisk     map[string]map[string]bool // 风险文本近似索引
+	fileNodes       map[string][]string        // 文件路径 → 该文件的所有节点 ID(R29 批次3:文件域查询免扫全表)
+	basedOnRev      map[string][]string        // 归一化 "node#entry" → 依赖它的 "node#entry"
+	disputesRev     map[string][]string        // 归一化 "node#entry" → 声明与它矛盾的 "node#entry"
+	flowsByNode     map[string][]string        // 节点 ID → flow IDs(反向链接,现算不落盘)
+	journalBy       map[string][]ChangeRef     // 现任节点 ID → 变更引用
+	landmine        map[string]int             // 轮30-C:节点 ID → 雷区分(变更频次 + 推翻次数×2 + refute 数)
+	duplicateIDs    []string                   // 跨分片重复 node ID:隔离,避免 map 遍历 last-write-wins
+	changes         []model.Change
+	flows           []model.Flow
 }
 
 // Build 全量构建索引。shards 是"分片相对路径 → 节点切片",由 engine 从 store
@@ -48,18 +54,22 @@ type Index struct {
 // store,维持 impl §2 依赖方向。切片共享缓存底层数组,NodeRef 指针指向缓存实体。
 func Build(shards map[string][]model.Node, changes []model.Change, flows []model.Flow) *Index {
 	ix := &Index{
-		nodes:       map[string]*NodeRef{},
-		lineage:     map[string][]string{},
-		inverted:    map[string]map[string]bool{},
-		trigram:     map[string]map[string]bool{},
-		fileNodes:   map[string][]string{},
-		basedOnRev:  map[string][]string{},
-		disputesRev: map[string][]string{},
-		flowsByNode: map[string][]string{},
-		journalBy:   map[string][]ChangeRef{},
-		landmine:    map[string]int{},
-		changes:     changes,
-		flows:       flows,
+		nodes:           map[string]*NodeRef{},
+		lineage:         map[string][]string{},
+		inverted:        map[string]map[string]bool{},
+		trigram:         map[string]map[string]bool{},
+		invertedCurrent: map[string]map[string]bool{},
+		trigramCurrent:  map[string]map[string]bool{},
+		invertedRisk:    map[string]map[string]bool{},
+		trigramRisk:     map[string]map[string]bool{},
+		fileNodes:       map[string][]string{},
+		basedOnRev:      map[string][]string{},
+		disputesRev:     map[string][]string{},
+		flowsByNode:     map[string][]string{},
+		journalBy:       map[string][]ChangeRef{},
+		landmine:        map[string]int{},
+		changes:         changes,
+		flows:           flows,
 	}
 
 	// 先计数再建表:跨分片重复 ID 不能由 map 迭代顺序随机决定胜者。
@@ -106,45 +116,76 @@ func Build(shards map[string][]model.Node, changes []model.Change, flows []model
 	for old := range ix.lineage {
 		sort.Strings(ix.lineage[old]) // 确定性:map 迭代序不可信
 	}
+	entryResolver := ix.NewEntryResolver()
+	resolveEntryRef := func(ref string) string {
+		resolved, _, err := entryResolver.ResolveContext(context.Background(), ref, 0)
+		if err != nil {
+			return ref
+		}
+		return resolved
+	}
 
-	// 倒排:节点 ID 分段 + 符号标识符拆词 + keywords + 活跃条目文本(impl §8)。
+	// 活跃且双方都未退场的 dispute 是“待裁决”。先算出双方 entry ref，
+	// 再建倒排：否则被指方的文本会被当成“当前结论”。
+	openDisputeEntries := map[string]bool{}
+	for id, ref := range ix.nodes {
+		for i := range ref.Node.Entries {
+			entry := &ref.Node.Entries[i]
+			if !entry.Active() {
+				continue
+			}
+			from := id + "#" + entry.ID
+			for _, target := range entry.Disputes {
+				resolved, targetEntry, _ := entryResolver.ResolveContext(context.Background(), target, 0)
+				if targetEntry == nil || !targetEntry.Active() {
+					continue
+				}
+				openDisputeEntries[from] = true
+				openDisputeEntries[resolved] = true
+			}
+		}
+	}
+
+	// 倒排分三份：Search 保留全量旧语义；SearchCurrent 只提供当前事实
+	// 和节点导航；SearchRisk 只提供 pitfall/suspect/open-dispute 风险文本。
 	// R29 批次5:同时建 trigram 索引(三字母组),供精确 token 命中不足时近似回退。
 	for id, ref := range ix.nodes {
 		n := ref.Node
-		add := func(tokens []string) {
-			for _, tok := range tokens {
-				set := ix.inverted[tok]
-				if set == nil {
-					set = map[string]bool{}
-					ix.inverted[tok] = set
-				}
-				set[id] = true
-				// trigram:对长度≥3 的 token 取所有三字母组(小写归一)。
-				if len(tok) >= 3 {
-					for _, tg := range trigrams(tok) {
-						ts := ix.trigram[tg]
-						if ts == nil {
-							ts = map[string]bool{}
-							ix.trigram[tg] = ts
-						}
-						ts[id] = true
-					}
-				}
-			}
+		addCurrent := func(tokens []string) {
+			addSearchTokens(id, tokens, ix.inverted, ix.trigram)
+			addSearchTokens(id, tokens, ix.invertedCurrent, ix.trigramCurrent)
+		}
+		addRisk := func(tokens []string) {
+			addSearchTokens(id, tokens, ix.inverted, ix.trigram)
+			addSearchTokens(id, tokens, ix.invertedRisk, ix.trigramRisk)
 		}
 		file, symbol := model.SplitNodeID(id)
 		for seg := range strings.SplitSeq(file, "/") {
-			add(Tokenize(seg))
+			addCurrent(Tokenize(seg))
 		}
 		if symbol != "" {
-			add(SplitIdent(symbol))
+			addCurrent(SplitIdent(symbol))
 		}
 		for _, kw := range n.Keywords {
-			add(Tokenize(kw))
+			addCurrent(Tokenize(kw))
 		}
 		for i := range n.Entries {
-			if n.Entries[i].Active() {
-				add(Tokenize(n.Entries[i].Text))
+			entry := &n.Entries[i]
+			if !entry.Active() {
+				continue
+			}
+			// Orphan knowledge is preserved for adoption/history, but there is no
+			// current code anchor against which its body can be treated as either a
+			// fact or an actionable live risk. Keep only node identity navigation.
+			if n.Status == model.StatusOrphaned {
+				continue
+			}
+			tokens := Tokenize(entry.Text)
+			if entry.Kind == model.KindPitfall || n.Status == model.StatusSuspect ||
+				n.PendingAnchor || entry.Confidence == model.ConfidenceSuspect || openDisputeEntries[id+"#"+entry.ID] {
+				addRisk(tokens)
+			} else {
+				addCurrent(tokens)
 			}
 		}
 	}
@@ -155,10 +196,12 @@ func Build(shards map[string][]model.Node, changes []model.Change, flows []model
 			e := &ref.Node.Entries[i]
 			from := id + "#" + e.ID
 			for _, dep := range e.BasedOn {
-				ix.basedOnRev[ix.ResolveEntryRef(dep)] = append(ix.basedOnRev[ix.ResolveEntryRef(dep)], from)
+				resolved := resolveEntryRef(dep)
+				ix.basedOnRev[resolved] = append(ix.basedOnRev[resolved], from)
 			}
 			for _, d := range e.Disputes {
-				ix.disputesRev[ix.ResolveEntryRef(d)] = append(ix.disputesRev[ix.ResolveEntryRef(d)], from)
+				resolved := resolveEntryRef(d)
+				ix.disputesRev[resolved] = append(ix.disputesRev[resolved], from)
 			}
 		}
 	}
@@ -217,23 +260,8 @@ func Build(shards map[string][]model.Node, changes []model.Change, flows []model
 // ResolveNodeIDs 仍代表现在；journal/flow 是历史制品，必须把新节点诞生前的
 // 引用送往 lineage 继承者，不能先被 exact ID 截走。
 func (ix *Index) resolveNodeIDsAt(id string, at time.Time) []string {
-	exact := ix.nodes[id]
-	heirs := ix.lineage[id]
-	if exact != nil {
-		if len(heirs) > 0 && exact.Node.Since.IsZero() {
-			out := []string{id}
-			return append(out, heirs...)
-		}
-		if len(heirs) > 0 && (at.IsZero() || (!exact.Node.Since.IsZero() && at.Before(exact.Node.Since))) {
-			return append([]string(nil), heirs...)
-		}
-		if exact.Node.Since.IsZero() || at.IsZero() || !at.Before(exact.Node.Since) {
-			return []string{id}
-		}
-		// 无 lineage 可承接的前任历史宁可不污染无关的新 exact 节点。
-		return nil
-	}
-	return append([]string(nil), heirs...)
+	resolved, _ := ix.ResolveNodeIDsAtContext(context.Background(), id, at, 0)
+	return resolved
 }
 
 // ---- 查询面 ----
@@ -276,6 +304,105 @@ func (ix *Index) ResolveNodeIDs(id string) []string {
 	return ix.lineage[id]
 }
 
+// ResolveNodeIDsAt 按历史制品时间解析节点归属。与普通 ResolveNodeIDs 不同，
+// 它会在旧 ID 后来被无关新节点复用时把旧 change/flow 送往 lineage heirs；
+// 拆分时返回全部现任 heirs。返回值是副本，可在只读锁外安全排序。
+func (ix *Index) ResolveNodeIDsAt(id string, at time.Time) []string {
+	resolved, _ := ix.ResolveNodeIDsAtContext(context.Background(), id, at, 0)
+	return resolved
+}
+
+// ResolveNodeIDsAtContext 是供有资源边界的派生索引构造使用的历史归属解析。
+// maxCandidates > 0 时在复制 lineage 前后都保证返回候选不超过该值；<=0 仅供
+// 既有同步调用保留无限制语义。超过上限必须显式失败，不能截断并静默漏掉 split heir。
+func (ix *Index) ResolveNodeIDsAtContext(ctx context.Context, id string, at time.Time, maxCandidates int) ([]string, error) {
+	if ctx == nil {
+		return nil, fmt.Errorf("index: resolve node IDs: nil context")
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	first, rest := ix.resolvedNodeIDsAtParts(id, at)
+	return copyResolvedNodeIDsContext(ctx, first, rest, maxCandidates)
+}
+
+// CountNodeIDsAtContext performs the same temporal selection as
+// ResolveNodeIDsAtContext without allocating the result slice. It is intended
+// for a global shape preflight that must authorize fan-out before DTO maps and
+// slices are created.
+func (ix *Index) CountNodeIDsAtContext(ctx context.Context, id string, at time.Time, maxCandidates int) (int, error) {
+	if ctx == nil {
+		return 0, fmt.Errorf("index: count node IDs: nil context")
+	}
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	first, rest := ix.resolvedNodeIDsAtParts(id, at)
+	total := len(rest)
+	if first != "" {
+		total++
+	}
+	if maxCandidates > 0 && total > maxCandidates {
+		return 0, fmt.Errorf("index: resolved node candidates %d exceed limit %d", total, maxCandidates)
+	}
+	for i := range rest {
+		if i&63 == 0 {
+			if err := ctx.Err(); err != nil {
+				return 0, err
+			}
+		}
+	}
+	return total, ctx.Err()
+}
+
+func (ix *Index) resolvedNodeIDsAtParts(id string, at time.Time) (string, []string) {
+	exact := ix.nodes[id]
+	heirs := ix.lineage[id]
+	switch {
+	case exact != nil && len(heirs) > 0 && exact.Node.Since.IsZero():
+		return id, heirs
+	case exact != nil && len(heirs) > 0 &&
+		(at.IsZero() || (!exact.Node.Since.IsZero() && at.Before(exact.Node.Since))):
+		return "", heirs
+	case exact != nil && (exact.Node.Since.IsZero() || at.IsZero() || !at.Before(exact.Node.Since)):
+		return id, nil
+	case exact != nil:
+		// 无 lineage 可承接的前任历史宁可不污染无关的新 exact 节点。
+		return "", nil
+	default:
+		return "", heirs
+	}
+}
+
+func copyResolvedNodeIDsContext(ctx context.Context, first string, rest []string, maxCandidates int) ([]string, error) {
+	total := len(rest)
+	if first != "" {
+		total++
+	}
+	if maxCandidates > 0 && total > maxCandidates {
+		return nil, fmt.Errorf("index: resolved node candidates %d exceed limit %d", total, maxCandidates)
+	}
+	if total == 0 {
+		return nil, ctx.Err()
+	}
+	out := make([]string, 0, total)
+	if first != "" {
+		out = append(out, first)
+	}
+	for i, id := range rest {
+		if i&63 == 0 {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+		}
+		out = append(out, id)
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // LooseMatch 宽松匹配(impl §3 定案):AI 报名精确失败后,忽略接收者/指针做
 // 归一匹配;唯一命中返回其 ID,多命中返回候选列表。
 func (ix *Index) LooseMatch(file, symbol string) (string, []string) {
@@ -298,72 +425,211 @@ func (ix *Index) LooseMatch(file, symbol string) (string, []string) {
 
 // ResolveEntryRef 归一化 "node-id#entry-id" 引用:节点沿 lineage、条目沿 supersedes 链。
 func (ix *Index) ResolveEntryRef(ref string) string {
+	resolved, _, err := ix.ResolveEntryContext(context.Background(), ref, 0)
+	if err != nil {
+		return ref
+	}
+	return resolved
+}
+
+// EntryResolver owns a request-local, lazily populated entry lookup. Reusing
+// one resolver across many disputes scans each candidate node's Entries at most
+// once; the Index and returned Entry pointers remain immutable.
+type EntryResolver struct {
+	ix     *Index
+	byNode map[string]map[string]*model.Entry
+}
+
+// NewEntryResolver creates a request-local resolver. Callers should construct
+// it only after their global source-shape budget has been authorized.
+func (ix *Index) NewEntryResolver() *EntryResolver { return &EntryResolver{ix: ix} }
+
+// ResolveEntryContext 一次完成 node lineage、entry supersedes 与最终条目查找，
+// 避免调用方先 ResolveEntryRef、再 EntryByRef 时重复整条解析。maxCandidates > 0
+// 时限制 exact node + unique lineage heirs 的总数；超过上限显式失败而不截断。
+// 返回的 Entry 指向发布后只读的 Index 快照，只能在该快照生命周期内读取。
+func (ix *Index) ResolveEntryContext(ctx context.Context, ref string, maxCandidates int) (string, *model.Entry, error) {
+	return ix.NewEntryResolver().ResolveContext(ctx, ref, maxCandidates)
+}
+
+// CheckEntryResolutionShapeContext validates the raw exact+lineage fan-out
+// without allocating a candidate set or scanning Entries. Duplicate lineage
+// declarations intentionally still count here: preflight is conservative and
+// malformed repetition must not bypass the source-build fan-out bound.
+func (ix *Index) CheckEntryResolutionShapeContext(ctx context.Context, ref string, maxCandidates int) error {
+	if ctx == nil {
+		return fmt.Errorf("index: check entry resolution: nil context")
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	nodeID, _ := splitEntryRef(ref)
+	if nodeID == "" {
+		return nil
+	}
+	total := len(ix.lineage[nodeID])
+	if ix.nodes[nodeID] != nil {
+		total++
+	}
+	if maxCandidates > 0 && total > maxCandidates {
+		return fmt.Errorf("index: entry candidate declarations %d exceed limit %d", total, maxCandidates)
+	}
+	for i := range ix.lineage[nodeID] {
+		if i&63 == 0 {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+		}
+	}
+	return ctx.Err()
+}
+
+// ResolveContext resolves through node lineage and entry supersedes while
+// reusing this resolver's per-node entry lookup.
+func (r *EntryResolver) ResolveContext(ctx context.Context, ref string, maxCandidates int) (string, *model.Entry, error) {
+	if ctx == nil {
+		return "", nil, fmt.Errorf("index: resolve entry: nil context")
+	}
+	if err := ctx.Err(); err != nil {
+		return "", nil, err
+	}
+	if r == nil || r.ix == nil {
+		return "", nil, fmt.Errorf("index: resolve entry: nil resolver")
+	}
+	ix := r.ix
 	nodeID, entryID := splitEntryRef(ref)
 	if nodeID == "" {
-		return ref
+		return ref, nil, nil
 	}
 	// Node ID 可能在迁移后被一个无关新符号复用。节点级解析此时应指向现任
 	// （ResolveNodeIDs 的既有语义），但稳定 entry 引用仍可能属于 lineage 继承者。
 	// 因此 entry 解析要同时查“现任同名节点 + 旧 ID 的全部继承者”。
-	candidates := append([]string(nil), ix.ResolveNodeIDs(nodeID)...)
-	for _, heir := range ix.lineage[nodeID] {
-		if !slices.Contains(candidates, heir) {
-			candidates = append(candidates, heir)
+	lineage := ix.lineage[nodeID]
+	capacity := len(lineage) + 1
+	if maxCandidates > 0 && capacity > maxCandidates {
+		capacity = maxCandidates
+	}
+	candidates := make([]string, 0, capacity)
+	seen := make(map[string]struct{}, capacity)
+	appendCandidate := func(candidate string) error {
+		if candidate == "" {
+			return nil
+		}
+		if _, duplicate := seen[candidate]; duplicate {
+			return nil
+		}
+		if maxCandidates > 0 && len(candidates) >= maxCandidates {
+			return fmt.Errorf("index: entry candidates exceed limit %d", maxCandidates)
+		}
+		seen[candidate] = struct{}{}
+		candidates = append(candidates, candidate)
+		return nil
+	}
+	if ix.nodes[nodeID] != nil {
+		if err := appendCandidate(nodeID); err != nil {
+			return "", nil, err
+		}
+	}
+	for i, heir := range lineage {
+		if i&63 == 0 {
+			if err := ctx.Err(); err != nil {
+				return "", nil, err
+			}
+		}
+		if err := appendCandidate(heir); err != nil {
+			return "", nil, err
 		}
 	}
 	if len(candidates) == 0 {
-		return ref
+		return ref, nil, nil
 	}
 	// 拆分时一个旧 node ID 可有多个继承者,条目只会被 remap 到其中一个。
 	// 必须先按 entry ID 在全部继承者中定位,不能先用 ResolveNodeID 固定选
 	// 字典序首个——否则 old#entry 会被归一到不含该条目的错误节点。
-	type match struct{ node, entry string }
-	var matches []match
-	for _, cur := range candidates {
-		if eid, ok := ix.resolveEntryInNode(cur, entryID); ok {
-			matches = append(matches, match{node: cur, entry: eid})
-		}
-	}
-	if len(matches) > 0 {
-		// 真正存在于现任同名节点的 exact entry 优先；稳定随机 entry ID 使它与
-		// 历史继承者碰撞的概率可忽略。现任不含该 entry 时才沿 lineage 追旧引用。
-		if ix.nodes[nodeID] != nil {
-			for _, m := range matches {
-				if m.node == nodeID {
-					return m.node + "#" + m.entry
-				}
+	bestNode, bestEntryID := "", ""
+	var bestEntry *model.Entry
+	for i, cur := range candidates {
+		if i&63 == 0 {
+			if err := ctx.Err(); err != nil {
+				return "", nil, err
 			}
 		}
-		sort.Slice(matches, func(i, j int) bool { return matches[i].node < matches[j].node })
-		return matches[0].node + "#" + matches[0].entry
+		eid, entry, ok, err := r.resolveEntryInNodeContext(ctx, cur, entryID)
+		if err != nil {
+			return "", nil, err
+		}
+		if !ok {
+			continue
+		}
+		// 真正存在于现任同名节点的 exact entry 优先；无需继续扫描 heirs。
+		if cur == nodeID && ix.nodes[nodeID] != nil {
+			return cur + "#" + eid, entry, nil
+		}
+		if bestNode == "" || cur < bestNode {
+			bestNode, bestEntryID, bestEntry = cur, eid, entry
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		return "", nil, err
+	}
+	if bestNode != "" {
+		return bestNode + "#" + bestEntryID, bestEntry, nil
 	}
 	// 保持原来的可诊断退化:节点能归一但条目不存在时,返回首个现任节点
 	// 加原 entry ID,由上层给出精确的“条目不在节点”错误。
-	return candidates[0] + "#" + entryID
+	return candidates[0] + "#" + entryID, nil, nil
 }
 
-// resolveEntryInNode 在单个现任节点内解析 supersedes 链。
-func (ix *Index) resolveEntryInNode(nodeID, entryID string) (string, bool) {
-	nref := ix.nodes[nodeID]
-	if nref == nil {
-		return "", false
-	}
-	byID := map[string]*model.Entry{}
-	for i := range nref.Node.Entries {
-		byID[nref.Node.Entries[i].ID] = &nref.Node.Entries[i]
+// resolveEntryInNodeContext 在单个现任节点内解析 supersedes 链。
+func (r *EntryResolver) resolveEntryInNodeContext(ctx context.Context, nodeID, entryID string) (string, *model.Entry, bool, error) {
+	byID, err := r.entriesByNodeContext(ctx, nodeID)
+	if err != nil {
+		return "", nil, false, err
 	}
 	eid := entryID
 	if byID[eid] == nil {
-		return "", false
+		return "", nil, false, nil
 	}
 	for range 32 {
+		if err := ctx.Err(); err != nil {
+			return "", nil, false, err
+		}
 		e, ok := byID[eid]
 		if !ok || e.SupersededBy == "" {
 			break
 		}
 		eid = e.SupersededBy
 	}
-	return eid, true
+	return eid, byID[eid], true, nil
+}
+
+func (r *EntryResolver) entriesByNodeContext(ctx context.Context, nodeID string) (map[string]*model.Entry, error) {
+	if r.byNode != nil {
+		if byID, ok := r.byNode[nodeID]; ok {
+			return byID, nil
+		}
+	}
+	nref := r.ix.nodes[nodeID]
+	if nref == nil {
+		return nil, nil
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	byID := make(map[string]*model.Entry, len(nref.Node.Entries))
+	for i := range nref.Node.Entries {
+		if i&63 == 0 {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+		}
+		byID[nref.Node.Entries[i].ID] = &nref.Node.Entries[i]
+	}
+	if r.byNode == nil {
+		r.byNode = make(map[string]map[string]*model.Entry)
+	}
+	r.byNode[nodeID] = byID
+	return byID, ctx.Err()
 }
 
 // DisputedBy 返回声明与该条目矛盾的条目引用(归一化;knowledge.md §12.4)。
@@ -377,20 +643,11 @@ func (ix *Index) DisputedBy(entryRef string) []string {
 
 // EntryByRef 按 "node-id#entry-id" 引用取条目(沿 lineage/supersedes 归一;查无 nil)。
 func (ix *Index) EntryByRef(ref string) *model.Entry {
-	nodeID, entryID := splitEntryRef(ix.ResolveEntryRef(ref))
-	if nodeID == "" {
+	_, entry, err := ix.ResolveEntryContext(context.Background(), ref, 0)
+	if err != nil {
 		return nil
 	}
-	nref := ix.nodes[nodeID]
-	if nref == nil {
-		return nil
-	}
-	for i := range nref.Node.Entries {
-		if nref.Node.Entries[i].ID == entryID {
-			return &nref.Node.Entries[i]
-		}
-	}
-	return nil
+	return entry
 }
 
 // Dependents 沿 basedOn 反向图取直接+间接依赖者(级联污染回收,knowledge.md §12.5)。
@@ -469,6 +726,21 @@ type Hit struct {
 // R29 批次5:精确 token 命中 < 3 时,回退 trigram 近似匹配(auth↔authentication、
 // loginLockout↔login lockout)。trigram 分数与精确分加权合并。
 func (ix *Index) Search(query string, limit int) []Hit {
+	return ix.searchTokenMaps(query, limit, ix.inverted, ix.trigram)
+}
+
+// SearchCurrent 只检索当前事实文本和节点 ID/路径/符号/keywords 导航。
+// 风险条目不会因为词面命中而被提升为当前结论。
+func (ix *Index) SearchCurrent(query string, limit int) []Hit {
+	return ix.searchTokenMaps(query, limit, ix.invertedCurrent, ix.trigramCurrent)
+}
+
+// SearchRisk 只检索 pitfall、suspect 节点/条目、活跃未裁决 dispute 双方的文本。
+func (ix *Index) SearchRisk(query string, limit int) []Hit {
+	return ix.searchTokenMaps(query, limit, ix.invertedRisk, ix.trigramRisk)
+}
+
+func (ix *Index) searchTokenMaps(query string, limit int, inverted, trigram map[string]map[string]bool) []Hit {
 	if limit <= 0 {
 		limit = 10
 	}
@@ -476,7 +748,7 @@ func (ix *Index) Search(query string, limit int) []Hit {
 	scores := map[string]int{}
 	exactHits := 0
 	for _, tok := range tokens {
-		for id := range ix.inverted[tok] {
+		for id := range inverted[tok] {
 			scores[id] += 2 // 精确命中权重 2
 			exactHits++
 		}
@@ -488,7 +760,7 @@ func (ix *Index) Search(query string, limit int) []Hit {
 				continue
 			}
 			for _, tg := range trigrams(tok) {
-				for id := range ix.trigram[tg] {
+				for id := range trigram[tg] {
 					scores[id]++ // trigram 权重 1
 				}
 			}
@@ -512,6 +784,29 @@ func (ix *Index) Search(query string, limit int) []Hit {
 		hits = hits[:limit]
 	}
 	return hits
+}
+
+func addSearchTokens(id string, tokens []string, inverted, trigram map[string]map[string]bool) {
+	for _, tok := range tokens {
+		set := inverted[tok]
+		if set == nil {
+			set = map[string]bool{}
+			inverted[tok] = set
+		}
+		set[id] = true
+		// trigram:对长度≥3 的 token 取所有三字母组(小写归一)。
+		if len(tok) < 3 {
+			continue
+		}
+		for _, tg := range trigrams(tok) {
+			tgSet := trigram[tg]
+			if tgSet == nil {
+				tgSet = map[string]bool{}
+				trigram[tg] = tgSet
+			}
+			tgSet[id] = true
+		}
+	}
 }
 
 // trigrams 取小写归一化的所有三字母组(loginLockout → [log, ogi, gin, ...])。

@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/zdypro888/iknowledge/internal/engine"
+	"github.com/zdypro888/iknowledge/internal/store"
 )
 
 func TestLoopbackDialAddrNormalizesWildcard(t *testing.T) {
@@ -33,7 +34,8 @@ func TestLoopbackDialAddrNormalizesWildcard(t *testing.T) {
 }
 
 // TestServeMultiRepo:多 repo 单守护 e2e(impl §1 修订)——一个 runServe 进程
-// 服务两个仓库,各自端口各答各的 repoRoot(连错仓库防护);SIGINT 优雅停机退出 0。
+// 服务两个 enabled semantic 仓库，resident 上限合计恰为 1024MiB；
+// 各端口各答各的 repoRoot，SIGINT 优雅停机退出 0。
 func TestServeMultiRepo(t *testing.T) {
 	repos := make([]string, 2)
 	ports := make([]int, 2)
@@ -54,6 +56,23 @@ func TestServeMultiRepo(t *testing.T) {
 			t.Fatal(err)
 		}
 		repos[i] = repo
+	}
+	// setupGitRepo 会为每次调用隔离 state home；多仓进程必须共享一个
+	// process state root，故所有仓准备完后统一切换并写各自 canonical 配置。
+	t.Setenv("IKNOWLEDGE_STATE_HOME", t.TempDir())
+	for _, repo := range repos {
+		s, err := store.Open(repo)
+		if err != nil {
+			t.Fatal(err)
+		}
+		semanticCfg := engine.DefaultSemanticSettings()
+		semanticCfg.Enabled = true
+		semanticCfg.Endpoint = "http://127.0.0.1:11434/v1"
+		semanticCfg.Model = "serve-budget-test"
+		semanticCfg.MaxVectorMiB = 512
+		if err := engine.SaveSemanticSettings(s, semanticCfg); err != nil {
+			t.Fatal(err)
+		}
 	}
 
 	code := make(chan int, 1)

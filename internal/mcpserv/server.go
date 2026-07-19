@@ -50,8 +50,9 @@ type Server struct {
 }
 
 type session struct {
-	author   string
-	lastSeen time.Time
+	author                string
+	lastSeen              time.Time
+	semanticSyncAttempted bool
 }
 
 type localAuthChallenge struct {
@@ -512,6 +513,28 @@ func (s *Server) author(sid string) string {
 	return "anonymous"
 }
 
+// claimSemanticSync 把“每个 MCP 会话最多一次 semantic sync”从提示词纪律
+// 提升为服务端不变量。即使第一次因 provider 瞬时故障失败，也不允许 AI 在同一
+// 会话里自动重试并反复产生费用；用户仍可显式通过 CLI 重建，或在新会话先重新
+// 查看 kb_status 后再按持久策略决定。
+func (s *Server) claimSemanticSync(sid string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	sess, ok := s.sessions[sid]
+	if !ok {
+		return &engine.KBError{Code: "SESSION_NOT_FOUND", Msg: "MCP 会话不存在", Hint: "重新 initialize 后先调用 kb_status"}
+	}
+	if sess.semanticSyncAttempted {
+		return &engine.KBError{
+			Code: "SEMANTIC_SYNC_ALREADY_ATTEMPTED",
+			Msg:  "本 MCP 会话已经尝试过一次 semantic sync",
+			Hint: "不要自动重试；查看 kb_status。需要人工重试时使用 CLI semantic rebuild",
+		}
+	}
+	sess.semanticSyncAttempted = true
+	return nil
+}
+
 // handleToolCall 分发 + 使用日志(impl §7.6)。
 func (s *Server) handleToolCall(ctx context.Context, w http.ResponseWriter, req rpcRequest, role, sid string) {
 	var p struct {
@@ -578,8 +601,29 @@ func (s *Server) dispatch(ctx context.Context, name string, args json.RawMessage
 		return rep.Text(), meta, nil
 
 	case "kb_status":
-		text, err := s.E.Status()
+		text, err := s.E.StatusContext(ctx)
 		return text, meta, err
+
+	case "kb_semantic":
+		var a struct {
+			Action string `json:"action"`
+		}
+		if err := un(&a); err != nil {
+			return "", meta, kbInvalid(err)
+		}
+		switch a.Action {
+		case "status":
+			text, err := s.E.SemanticStatusTextContext(ctx)
+			return text, meta, err
+		case "sync":
+			if err := s.claimSemanticSync(sid); err != nil {
+				return "", meta, err
+			}
+			text, err := s.E.SyncSemantic(ctx)
+			return text, meta, err
+		default:
+			return "", meta, &engine.KBError{Code: "INVALID_ARGUMENT", Msg: "非法 semantic action " + a.Action, Hint: "action ∈ status|sync"}
+		}
 
 	case "kb_map":
 		var a struct {
@@ -658,7 +702,7 @@ func (s *Server) dispatch(ctx context.Context, name string, args json.RawMessage
 		if err := un(&a); err != nil {
 			return "", meta, kbInvalid(err)
 		}
-		text, err := s.E.Task(a, sid, author)
+		text, err := s.E.TaskContext(ctx, a, sid, author)
 		return text, meta, err
 
 	case "kb_flow":
@@ -757,7 +801,7 @@ func (s *Server) serveStatus(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusMethodNotAllowed)
 		return
 	}
-	out, err := s.E.Status()
+	out, err := s.E.StatusContext(r.Context())
 	writeReadOnly(w, out, err)
 }
 

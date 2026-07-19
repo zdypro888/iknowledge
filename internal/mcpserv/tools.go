@@ -31,7 +31,7 @@ func toolDefs(role string) []any {
 }
 
 var toolOrder = []string{
-	"kb_init", "kb_status", "kb_map", "kb_recall", "kb_diagnose", "kb_remember", "kb_record_change",
+	"kb_init", "kb_status", "kb_semantic", "kb_map", "kb_recall", "kb_diagnose", "kb_remember", "kb_record_change",
 	"kb_verify", "kb_revert", "kb_task", "kb_investigate", "kb_submit_findings", "kb_adopt",
 	"kb_flow", "kb_maintain", "kb_session",
 }
@@ -62,8 +62,15 @@ var allTools = map[string]any{
 	},
 	"kb_status": map[string]any{
 		"name":        "kb_status",
-		"description": "库状态:覆盖率、suspect/孤儿/冲突分片、使用日志汇总、活跃任务、维护欠账。",
+		"description": "库状态:覆盖率、suspect/孤儿/冲突分片、使用日志、任务/维护欠账及 semantic 健康。每会话先读它。semantic 检查纯本地；provider=unchecked 表示未联网探测，不是故障。只有 next_action 明确为 kb_semantic action=sync 且 policy=ai-local/ai-remote 时才允许 AI 同步；其他情况不要重复配置或同步。",
 		"inputSchema": obj(map[string]any{}),
+	},
+	"kb_semantic": map[string]any{
+		"name":        "kb_semantic",
+		"description": "semantic 本地状态/同步。status 永不联网；sync 只在 kb_status 的 next_action 明确为 kb_semantic action=sync，且用户已通过 CLI 持久授权 ai-local/ai-remote 时重建派生索引。每会话最多 sync 一次；ready/none 不调用。绝不修改 endpoint/model/profile/policy、下载或切换模型、开启远端外发。",
+		"inputSchema": obj(map[string]any{
+			"action": map[string]any{"type": "string", "enum": []string{"status", "sync"}, "description": "status=纯本地健康；sync=按既有授权同步"},
+		}, "action"),
 	},
 	"kb_map": map[string]any{
 		"name":        "kb_map",
@@ -198,8 +205,8 @@ var allTools = map[string]any{
 				}, "node"), "有序步骤(主题节点可空)"),
 				"conventions":  arr(str(""), "全局约定"),
 				"troubleshoot": str("排障入口说明"),
-			}, "id", "title"),
-		}, "action", "flow"),
+			}),
+		}, "action"),
 	},
 	"kb_maintain": map[string]any{
 		"name":        "kb_maintain",

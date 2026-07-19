@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"context"
 	"fmt"
 	"sort"
 	"strings"
@@ -83,6 +84,10 @@ func (e *Engine) Precheck(files, accountedNodes, deletedFiles []string) (Prechec
 	}
 	e.rt.mu.RLock()
 	defer e.rt.mu.RUnlock()
+	inactive, err := inactiveChanges(e.rt.ix.Changes())
+	if err != nil {
+		return report, err
+	}
 	accountedFiles := e.precheckAccountedFilesLocked(accountedNodes)
 	deleted := map[string]bool{}
 	for _, input := range deletedFiles {
@@ -114,7 +119,7 @@ func (e *Engine) Precheck(files, accountedNodes, deletedFiles []string) (Prechec
 				Message: "本次新增 journal 记录未覆盖该源码;完成 kb_record_change 后把对应记录一并纳入提交。",
 			})
 		}
-		e.precheckFileLocked(&report, rel, nodeIDs, deleted[rel])
+		e.precheckFileLocked(&report, rel, nodeIDs, deleted[rel], inactive)
 	}
 	sort.Strings(report.Files)
 	sort.SliceStable(report.Warnings, func(i, j int) bool {
@@ -149,7 +154,7 @@ func (e *Engine) precheckAccountedFilesLocked(nodes []string) map[string]bool {
 	return out
 }
 
-func (e *Engine) precheckFileLocked(report *PrecheckReport, file string, nodeIDs []string, deleted bool) {
+func (e *Engine) precheckFileLocked(report *PrecheckReport, file string, nodeIDs []string, deleted bool, inactive map[string]bool) {
 	var stale, deletedOrphans, landmines, pitfalls, disputes, rejected []string
 	disputeSeen := map[string]bool{}
 	history := map[string]model.Change{}
@@ -207,8 +212,8 @@ func (e *Engine) precheckFileLocked(report *PrecheckReport, file string, nodeIDs
 		}
 	}
 
-	// 追加账本的撤销/推翻语义按时间重放,只呈现当前仍生效决策里的负知识。
-	inactive := inactiveChanges(e.rt.ix.Changes())
+	// 只呈现当前仍生效决策里的负知识。inactive 已从完整 journal 的
+	// revert 生效图与 overturn 决策图计算一次，不能按单文件历史局部猜测。
 	var changes []model.Change
 	for _, c := range history {
 		changes = append(changes, c)
@@ -260,24 +265,216 @@ func addPrecheckDispute(out *[]string, seen map[string]bool, a, b string) {
 	*out = append(*out, a+" ↔ "+b)
 }
 
-func inactiveChanges(changes []model.Change) map[string]bool {
-	byID := map[string]model.Change{}
-	inactive := map[string]bool{}
-	for _, c := range changes {
-		byID[c.ID] = c
+func inactiveChanges(changes []model.Change) (map[string]bool, error) {
+	return inactiveChangesContext(context.Background(), changes)
+}
+
+func inactiveChangesContext(ctx context.Context, changes []model.Change) (map[string]bool, error) {
+	if ctx == nil {
+		return nil, fmt.Errorf("inactive changes: nil context")
 	}
-	for _, c := range changes {
-		if c.Overturns != "" {
-			inactive[c.Overturns] = true
+	checks := 0
+	check := func() error {
+		checks++
+		if checks&63 == 0 {
+			return ctx.Err()
 		}
-		if c.Reverts != "" {
-			inactive[c.Reverts] = true
-			if target, ok := byID[c.Reverts]; ok && target.Overturns != "" {
-				delete(inactive, target.Overturns) // 撤销一次推翻会恢复被它推翻的决策。
+		return nil
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	byID := make(map[string]int, len(changes))
+	revertedBy := make(map[string][]string)
+	for i, change := range changes {
+		if err := check(); err != nil {
+			return nil, err
+		}
+		if change.ID == "" {
+			return nil, fmt.Errorf("journal change 缺少 ID，无法计算决策生效状态")
+		}
+		if _, duplicate := byID[change.ID]; duplicate {
+			return nil, fmt.Errorf("journal change ID %s 重复，无法计算决策生效状态", change.ID)
+		}
+		byID[change.ID] = i
+		if change.Reverts != "" {
+			revertedBy[change.Reverts] = append(revertedBy[change.Reverts], change.ID)
+		}
+	}
+	for target, children := range revertedBy {
+		if err := check(); err != nil {
+			return nil, err
+		}
+		if _, ok := byID[target]; !ok {
+			return nil, fmt.Errorf("journal revert 指向不存在的 change %s", target)
+		}
+		if err := contextSortStrings(ctx, children); err != nil {
+			return nil, err
+		}
+		revertedBy[target] = children
+	}
+	// LoadJournal sorts equal timestamps by random-suffixed ID, so slice
+	// position is not append order for records created in the same clock tick.
+	// Use time when available and fall back to the indexed input position only
+	// for legacy zero timestamps; cycles are rejected independently below.
+	for i, change := range changes {
+		if err := check(); err != nil {
+			return nil, err
+		}
+		for _, ref := range []struct{ kind, target string }{{"revert", change.Reverts}, {"overturn", change.Overturns}} {
+			if ref.target == "" {
+				continue
+			}
+			if ref.target == change.ID {
+				return nil, fmt.Errorf("journal %s 不能指向自身 change %s", ref.kind, change.ID)
+			}
+			targetIndex := byID[ref.target]
+			target := changes[targetIndex]
+			if (!change.At.IsZero() && !target.At.IsZero() && target.At.After(change.At)) ||
+				((change.At.IsZero() || target.At.IsZero()) && targetIndex >= i) {
+				return nil, fmt.Errorf("journal %s 必须指向更早的 change %s", ref.kind, ref.target)
 			}
 		}
 	}
-	return inactive
+	// Validate every historical reference, including one whose own change is
+	// later reverted. A malformed inactive overturn is still ambiguous truth;
+	// silently accepting it would make history cards and future revert parity
+	// depend on whether an unrelated descendant happens to be active today.
+	for _, change := range changes {
+		if err := check(); err != nil {
+			return nil, err
+		}
+		if change.Overturns != "" {
+			if _, ok := byID[change.Overturns]; !ok {
+				return nil, fmt.Errorf("journal overturn 指向不存在的 change %s", change.Overturns)
+			}
+		}
+	}
+	ids := make([]string, 0, len(byID))
+	for id := range byID {
+		if err := check(); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	if err := contextSortStrings(ctx, ids); err != nil {
+		return nil, err
+	}
+	// Reverts and Overturns have different effect semantics, but both assert a
+	// dependency on an already-existing decision. Validate their union so an
+	// equal-time mixed cycle cannot make each record impossibly depend on the
+	// other while evading the per-effect evaluators below.
+	dependencyState := make(map[string]uint8, len(changes))
+	type dependencyFrame struct {
+		id   string
+		next int
+	}
+	for _, root := range ids {
+		if dependencyState[root] == 2 {
+			continue
+		}
+		dependencyState[root] = 1
+		stack := []dependencyFrame{{id: root}}
+		for len(stack) > 0 {
+			if err := check(); err != nil {
+				return nil, err
+			}
+			top := &stack[len(stack)-1]
+			change := changes[byID[top.id]]
+			targets := [2]string{change.Reverts, change.Overturns}
+			for top.next < len(targets) && targets[top.next] == "" {
+				top.next++
+			}
+			if top.next == len(targets) {
+				dependencyState[top.id] = 2
+				stack = stack[:len(stack)-1]
+				continue
+			}
+			target := targets[top.next]
+			top.next++
+			switch dependencyState[target] {
+			case 1:
+				return nil, fmt.Errorf("journal 决策依赖链存在环，涉及 change %s", target)
+			case 2:
+				continue
+			default:
+				dependencyState[target] = 1
+				stack = append(stack, dependencyFrame{id: target})
+			}
+		}
+	}
+
+	// applied answers whether a change's effects currently apply. Only Reverts
+	// participates in this graph: overturning a decision does not undo that
+	// change's side effects. A change is unapplied iff at least one currently
+	// applied revert targets it. Memoized DFS handles revert-of-revert parity
+	// without relying on journal order or timestamps.
+	state := make(map[string]uint8, len(changes)) // 0 unseen, 1 visiting, 2 done
+	applied := make(map[string]bool, len(changes))
+	type appliedFrame struct {
+		id     string
+		next   int
+		active bool
+	}
+	for _, root := range ids {
+		if state[root] == 2 {
+			continue
+		}
+		state[root] = 1
+		stack := []appliedFrame{{id: root, active: true}}
+		for len(stack) > 0 {
+			if err := check(); err != nil {
+				return nil, err
+			}
+			top := &stack[len(stack)-1]
+			children := revertedBy[top.id]
+			if top.next == len(children) {
+				state[top.id] = 2
+				applied[top.id] = top.active
+				stack = stack[:len(stack)-1]
+				continue
+			}
+			child := children[top.next]
+			switch state[child] {
+			case 1:
+				return nil, fmt.Errorf("journal revert 链存在环，涉及 change %s", child)
+			case 2:
+				if applied[child] {
+					top.active = false
+				}
+				top.next++
+			default:
+				state[child] = 1
+				stack = append(stack, appliedFrame{id: child, active: true})
+			}
+		}
+	}
+
+	inactive := make(map[string]bool, len(changes))
+	for id, active := range applied {
+		if err := check(); err != nil {
+			return nil, err
+		}
+		if !active {
+			inactive[id] = true
+		}
+	}
+	// An applied overturn marks its target decision historical. Even if the
+	// overturning decision is itself later overturned, its effects continue;
+	// only an applied Reverts record can unapply it and restore its target.
+	for _, change := range changes {
+		if err := check(); err != nil {
+			return nil, err
+		}
+		if change.Overturns == "" || !applied[change.ID] {
+			continue
+		}
+		inactive[change.Overturns] = true
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return inactive, nil
 }
 
 func shortChangeID(id string) string {

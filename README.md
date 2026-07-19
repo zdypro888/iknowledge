@@ -20,7 +20,7 @@ Two iron laws: **knowledge navigates, source code decides** (the knowledge base 
 curl -fsSL https://raw.githubusercontent.com/zdypro888/iknowledge/main/install.sh | sh
 ```
 
-The installer does three things: installs a **checksummed prebuilt binary** when one is available (no Go toolchain needed; a missing checksum, missing verifier, or mismatch is never accepted), falls back to `go install` when no verified asset can be used, and installs the [`kb-bootstrap`](skills/kb-bootstrap/SKILL.md) skill into Claude Code (`~/.claude/skills/`) plus Codex (`~/.codex/skills/`) when detected. The release workflow builds macOS, Linux, and Windows for both amd64 and arm64. Set `IKNOWLEDGE_BIN` for a custom binary directory or `IKNOWLEDGE_FORCE_SOURCE=1` to build from source explicitly.
+The installer prefers prebuilt assets (no Go toolchain required): both the binary and `kb-bootstrap-SKILL.md` come from the same fully published immutable tag and must match that Release's `sha256sums.txt`. A Release stays draft until every asset is uploaded; a missing entry, missing verifier, or mismatch is never accepted. Only when no verified asset is usable does it fall back to `go install`, first trying to freeze `@latest` to a concrete module version (`IKNOWLEDGE_SOURCE_REF=vX.Y.Z` can make that explicit). Before committing files it validates PATH shadows, controlled aliases, the binary's self-reported version, and both staged skills. If `~/.local/bin` is not on PATH and no safe `/usr/local/bin` entry can be created, it asks you to add PATH and rerun. Every pre-commit failure preserves the old binary and skills; a rare post-replacement alias/stop failure is reported loudly while the same-version skill is retained, and rerunning after fixing the exact path converges. Skills go to Claude Code (`~/.claude/skills/`) and Codex (`~/.codex/skills/`) when detected; releases cover macOS, Linux, and Windows on amd64/arm64. Set `IKNOWLEDGE_BIN` for a custom directory or `IKNOWLEDGE_FORCE_SOURCE=1` for an explicit source build. On Unix, graceful `TERM` is sent only to the current UID's `serve` processes launched through exact controlled paths, followed by KeepAlive-respawn sweeps; the installer never kills by process name. On Windows, close that exact executable if replacement reports it busy and rerun under Git Bash/MSYS2.
 
 Then, inside any project, tell **Claude Code or Codex**: **"initialize the knowledge base for this project"**. The AI builds the skeleton, writes all integration config for you (the Claude Code trio + Codex's `config.toml`/`AGENTS.md`) and verifies connectivity (both clients field-tested). After restarting the session, the `kb_*` tools and hook injection are live; the server is auto-started on demand by the stdio bridge, so even a machine reboot needs no attention.
 
@@ -47,7 +47,7 @@ iknowledge setup --repo /path/to/your/repo
 
 | Where | What | Why |
 |---|---|---|
-| `.mcp.json` | MCP stdio bridge (`command: iknowledge stdio`) | The agent sees the 16 `kb_*` tools; the bridge auto-starts the background serve on demand — zero service management (required) |
+| `.mcp.json` | MCP stdio bridge (`command: iknowledge stdio`) | The agent sees the 17 `kb_*` tools; the bridge auto-starts the background serve on demand — zero service management (required) |
 | `CLAUDE.md` | Discipline prompt | The working rules for the AI: query before locating, record after changing, distill what was hard-won (required) |
 | `.claude/settings.json` | Hook snippet | Every time the AI Reads/Edits a file, that file's knowledge + staleness alerts are injected into context automatically (recommended) |
 | `~/.codex/config.toml` + repo `AGENTS.md` | Codex MCP + discipline | Codex integration when that host is used (optional) |
@@ -66,7 +66,7 @@ macOS (launchd): save as `~/Library/LaunchAgents/com.iknowledge.serve.plist`, th
 <plist version="1.0"><dict>
   <key>Label</key><string>com.iknowledge.serve</string>
   <key>ProgramArguments</key><array>
-    <string>/Users/you/go/bin/iknowledge</string>
+    <string>/Users/you/.local/bin/iknowledge</string>
     <string>serve</string>
     <string>--repo</string><string>/path/to/repoA</string>
     <string>--repo</string><string>/path/to/repoB</string>
@@ -83,7 +83,7 @@ Linux (systemd user unit): save as `~/.config/systemd/user/iknowledge.service`, 
 Description=iknowledge knowledge MCP
 
 [Service]
-ExecStart=%h/go/bin/iknowledge serve --repo /path/to/repoA --repo /path/to/repoB
+ExecStart=%h/.local/bin/iknowledge serve --repo /path/to/repoA --repo /path/to/repoB
 Restart=on-failure
 
 [Install]
@@ -91,6 +91,8 @@ WantedBy=default.target
 ```
 
 </details>
+
+The paths above match the installer's default. If you set `IKNOWLEDGE_BIN`, use that same absolute path in launchd/systemd so upgrades can identify the exact managed executable.
 
 ## Day-to-day usage
 
@@ -114,7 +116,7 @@ A screen full of `undigested` right after init is **by design**: skeleton first,
 
 You never manage the server: the stdio bridge auto-starts the background serve on demand. Internal clients always verify the current loopback listener with a mutual-HMAC challenge and send only a scope-bound short-lived session; the long-term local identity is never sent to an unknown port. If Bearer auth was enabled before reboot, its user-private token also preserves that mode and the bridge restarts `serve --auth`. And even if everything is down, the AI just works normally and the hook stays silently inert.
 
-## The 16 tools at a glance
+## The 17 tools at a glance
 
 | Kind | Tool | One-liner |
 |---|---|---|
@@ -131,7 +133,8 @@ You never manage the server: the stdio bridge auto-starts the background serve o
 | State | `kb_session` | Current-session summary and end-of-task gate for missing distillation / accounting risks |
 | Scout | `kb_investigate` | Dispatch a disposable scout to locate things repo-wide; only conclusions come back — the main context stays clean |
 | Scout | `kb_submit_findings` | The scout's report-back exit |
-| Maint | `kb_status` | Library health: coverage / suspects / orphans / debts / hotspot list |
+| Maint | `kb_status` | Library health: coverage / suspects / orphans / debts / hotspots plus local-only semantic health and its exact next action |
+| Maint | `kb_semantic` | Local-only `status`, or one policy-authorized `sync`; it never configures, installs, downloads, or switches a model |
 | Maint | `kb_maintain` | Claim maintenance debts (stale summaries, likely duplicates, pending re-verification, open disputes…); `patrol` returns a cross-node conflict-patrol brief |
 | Maint | `kb_init` | In-library init/reconcile (equivalent to CLI init) |
 
@@ -142,7 +145,8 @@ You never manage the server: the stdio bridge auto-starts the background serve o
 # (stops the server, deletes .knowledge/, removes every integration trace; asks for confirmation first)
 "uninstall this project's knowledge base"
 
-# Machine level: removes the binary (including IKNOWLEDGE_BIN) and both skills, stops all running serves
+# Machine level: removes the binary (including IKNOWLEDGE_BIN) and both skills;
+# safely stops only serves launched from that exact install path
 curl -fsSL https://raw.githubusercontent.com/zdypro888/iknowledge/main/uninstall.sh | sh
 ```
 
@@ -155,15 +159,25 @@ Do the per-project sentence first, then the machine-level script (reversed order
 - **Should I "analyze the whole repo" first?** No. init builds only the structural skeleton (AST, free); semantic knowledge grows on demand. Bulk digestion is expensive, shallow, and starts rotting immediately — see "Cold start: a tower with holes" in the design docs.
 - **What if the knowledge is wrong?** When the AI reads the source and finds a conflict, discipline says the source wins and it files a `kb_verify refute`; entries derived from the refuted one are cascade-downgraded to suspect. When two entries contradict each other and can't be settled on the spot, a *dispute* can be registered — both sides stay visible, each flagged "don't trust until adjudicated". Upgrading to *verified* is symmetric: `confirm` requires evidence too and leaves a journal record, so unverified claims can't be laundered into trusted ones. For contradictions living on *different* nodes, `kb_maintain patrol` clusters same-keyword knowledge across nodes into one brief for side-by-side adjudication.
 - **Does knowledge go stale when code changes?** Yes — and the system knows. The anchor hash detects rot; a name-insensitive structural hash finds rename/move candidates; and a doc-sensitive migration guard prevents a rename combined with a contract change from being silently declared fresh. Ambiguous or unprovable migrations preserve the knowledge but mark it `suspect` pending re-verification. Re-reading a changed node within a session raises a staleness alert, and suspects enter the maintenance-debt queue.
-- **Does semantic/vector search upload my repository or require another MCP server?** An optional **preview is implemented and disabled by default**. Opt in per repository with `iknowledge semantic configure --endpoint … --model …`, then explicitly run `iknowledge semantic rebuild`; configure/enable/status never contact the provider, and a stale or unavailable semantic index falls back to the existing lexical/structural search. Loopback Ollama and remote OpenAI-compatible endpoints are direct HTTP providers inside iknowledge, not third-party MCP servers. The index contains only redacted active knowledge summaries/era summaries — never source-code chunks. Endpoint/model/dimensions/revision/enabled and bounded ranking/resource settings live only in canonical-repository-scoped user-private state; tracked config, bundles, and MCP arguments cannot enable or redirect outbound traffic. A remote API key is read only from `IKNOWLEDGE_EMBEDDING_API_KEY`. Eino is an implementation reference, not a dependency; iknowledge uses its own standard-library HTTP Embedder provider and local Flat snapshot. See [`vecdb.md`](vecdb.md) for the immutable-generation, hybrid-ranking, resource, security, and evaluation contract.
+- **Does semantic/vector search upload my repository or require another MCP server?** An optional **preview is implemented and disabled by default**. Loopback Ollama and remote OpenAI-compatible endpoints are direct HTTP providers inside iknowledge — **not a third-party MCP server** — and Eino remains an architectural reference, not a dependency. Configuration is written once to canonical-repository-scoped user-private state and survives MCP sessions/process restarts; another clone/path gets a separate safe partition. `--query-profile auto` is concretized on save (`qwen3-code-v1` for Qwen3 Embedding, otherwise `plain`) rather than re-guessed on every call. iknowledge never installs Ollama, downloads a model, or silently changes one.
+
+  The derived index contains redacted `current`, `risk`, and `history` knowledge cards — contracts/usages, pitfalls/disputes/active rejections/stale flow references, and decision history/eras/overturns — never source-code chunks. One Flat scan returns an independent distinct-node Top-K for each lane: only `current` joins lexical RRF, while risk/history remain advisory. Exact risk wording is also kept in a separate deterministic lexical lane. At task start, every directly touched current heir is checked against typed cards and exact truth; a deterministic one-hop scope is also checked up to 100 nodes. Direct risks therefore cannot hide behind Top-K, a split's second heir, paraphrased wording, or a disabled embedding model. Wider one-hop truncation is reported explicitly instead of being presented as a clean bill of health; the response expands at most 20 direct and 6 other warnings and lists omitted directly touched node IDs for exact review. Candidate headers never print an unvalidated summary; exact node down-drill presents entry confidence and disputes. A source change enters safe `partial` mode: only old records whose ID, node, lane, and source hash still match the current manifest are reused. Rebuild batches pair document- and query-mode canaries in the same provider request to detect common accidental model drift and reject an inconsistent mixed generation. This is not remote model attestation; strong identity still requires a trusted endpoint and immutable revision. The decision firewall never blocks or adjudicates.
+
+  Rebuild authorization is explicit and persistent: `manual` (default), loopback-only `ai-local`, or HTTPS-remote `ai-remote`. `kb_status` reports local semantic health without contacting the provider. Only when its `next_action` says `kb_semantic action=sync` and the user previously selected an AI policy may the agent sync once in that MCP session; it can never edit endpoint/model/profile/policy. The server enforces the one-attempt limit atomically: even a failed first sync consumes that session's attempt, and a duplicate returns `SEMANTIC_SYNC_ALREADY_ATTEMPTED` before any provider request. MCP sync also has an 8-minute, 3,000-source-card/100-batch ceiling; an oversized local source makes status point straight to user-run CLI rebuild instead of wasting the one attempt. Manual CLI `semantic rebuild` remains available. A remote API key is read only from `IKNOWLEDGE_EMBEDDING_API_KEY`; when non-empty, `IKNOWLEDGE_EMBEDDING_API_ORIGIN` must bind its one canonical origin so a multi-repo daemon cannot send it to another service. These variables must be inherited by the process that actually makes the HTTP request: the current shell for a manual CLI rebuild, or the long-lived `serve`/desktop AI host for MCP sync and recall. Exporting them in a different terminal does not modify an already-running daemon, and GUI-launched desktop apps generally do not inherit later shell exports; configure the secret in the launchd/systemd/desktop-host environment and restart that host/serve instead of writing it into the repository. Multi-repo startup and hot runtime changes additionally share a 1GiB vector budget, one provider slot, and two Flat-scan slots; hot enable, replacement, clear, and disable all participate in reserve/release, so repository count cannot multiply memory or remote cost without bound. See [`vecdb.md`](vecdb.md) for the complete contract.
+
+  Typed source manifests have a separate daemon-wide `384 MiB` logical budget: steady caches are charged by a conservative retained-size estimate, construction reserves `192 MiB`, and only one construction runs process-wide. Gate waits, DTO capture, and card construction honor cancellation; disabled/clear/no-index/shutdown return the cache reservation. Sequential `kb_status` calls across many repositories therefore cannot bypass the vector budget by accumulating manifests.
 
   Shortest local setup (you install and run Ollama/the model; iknowledge never deploys them automatically). `qwen3-embedding:0.6b` outputs 1024 dimensions, while `--dimensions 0` safely auto-detects that value:
 
   ```bash
   ollama pull qwen3-embedding:0.6b
-  iknowledge semantic configure --repo . --endpoint http://127.0.0.1:11434/v1 --model qwen3-embedding:0.6b --dimensions 0
+  iknowledge semantic configure --repo . --endpoint http://127.0.0.1:11434/v1 --model qwen3-embedding:0.6b --dimensions 0 --query-profile auto --rebuild-policy manual
   iknowledge semantic rebuild --repo .
   ```
+
+  To authorize the AI to perform a needed local sync instead, choose `--rebuild-policy ai-local`; remote synchronization requires the separate explicit `ai-remote` policy and a non-loopback HTTPS endpoint.
+
+  If nbco already serves `bge-m3` through a local Ollama instance, iknowledge can reuse that endpoint/model service. The two products still keep separate documents, fingerprints, and vector indexes; iknowledge never reads or writes nbco's Qdrant/index data.
 
 - **Security model?** It listens on `127.0.0.1` by default; Origin validation blocks browser DNS-rebinding. Internal stdio/hook/scout traffic performs a loopback-only mutual-HMAC listener check even when business Bearer auth is off. On shared machines use `serve --auth`, which additionally requires Bearer or a scoped short session on business endpoints. Long-term keys and scout trust live outside the repository under the user's private config state, partitioned by the canonical repository path (Unix files 0600); legacy in-repo tokens are rotated, never reused. `.knowledge` writes and source reads reject symlinks beneath their respective roots, so a hostile checkout cannot redirect storage or make tracked symlinks disclose outside files. Plain HTTP on an explicitly non-loopback bind still does not provide transport confidentiality.
 - **My agent host has no subagent capability — can I still use scouting?** `kb_investigate` defaults to delegate mode. If the host has none, set `scout: self`, review the command, then run `iknowledge trust-scout --repo .`. The authorization is user-private state outside the repository, bound to the exact mode/command and invalidated by any config change; repository-controlled executables are refused. The temporary in-repo MCP config contains only a short HMAC-derived session, never a root secret. macOS/Linux only.
@@ -172,9 +186,9 @@ Do the per-project sentence first, then the machine-level script (reversed order
 
 ## Status
 
-Phase 1 fully delivered and continuously hardened: now 16 MCP tools + the `/mcp/main` and `/mcp/scout` endpoints + `GET /inject` and the read-only legs (`/recall` `/map` `/status`) + the `iknowledge hook/setup/maintain/doctor/brief/precheck/semantic` suite. A 2026-07-11 adversarial audit additionally hardened crash-recoverable multi-file transactions, strict/portable bundles, parser boundaries and semantic hashes, generation-aware indexes, concurrent snapshots, source/storage symlink confinement, listener identity, self-scout trust, and checksummed cross-platform installation. The 2026-07-18 additions provide default secret redaction for semantic writes and bundle imports, a bounded new-session briefing, and staged-change risk/accounting precheck. On 2026-07-04 the originally-deferred phase 2/3/4 items landed: full-repo call graph & structural search expansion, hotspot digestion list, dispute registration, review reminders for non-code knowledge, `--auth`, multi-repo single daemon, Windows support, and the PTY self-dispatch scout fallback. **Both clients field-tested** (Claude Code + Codex, including instructions semantics). **M1.4 A/B acceptance passed**: 10 fixed code-location tasks, knowledge-base-connected (19 % seeded coverage) vs bare grep, same model — median tokens down 41 % (59 % ≤ the 60 % threshold), cheaper on 8/10 tasks, faster wall-clock; protocol, harness (`cmd/kbeval`) and both rounds of raw data live in [eval/m14/](eval/m14/).
+Phase 1 fully delivered and continuously hardened: now 17 MCP tools + the `/mcp/main` and `/mcp/scout` endpoints + `GET /inject` and the read-only legs (`/recall` `/map` `/status`) + the `iknowledge hook/setup/maintain/doctor/brief/precheck/semantic` suite. A 2026-07-11 adversarial audit additionally hardened crash-recoverable multi-file transactions, strict/portable bundles, parser boundaries and semantic hashes, generation-aware indexes, concurrent snapshots, source/storage symlink confinement, listener identity, self-scout trust, and checksummed cross-platform installation. The 2026-07-18 additions provide default secret redaction for semantic writes and bundle imports, a bounded new-session briefing, and staged-change risk/accounting precheck. On 2026-07-04 the originally-deferred phase 2/3/4 items landed: full-repo call graph & structural search expansion, hotspot digestion list, dispute registration, review reminders for non-code knowledge, `--auth`, multi-repo single daemon, Windows support, and the PTY self-dispatch scout fallback. **Both clients field-tested** (Claude Code + Codex, including instructions semantics). **M1.4 A/B acceptance passed**: 10 fixed code-location tasks, knowledge-base-connected (19 % seeded coverage) vs bare grep, same model — median tokens down 41 % (59 % ≤ the 60 % threshold), cheaper on 8/10 tasks, faster wall-clock; protocol, harness (`cmd/kbeval`) and both rounds of raw data live in [eval/m14/](eval/m14/).
 
-The optional semantic/vector preview is shipped but remains per-repository opt-in and disabled by default. Its quality-promotion benchmark is still pending, so lexical/structural retrieval remains the baseline and fallback.
+The optional semantic/vector preview is shipped but remains per-repository opt-in and disabled by default. Its deterministic offline algorithm baseline (`cmd/kbsemeval`, [eval/semantic/](eval/semantic/)) now guards lane isolation, distinct-node ranking, and exact stable winning-record order; engine tests separately guard “advisory, not adjudication.” The baseline uses hand-authored vectors and is **not** a real-model quality claim. A 100+ independent bilingual qrels/model-vs-lexical benchmark is still pending, so lexical/structural retrieval remains the baseline and fallback.
 
 - [`knowledge.md`](knowledge.md) — the concept design (the convergence of 20 design rounds: five dimensions, self-healing, economics, security, four thought-experiments) *(Chinese)*
 - [`knowledge-impl.md`](knowledge-impl.md) — the phase-1 engineering spec (package layout, data model, storage, full MCP API spec, milestones) *(Chinese)*

@@ -174,13 +174,22 @@ func (Python) HashFile(src []byte) string {
 
 // Parse 经助手进程提取符号(src 走 stdin,JSON 走 stdout)。
 func (Python) Parse(path string, src []byte) ([]Symbol, error) {
-	raw, err := runPythonHelper(src)
+	return (Python{}).ParseContext(context.Background(), path, src)
+}
+
+func (Python) ParseContext(ctx context.Context, path string, src []byte) ([]Symbol, error) {
+	raw, err := runPythonHelperContext(ctx, src)
 	if err != nil {
 		return nil, err
 	}
 	cachePythonFileHash(src, raw.FileHash)
 	syms := make([]Symbol, 0, len(raw.Symbols))
-	for _, r := range raw.Symbols {
+	for i, r := range raw.Symbols {
+		if i&63 == 0 {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+		}
 		start, end := r.Start, min(r.End, len(src))
 		if start < 0 || start > end {
 			continue // 偏移异常的符号丢弃,宁缺
@@ -200,12 +209,22 @@ func (Python) Parse(path string, src []byte) ([]Symbol, error) {
 }
 
 func runPythonHelper(src []byte) (pyResult, error) {
+	return runPythonHelperContext(context.Background(), src)
+}
+
+func runPythonHelperContext(parent context.Context, src []byte) (pyResult, error) {
+	if parent == nil {
+		return pyResult{}, fmt.Errorf("python 解析: nil context")
+	}
+	if err := parent.Err(); err != nil {
+		return pyResult{}, err
+	}
 	exe := pythonExe()
 	if exe == "" {
 		return pyResult{}, fmt.Errorf("python3 不可用(未注册时不应到达)")
 	}
 	// 20s 超时:单文件解析挂死不许阻塞整库(engine 多数调用点持锁)。
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	ctx, cancel := context.WithTimeout(parent, 20*time.Second)
 	defer cancel()
 	cmd := isolatedPythonCommand(ctx, exe, safePythonDir(exe), pyHelper)
 	cmd.Stdin = bytes.NewReader(src)
@@ -214,6 +233,9 @@ func runPythonHelper(src []byte) (pyResult, error) {
 	var out, errBuf bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &out, &errBuf
 	if err := cmd.Run(); err != nil {
+		if err := parent.Err(); err != nil {
+			return pyResult{}, err
+		}
 		if ctx.Err() != nil {
 			return pyResult{}, fmt.Errorf("python 解析超时(20s 护栏)")
 		}

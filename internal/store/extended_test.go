@@ -1,6 +1,7 @@
 package store
 
 import (
+	"context"
 	"errors"
 	"os"
 	"path/filepath"
@@ -264,6 +265,16 @@ func TestUsageAppendLoad(t *testing.T) {
 	recs, err := s.LoadUsage()
 	if err != nil || len(recs) != 3 {
 		t.Fatalf("LoadUsage = %d 条, err %v", len(recs), err)
+	}
+}
+
+func TestLoadUsageContextHonorsCancellationWithoutLogs(t *testing.T) {
+	s := newStoreT(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	recs, err := s.LoadUsageContext(ctx)
+	if !errors.Is(err, context.Canceled) || recs != nil {
+		t.Fatalf("LoadUsageContext canceled = %#v, %v; want nil, context.Canceled", recs, err)
 	}
 }
 
