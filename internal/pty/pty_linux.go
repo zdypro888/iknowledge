@@ -19,12 +19,12 @@ func open() (*os.File, string, error) {
 	}
 	var n uint32
 	if err := ioctl(ptmx.Fd(), tiocgptn, uintptr(unsafe.Pointer(&n))); err != nil {
-		ptmx.Close()
+		_ = ptmx.Close()
 		return nil, "", err
 	}
 	var unlock int32 // 0 = 解锁
 	if err := ioctl(ptmx.Fd(), tiocsptlck, uintptr(unsafe.Pointer(&unlock))); err != nil {
-		ptmx.Close()
+		_ = ptmx.Close()
 		return nil, "", err
 	}
 	return ptmx, fmt.Sprintf("/dev/pts/%d", n), nil

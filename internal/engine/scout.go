@@ -67,7 +67,7 @@ func (e *Engine) selfDispatch(job *scoutJob, brief string, cfg *store.Config) (s
 	if err := e.Store.WritePrivateKnowledgeFile(cfgRel, cfgBytes); err != nil {
 		return "", err
 	}
-	defer e.Store.RemoveKnowledgeFile(cfgRel)
+	defer func() { _ = e.Store.RemoveKnowledgeFile(cfgRel) }()
 
 	cmd, err := scoutCommand(cfg.ScoutCommand, cfgPath)
 	if err != nil {
@@ -92,8 +92,18 @@ func (e *Engine) selfDispatch(job *scoutJob, brief string, cfg *store.Config) (s
 		return "", kbErr("SCOUT_TIMEOUT", "侦察兵进程启动失败:"+err.Error(),
 			"检查 config 的 scout_command;或改回委派模式(scout: delegate)")
 	}
-	defer ptmx.Close()
+	defer func() { _ = ptmx.Close() }()
 	defer pty.KillGroup(cmd)
+	writePTY := func(data []byte) error {
+		n, err := ptmx.Write(data)
+		if err != nil {
+			return err
+		}
+		if n != len(data) {
+			return fmt.Errorf("PTY short write:%d/%d", n, len(data))
+		}
+		return nil
+	}
 
 	// 输出旁路进日志(有界),同时扫 spinner/响应符号做"回合已启动"信号
 	//(kbeval 排障定案:欢迎屏无这些符号;首启信任弹窗会吞输入,须检测 + 重投)。
@@ -104,7 +114,7 @@ func (e *Engine) selfDispatch(job *scoutJob, brief string, cfg *store.Config) (s
 	}
 	activity := make(chan struct{}, 1)
 	go func() {
-		defer logFile.Close()
+		defer func() { _ = logFile.Close() }()
 		drainToLog(ptmx, logFile, 1<<20, activity)
 	}()
 	exited := make(chan error, 1)
@@ -113,13 +123,33 @@ func (e *Engine) selfDispatch(job *scoutJob, brief string, cfg *store.Config) (s
 	// 喂简报:括号粘贴包裹(多行文本裸 \n 会被 TUI 当回车逐行提交,kbeval 排障定案)
 	// + 两步输入(正文、停顿、单发回车,对抗 paste 突发去抖,aibridge driver.go 同法)。
 	time.Sleep(6 * time.Second) // TUI 启动等待
-	submit := func() {
-		if _, err := ptmx.Write([]byte("\x1b[200~" + brief + "\x1b[201~")); err == nil {
-			time.Sleep(2 * time.Second)
-			ptmx.Write([]byte("\r"))
+	submit := func() error {
+		if err := writePTY([]byte("\x1b[200~" + brief + "\x1b[201~")); err != nil {
+			return err
+		}
+		time.Sleep(2 * time.Second)
+		return writePTY([]byte("\r"))
+	}
+	if err := submit(); err != nil {
+		// 非 TUI 侦察兵可能不读 stdin，直接经 MCP 交卷后退出；此时 PTY
+		// 主端会报 EIO。先给交卷/Wait 竞态一个短宽限，再判定真失败。
+		select {
+		case findings := <-job.done:
+			return framed(findings + "\n(自派侦察兵已交卷)"), nil
+		case exitErr := <-exited:
+			select {
+			case findings := <-job.done:
+				return framed(findings + "\n(自派侦察兵已交卷)"), nil
+			case <-time.After(2 * time.Second):
+			}
+			return "", kbErr("SCOUT_TIMEOUT",
+				fmt.Sprintf("向侦察兵提交简报失败:%v;进程已退出:%v", err, exitErr),
+				"检查侦察兵是否启动;看日志 .knowledge/local/scout-"+job.ID+".log")
+		case <-time.After(2 * time.Second):
+			return "", kbErr("SCOUT_TIMEOUT", "向侦察兵提交简报失败:"+err.Error(),
+				"检查侦察兵是否启动;看日志 .knowledge/local/scout-"+job.ID+".log")
 		}
 	}
-	submit()
 
 	// 启动确认:25s 无活动符号 → 单发回车收弹窗 + 重投(上限 2 次)。
 	// 同时监听交卷/退程——非 TUI 侦察兵(自定义 scout_command)可能不画 spinner 直接交卷。
@@ -149,9 +179,15 @@ func (e *Engine) selfDispatch(job *scoutJob, brief string, cfg *store.Config) (s
 					"在该仓库手动跑一次 claude 完成目录信任后重试;或看日志 .knowledge/local/scout-"+job.ID+".log")
 			}
 			resends++
-			ptmx.Write([]byte("\r"))
+			if err := writePTY([]byte("\r")); err != nil {
+				return "", kbErr("SCOUT_TIMEOUT", "关闭侦察兵启动弹窗失败:"+err.Error(),
+					"看日志 .knowledge/local/scout-"+job.ID+".log")
+			}
 			time.Sleep(3 * time.Second)
-			submit()
+			if err := submit(); err != nil {
+				return "", kbErr("SCOUT_TIMEOUT", "重投侦察简报失败:"+err.Error(),
+					"看日志 .knowledge/local/scout-"+job.ID+".log")
+			}
 		}
 	}
 

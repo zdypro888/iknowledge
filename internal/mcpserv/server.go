@@ -4,6 +4,7 @@ package mcpserv
 
 import (
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
@@ -18,15 +19,16 @@ import (
 	"sync"
 	"time"
 
+	"github.com/zdypro888/iknowledge/internal/buildinfo"
 	"github.com/zdypro888/iknowledge/internal/engine"
 	"github.com/zdypro888/iknowledge/internal/store"
 )
 
 const protocolVersion = "2025-06-18"
+const maxRPCBodyBytes = 4 << 20
 
-// Version 是 serverInfo.version。
-// release workflow 用 -X 直接注入 tag；本地构建保留开发默认值。
-var Version = "0.2.0"
+// serverVersion 与 CLI 版本共用构建元数据，避免两个入口报告不同版本。
+func serverVersion() string { return buildinfo.Read().Version }
 
 // Server 是一个仓库的 MCP 服务。
 type Server struct {
@@ -76,28 +78,9 @@ const sessionTTL = 24 * time.Hour
 
 // New 建服务。
 func New(e *engine.Engine) *Server {
-	s := &Server{
+	return &Server{
 		E: e, sessions: map[string]*session{},
 		authChallenges: map[string]localAuthChallenge{}, authSessions: map[string]localAuthSession{},
-	}
-	// R29-E7.6:后台 goroutine 每 10min 回收过期 session(handleInitialize 原先只
-	// 机会性回收——大量 initialize 但不再发请求的场景会积累过期会话)。cap 10000
-	// 防恶意刷 initialize 耗内存(超限返 503)。
-	go s.reapSessions()
-	return s
-}
-
-func (s *Server) reapSessions() {
-	t := time.NewTicker(10 * time.Minute)
-	defer t.Stop()
-	for range t.C {
-		s.mu.Lock()
-		for id, sess := range s.sessions {
-			if time.Since(sess.lastSeen) > sessionTTL {
-				delete(s.sessions, id)
-			}
-		}
-		s.mu.Unlock()
 	}
 }
 
@@ -145,10 +128,11 @@ func (s *Server) authGuard(next http.Handler) http.Handler {
 	if s.AuthToken == "" {
 		return next
 	}
-	want := []byte("Bearer " + s.AuthToken)
+	wantHash := sha256.Sum256([]byte("Bearer " + s.AuthToken))
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		got := []byte(r.Header.Get("Authorization"))
-		rootOK := subtle.ConstantTimeCompare(got, want) == 1
+		gotHash := sha256.Sum256(got)
+		rootOK := subtle.ConstantTimeCompare(gotHash[:], wantHash[:]) == 1
 		sessionOK := false
 		if !rootOK {
 			prefix := store.LocalSessionAuthScheme + " "
@@ -413,10 +397,22 @@ func (s *Server) serveRPC(w http.ResponseWriter, r *http.Request, role string) {
 		}
 	}
 
-	body, _ := io.ReadAll(io.LimitReader(r.Body, 4<<20))
+	body, err := io.ReadAll(io.LimitReader(r.Body, maxRPCBodyBytes+1))
+	if err != nil {
+		http.Error(w, "read request body failed", http.StatusBadRequest)
+		return
+	}
+	if len(body) > maxRPCBodyBytes {
+		http.Error(w, "request body exceeds 4 MiB", http.StatusRequestEntityTooLarge)
+		return
+	}
 	var req rpcRequest
-	if err := json.Unmarshal(body, &req); err != nil {
+	if !json.Valid(body) {
 		writeRPCError(w, nil, -32700, "parse error")
+		return
+	}
+	if err := json.Unmarshal(body, &req); err != nil || req.JSONRPC != "2.0" || strings.TrimSpace(req.Method) == "" {
+		writeRPCError(w, req.ID, -32600, "invalid request")
 		return
 	}
 
@@ -428,8 +424,8 @@ func (s *Server) serveRPC(w http.ResponseWriter, r *http.Request, role string) {
 		return
 	}
 
-	// 通知(无 id)→ 202 无体。
-	if len(req.ID) == 0 || string(req.ID) == "null" {
+	// 通知只有“完全没有 id 字段”的合法请求。显式 id:null 仍必须返回响应。
+	if len(req.ID) == 0 {
 		w.WriteHeader(http.StatusAccepted)
 		return
 	}
@@ -500,7 +496,7 @@ func (s *Server) handleInitialize(w http.ResponseWriter, req rpcRequest) {
 	writeRPCResult(w, req.ID, map[string]any{
 		"protocolVersion": protocolVersion,
 		"capabilities":    map[string]any{"tools": map[string]any{"listChanged": true}},
-		"serverInfo":      map[string]any{"name": "knowledge", "version": Version},
+		"serverInfo":      map[string]any{"name": "knowledge", "version": serverVersion()},
 		"repoRoot":        s.E.Store.RepoRoot(),
 		"instructions":    engine.InitializeInstructions,
 	})
@@ -787,7 +783,7 @@ func writeReadOnly(w http.ResponseWriter, out string, err error) {
 		return
 	}
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-	io.WriteString(w, out)
+	_, _ = io.WriteString(w, out) // response 已提交，无可恢复路径
 }
 
 func (s *Server) serveInject(w http.ResponseWriter, r *http.Request) {
@@ -820,7 +816,7 @@ func (s *Server) serveInject(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-	io.WriteString(w, text)
+	_, _ = io.WriteString(w, text) // response 已提交，无可恢复路径
 }
 
 func writeToolResult(w http.ResponseWriter, id json.RawMessage, text string, isErr bool) {

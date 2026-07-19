@@ -220,7 +220,9 @@ func TestWorkflowCrossSessionStaleAlert(t *testing.T) {
 		"internal/auth/login.go": workflowSrc,
 	})
 	// 会话 A 先 recall(记录哈希基线)。
-	e.Recall(RecallArgs{Query: "internal/auth/login.go#Login"}, "session-stale")
+	if _, _, err := e.Recall(RecallArgs{Query: "internal/auth/login.go#Login"}, "session-stale"); err != nil {
+		t.Fatal(err)
+	}
 
 	// 改源码(让符号哈希变化:改函数体逻辑,不只是注释——Go parser 的 Hash 是
 	// gofmt 免疫且行内注释不参与,必须改实际语句)。

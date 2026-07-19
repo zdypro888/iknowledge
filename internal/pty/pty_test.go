@@ -16,7 +16,7 @@ func TestStartEcho(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer ptmx.Close()
+	defer func() { _ = ptmx.Close() }()
 
 	out := make(chan string, 1)
 	go func() {
@@ -39,7 +39,9 @@ func TestStartEcho(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("读 PTY 输出超时")
 	}
-	cmd.Wait()
+	if err := cmd.Wait(); err != nil {
+		t.Fatal(err)
+	}
 }
 
 // 键盘输入回程:写主端 → 子进程 stdin。
@@ -49,7 +51,7 @@ func TestStdinRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer ptmx.Close()
+	defer func() { _ = ptmx.Close() }()
 	if _, err := ptmx.Write([]byte("hello\r")); err != nil {
 		t.Fatal(err)
 	}
@@ -60,7 +62,9 @@ func TestStdinRoundTrip(t *testing.T) {
 		n, err := ptmx.Read(buf)
 		all = append(all, buf[:n]...)
 		if strings.Contains(string(all), "GOT-hello") {
-			cmd.Wait()
+			if err := cmd.Wait(); err != nil {
+				t.Fatal(err)
+			}
 			return
 		}
 		if err != nil {

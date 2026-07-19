@@ -74,7 +74,7 @@ type Entry struct {
 	// 条目被编辑/合并时漂移,basedOn/RefutedBy 引用全部悬空(推演五 #24)。
 	ID         string     `yaml:"id"`
 	Kind       string     `yaml:"kind"` // summary|contract|mutation|pitfall|usage
-	Text       string     `yaml:"text"`
+	Text       string     `yaml:"text" redact:"true"`
 	Confidence Confidence `yaml:"confidence"`
 	// At 写入时间(全量实现补定):维护欠账"摘要落后于其下变更"的判定依据,
 	// 也是来源审计的一部分。旧分片缺此字段视为零值,判定时按保守处理。
@@ -116,14 +116,14 @@ type Node struct {
 	Since   time.Time `yaml:"since"`
 	Entries []Entry   `yaml:"entries,omitempty"`
 	// Keywords 上限 12,小写归一去重;写入是整体替换语义(impl §7.3)。
-	Keywords []string `yaml:"keywords,omitempty"`
+	Keywords []string `yaml:"keywords,omitempty" redact:"true"`
 	// Lineage 血缘:此节点历史上的旧 ID,全链 flat 集合(非一跳),查询按集合去重,
 	// 天然免疫 A→B→A 环(knowledge.md §12.6)。
 	Lineage []string `yaml:"lineage,omitempty"`
 	// EraSummary 时代摘要(knowledge.md §12.3):早于 EraUntil 的历史在呈现层
 	// 折叠为这段摘要(由 AI 经 kb_maintain 写入,负知识须逐条保留在摘要文本里);
 	// 原始记录永在 journal 可溯源,永不改写。
-	EraSummary string    `yaml:"era_summary,omitempty"`
+	EraSummary string    `yaml:"era_summary,omitempty" redact:"true"`
 	EraUntil   time.Time `yaml:"era_until,omitempty"`
 	// PendingAnchor 待补锚(impl §7.3 record_change 第四情形):文件当时不可解析,
 	// 记录照收、锚保持旧值;该文件下次成功解析时(任何读写路径经过)自动补锚。
@@ -132,8 +132,8 @@ type Node struct {
 
 // Rejected 是一条负知识:否决了什么、为什么(knowledge.md §5.1)。
 type Rejected struct {
-	Option string `yaml:"option" json:"option"`
-	Reason string `yaml:"reason" json:"reason"`
+	Option string `yaml:"option" json:"option" redact:"true"`
+	Reason string `yaml:"reason" json:"reason" redact:"true"`
 }
 
 // Change 是 journal 的一行变更记录(impl §3)。
@@ -147,12 +147,12 @@ type Change struct {
 	Nodes     []string   `json:"nodes"`
 	At        time.Time  `json:"at"`
 	Commit    string     `json:"commit,omitempty"`
-	Task      string     `json:"task,omitempty"`
-	What      string     `json:"what"`
-	Why       string     `json:"why"`
+	Task      string     `json:"task,omitempty" redact:"true"`
+	What      string     `json:"what" redact:"true"`
+	Why       string     `json:"why" redact:"true"`
 	Rejected  []Rejected `json:"rejected,omitempty"`
-	Overturns string     `json:"overturns,omitempty"` // 决策链:被推翻的 change ID
-	Rebuttal  string     `json:"rebuttal,omitempty"`  // Overturns 非空时必填(engine 校验)
+	Overturns string     `json:"overturns,omitempty"`              // 决策链:被推翻的 change ID
+	Rebuttal  string     `json:"rebuttal,omitempty" redact:"true"` // Overturns 非空时必填(engine 校验)
 	// Reverts(R29 批次4):kb_revert 撤销记录——指向被撤销的 change ID。撤销本身是
 	// 追加的 Change(追加式不变量不破):反向应用被撤销 change 的副作用(恢复被 supersede
 	// 的 entry、回滚 verify 级联)。用于撤销"全错"的记录(误 refute 级联、错误 overturns)。
@@ -172,7 +172,7 @@ type Change struct {
 	NodeEffects []NodeEffect `json:"node_effects,omitempty"`
 	// Remaps 重构申报(knowledge.md §12.6 第 2 层):拆分/合并机器猜不了,谁重构谁申报。
 	Remaps   []Remap `json:"remaps,omitempty"`
-	Verified string  `json:"verified,omitempty"`
+	Verified string  `json:"verified,omitempty" redact:"true"`
 	Author   string  `json:"author,omitempty"`
 }
 

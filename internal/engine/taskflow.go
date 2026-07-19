@@ -18,7 +18,9 @@ type TaskArgs struct {
 }
 
 // Task 任务态读写:与知识层严格分离,归档时压缩成变更记录。
-func (e *Engine) Task(a TaskArgs, sid, author string) (string, error) {
+func (e *Engine) Task(a TaskArgs, sid, author string) (out string, err error) {
+	redaction := RedactSecrets(&a)
+	defer appendRedactionNotice(&out, &err, redaction)
 	if err := e.requireInit(); err != nil {
 		return "", err
 	}
@@ -267,7 +269,9 @@ type FlowArgs struct {
 }
 
 // Flow 流程/主题节点 CRUD;steps 引用的树节点必须存在,反向链接由 index 现算。
-func (e *Engine) Flow(a FlowArgs, sid, author string) (string, error) {
+func (e *Engine) Flow(a FlowArgs, sid, author string) (out string, err error) {
+	redaction := RedactSecrets(&a)
+	defer appendRedactionNotice(&out, &err, redaction)
 	if err := e.requireInit(); err != nil {
 		return "", err
 	}

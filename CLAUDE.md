@@ -1,9 +1,11 @@
 # iknowledge 开发约定
 
-AI 代码知识库(MCP 服务)。**两份设计文档是唯一真相源**,实现与其冲突时要么修文档(留痕)要么修实现,不许静默偏离:
+AI 代码知识库(MCP 服务)。**两份现行设计文档是唯一真相源**,实现与其冲突时要么修文档(留痕)要么修实现,不许静默偏离:
 
 - [knowledge.md](knowledge.md) — 概念设计全案(五维模型、自愈机制、两条铁律、五篇推演)
 - [knowledge-impl.md](knowledge-impl.md) — 第一期工程方案(数据模型、存储、MCP API 全量规范、里程碑)——**写代码照这份**,已含推演五的全部定案
+
+[vecdb.md](vecdb.md) 只记录可选向量检索提案,尚未实现,不属于现有能力或现行实现正本。
 
 ## 铁律(违反即返工)
 
@@ -71,3 +73,7 @@ go test -race ./...
 **轮 33(2026-07-09,预编译发布)**:release workflow 在 `v*` tag 构建 darwin/linux/windows × amd64/arm64、生成 sha256sums 并创建 GitHub Release;install.sh 优先预编译、无匹配资产回退 go install,双宿主 skill 同步安装。`v0.2.0` 为首个标签;随后主线补 Windows arm64 与 installer 静态加固。
 
 **轮 34(2026-07-11,先 pull 最新后全仓审核并修复)**:安全/事务/解析/并发四镜头清盘。①self scout 授权、auth 根 token、本机 listener identity 全迁仓外用户私有态;stdio/hook/scout 无论 Bearer 开关均先做 loopback 双向 HMAC,仓内临时配置只含 scope 短 session;源码与 `.knowledge` 根以下 symlink/非普通文件统一拒绝。②record_change/verify/revert/adopt/task-complete/import 统一用仓外 prepared/committed WAL,恢复只允许 writer-lock owner,panic 同进程回滚;结构化 Entry/Node effects 使 revert 可证明、旧记录 fail closed。③bundle 必须唯一 manifest/单 gzip,限制单条/总量/header/staging,拒尾随、非普通、不可便携与运行时不可见路径;默认不覆盖异内容,显式 `--force`;remap 覆盖 project/tree/flow/journal/config 并做最终引用/月分片/effects 校验。④Go 哈希/调用图按 `(dir,package)` 隔离,Python `-I -S`+PEP263,TS regex/class initializer,Java/Rust 边界修正;DocStructHash 护栏。⑤session ledger/callgraph 不可变快照,重复 Node ID 全隔离,历史/FlowStep 按 Since 路由代际,拆分 entry 找真实继承者,WIP 按 session。⑥安装/卸载/发布跨平台与 checksum/原子性加固。README/两份正本同步;交付门仍为 build/vet/全量 race + shell 语法/脚本动态回归 + Windows 双架构交叉构建。未发布/未打新 tag。
+
+**轮 35(2026-07-18,参考 ProjectMem 后的选择性吸收)**:只吸收能强化“代码知识库”边界的机制,不搬全局跨项目记忆、watcher/dashboard、把 commit 前缀自动当决策或虚构金额 ROI。①所有语义写入口与 bundle 导入默认秘密脱敏(厂商 token/JWT/Bearer/私钥/URL 凭证/常见 credential 赋值),命中只回执类型/数量,原文不落盘;②新增 `iknowledge precheck` 暂存区预检,把源码增改删/重命名映射到历史否决、suspect/orphan/pending、未决矛盾、雷区/pitfall,记账只认相对 HEAD 新增且节点精确覆盖源码的 journal;缺省告警,`--strict` 才阻断;③新增 `iknowledge brief --budget` 一屏 Markdown(WIP/风险/近期决策/维护债),严格预算且始终保留防投毒数据框;④usage 只记录真实 precheck 次数/告警/阻断;⑤CLI/MCP 统一使用 `internal/buildinfo` 发布版本。仍零新依赖、MCP 工具数不变、只写既定边界。
+
+**轮 36(2026-07-19,分支合并收口 + 向量检索定案留档)**:把轮35能力合并到轮34之后的事务、bundle、listener identity 与解析加固主线,冲突处理以主线安全边界为底座并补齐回归:bundle 在 remap 后/写盘前脱敏且 dry-run 同报告;JSON-RPC 真 4MiB 上限、parse/invalid request 与显式 `id:null` 语义修正;stdio 同步转发 `id:null`;session 改机会性回收+容量上限,移除无生命周期后台 goroutine;自派侦察兵兼容不读 PTY 而直接交卷的非 TUI 命令。新增 [`vecdb.md`](vecdb.md) 定义尚未实现的可选语义检索层:默认纯 Go Flat 派生索引、仅摘要、混合召回、Zvec 只作规模增长后的可选后端;不得把设计文档误报为现有能力。

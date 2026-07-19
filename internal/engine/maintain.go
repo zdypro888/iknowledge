@@ -248,8 +248,8 @@ func (e *Engine) Debts() ([]Debt, error) {
 type MaintainArgs struct {
 	Action     string `json:"action"` // next | complete | dismiss
 	ID         string `json:"id,omitempty"`
-	Scope      string `json:"scope,omitempty"`       // 路径前缀:只取本任务相关的债
-	EraSummary string `json:"era_summary,omitempty"` // era-compress 完成时提交
+	Scope      string `json:"scope,omitempty"`                     // 路径前缀:只取本任务相关的债
+	EraSummary string `json:"era_summary,omitempty" redact:"true"` // era-compress 完成时提交
 }
 
 func debtInScope(node, scope string) bool {
@@ -269,7 +269,9 @@ func debtInScope(node, scope string) bool {
 }
 
 // Maintain 维护欠账:next 取一条最高优先级欠账;complete 销账(era 债携带摘要落库)。
-func (e *Engine) Maintain(a MaintainArgs, sid, author string) (string, error) {
+func (e *Engine) Maintain(a MaintainArgs, sid, author string) (out string, err error) {
+	redaction := RedactSecrets(&a)
+	defer appendRedactionNotice(&out, &err, redaction)
 	if err := e.requireInit(); err != nil {
 		return "", err
 	}

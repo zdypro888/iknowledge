@@ -85,7 +85,9 @@ func TestServeUpUsesMutualLocalSession(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	resp.Body.Close()
+	if err := resp.Body.Close(); err != nil {
+		t.Fatal(err)
+	}
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("短期 session 未获放行: %d", resp.StatusCode)
 	}
@@ -131,6 +133,11 @@ func TestProxyStdioRejectsMalformedInputAndInvalidJSONResponse(t *testing.T) {
 	requests := 0
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		requests++
+		if requests == 1 {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `{"jsonrpc":"2.0","id":null,"result":{}}`)
+			return
+		}
 		w.WriteHeader(http.StatusOK)
 		_, _ = io.WriteString(w, "not-json")
 	}))
@@ -144,12 +151,13 @@ func TestProxyStdioRejectsMalformedInputAndInvalidJSONResponse(t *testing.T) {
 	if code := proxyStdio(strings.NewReader(input), &out, ts.URL, s, ts.URL, "", time.Second); code != 0 {
 		t.Fatalf("proxy code=%d out=%s", code, out.String())
 	}
-	if requests != 1 {
-		t.Fatalf("畸形/id:null 不应发往 serve, requests=%d", requests)
+	if requests != 2 {
+		t.Fatalf("畸形 JSON 不应转发，id:null 应作为请求转发，requests=%d", requests)
 	}
 	lines := strings.Split(strings.TrimSpace(out.String()), "\n")
 	if len(lines) != 3 || !strings.Contains(lines[0], `"code":-32700`) ||
-		!strings.Contains(lines[1], `"code":-32600`) || !strings.Contains(lines[2], `"code":-32000`) {
+		!strings.Contains(lines[1], `"id":null`) || !strings.Contains(lines[1], `"result":{}`) ||
+		!strings.Contains(lines[2], `"code":-32000`) {
 		t.Fatalf("错误响应不完整:\n%s", out.String())
 	}
 	for i, line := range lines {

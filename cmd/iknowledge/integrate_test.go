@@ -35,8 +35,8 @@ func startServe(t *testing.T, repo string, e *engine.Engine) int {
 	msrv := mcpserv.New(e)
 	msrv.LocalIdentity = identity
 	srv := &http.Server{Handler: msrv.Handler()}
-	go srv.Serve(ln)
-	t.Cleanup(func() { srv.Close() })
+	go func() { _ = srv.Serve(ln) }()
+	t.Cleanup(func() { _ = srv.Close() })
 	return port
 }
 
@@ -125,8 +125,8 @@ func TestHookBridgeAuth(t *testing.T) {
 	}
 	msrv.LocalIdentity = identity
 	srv := &http.Server{Handler: msrv.Handler()}
-	go srv.Serve(ln)
-	t.Cleanup(func() { srv.Close() })
+	go func() { _ = srv.Serve(ln) }()
+	t.Cleanup(func() { _ = srv.Close() })
 
 	stdin := fmt.Sprintf(`{"session_id":"x","cwd":%q,"tool_input":{"file_path":%q}}`,
 		repo, filepath.Join(repo, "internal", "auth", "login.go"))
@@ -149,7 +149,9 @@ func TestHookServeDown(t *testing.T) {
 		t.Fatal(err)
 	}
 	port := ln.Addr().(*net.TCPAddr).Port
-	ln.Close()
+	if err := ln.Close(); err != nil {
+		t.Fatal(err)
+	}
 	if err := os.WriteFile(filepath.Join(repo, ".knowledge", "config.yaml"),
 		fmt.Appendf(nil, "schema: 1\nport: %d\n", port), 0o644); err != nil {
 		t.Fatal(err)
@@ -191,6 +193,7 @@ func TestSetupPrints(t *testing.T) {
 		"本仓库配有 knowledge MCP", // 纪律段(engine.DisciplinePrompt 首行)
 		"PostToolUse", `"command": "iknowledge hook"`,
 		"[mcp_servers.knowledge]", "AGENTS.md", // Codex 段(config.toml + 纪律载体)
+		"Git pre-commit 预检", "iknowledge precheck --repo .",
 	} {
 		if !strings.Contains(out.String(), want) {
 			t.Errorf("setup 输出缺 %q", want)

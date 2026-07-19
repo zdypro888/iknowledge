@@ -175,21 +175,23 @@ type ImportReport struct {
 	Scanned    int
 	Imported   int
 	Skipped    int
+	Redacted   int
 	Bytes      int64
 	BackupPath string
 	Entries    []ImportEntry
 }
 
 type ImportEntry struct {
-	Name   string
-	Action string
-	Reason string
-	Bytes  int64
+	Name     string
+	Action   string
+	Reason   string
+	Bytes    int64
+	Redacted int
 }
 
 func (r ImportReport) Text() string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "导入报告: scanned=%d importable=%d skipped=%d bytes=%d", r.Scanned, r.Imported, r.Skipped, r.Bytes)
+	fmt.Fprintf(&b, "导入报告: scanned=%d importable=%d skipped=%d redacted=%d bytes=%d", r.Scanned, r.Imported, r.Skipped, r.Redacted, r.Bytes)
 	if r.BackupPath != "" {
 		fmt.Fprintf(&b, "\n备份: %s", r.BackupPath)
 	}
@@ -200,9 +202,17 @@ func (r ImportReport) Text() string {
 	for _, ent := range shown {
 		switch ent.Action {
 		case "import":
-			fmt.Fprintf(&b, "\n  + %s (%d bytes)", ent.Name, ent.Bytes)
+			fmt.Fprintf(&b, "\n  + %s (%d bytes", ent.Name, ent.Bytes)
+			if ent.Redacted > 0 {
+				fmt.Fprintf(&b, ", 脱敏 %d 处", ent.Redacted)
+			}
+			b.WriteString(")")
 		case "replace":
-			fmt.Fprintf(&b, "\n  ! %s (强制替换, %d bytes)", ent.Name, ent.Bytes)
+			fmt.Fprintf(&b, "\n  ! %s (强制替换, %d bytes", ent.Name, ent.Bytes)
+			if ent.Redacted > 0 {
+				fmt.Fprintf(&b, ", 脱敏 %d 处", ent.Redacted)
+			}
+			b.WriteString(")")
 		default:
 			fmt.Fprintf(&b, "\n  - %s (%s)", ent.Name, ent.Reason)
 		}
@@ -219,8 +229,9 @@ func (e *Engine) Import(r io.Reader, pathRemap map[string]string) (int, error) {
 }
 
 type stagedImportFile struct {
-	name string
-	data []byte
+	name     string
+	data     []byte
+	redacted int
 }
 
 // ImportWithOptions 先把整个 bundle 读入 staging、做语义 remap 和最终态冲突验证，
@@ -344,6 +355,11 @@ func (e *Engine) ImportWithOptions(r io.Reader, opts ImportOptions) (ImportRepor
 			_ = gz.Close()
 			return rep, fmt.Errorf("bundle 条目 %s remap 后路径 %q 不可便携: %w", clean, outName, err)
 		}
+		// bundle 来自仓库外部，不能依赖当前 Go 模型的 redact 标签。对完成
+		// remap 的 YAML/JSONL 原文统一脱敏，dry-run 与真实导入走同一数据。
+		redactedText, redaction := RedactText(string(outData))
+		outData = []byte(redactedText)
+		rep.Redacted += redaction.Count
 		if prev := outputNames[outName]; prev != "" {
 			_ = gz.Close()
 			return rep, fmt.Errorf("导入输出路径冲突:%s 与 %s 均映射到 %s", prev, clean, outName)
@@ -360,7 +376,7 @@ func (e *Engine) ImportWithOptions(r io.Reader, opts ImportOptions) (ImportRepor
 		stagedTotal += int64(len(outData))
 		outputNames[outName] = clean
 		outputFoldNames[foldKey] = outName
-		staged = append(staged, stagedImportFile{name: outName, data: outData})
+		staged = append(staged, stagedImportFile{name: outName, data: outData, redacted: redaction.Count})
 	}
 	if !manifestSeen {
 		_ = gz.Close()
@@ -415,7 +431,7 @@ func (e *Engine) ImportWithOptions(r io.Reader, opts ImportOptions) (ImportRepor
 			writeStage = append(writeStage, file)
 			rep.Imported++
 			rep.Bytes += int64(len(file.data))
-			rep.Entries = append(rep.Entries, ImportEntry{Name: file.name, Action: "import", Bytes: int64(len(file.data))})
+			rep.Entries = append(rep.Entries, ImportEntry{Name: file.name, Action: "import", Bytes: int64(len(file.data)), Redacted: file.redacted})
 		case readErr != nil:
 			return rep, fmt.Errorf("读取导入目标 %s: %w", file.name, readErr)
 		case strings.HasPrefix(file.name, "journal/"):
@@ -427,7 +443,7 @@ func (e *Engine) ImportWithOptions(r io.Reader, opts ImportOptions) (ImportRepor
 			writeStage = append(writeStage, file)
 			rep.Imported++
 			rep.Bytes += int64(len(file.data))
-			rep.Entries = append(rep.Entries, ImportEntry{Name: file.name, Action: "import", Reason: "journal 合并", Bytes: int64(len(file.data))})
+			rep.Entries = append(rep.Entries, ImportEntry{Name: file.name, Action: "import", Reason: "journal 合并", Bytes: int64(len(file.data)), Redacted: file.redacted})
 		default:
 			equal, err := importSemanticEqual(file.name, existing, file.data)
 			if err != nil {
@@ -444,7 +460,7 @@ func (e *Engine) ImportWithOptions(r io.Reader, opts ImportOptions) (ImportRepor
 			writeStage = append(writeStage, file)
 			rep.Imported++
 			rep.Bytes += int64(len(file.data))
-			rep.Entries = append(rep.Entries, ImportEntry{Name: file.name, Action: "replace", Reason: "--force", Bytes: int64(len(file.data))})
+			rep.Entries = append(rep.Entries, ImportEntry{Name: file.name, Action: "replace", Reason: "--force", Bytes: int64(len(file.data)), Redacted: file.redacted})
 		}
 	}
 	if err := e.validateImportStage(writeStage); err != nil {

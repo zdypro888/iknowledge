@@ -29,7 +29,7 @@ jobs:
       - name: Build binaries
         run: |
           VERSION="${GITHUB_REF_NAME:-dev}"
-          LDFLAGS="-s -w -X main.buildVersion=${VERSION} -X github.com/zdypro888/iknowledge/internal/mcpserv.Version=${VERSION}"
+          LDFLAGS="-s -w -X github.com/zdypro888/iknowledge/internal/buildinfo.Version=${VERSION}"
           build_one() {
             os="$1"; arch="$2"; ext="$3"
             target="iknowledge-${os}-${arch}"

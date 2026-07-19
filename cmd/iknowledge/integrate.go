@@ -1,4 +1,5 @@
-// 接入套件(impl §7.1/§9,轮 25):setup 打印三件套、hook 做宿主 hook 桥。
+// 接入套件(impl §7.1/§9):setup 打印 MCP/纪律/hook/pre-commit 片段，
+// hook 做宿主 PostToolUse 桥。
 // 两者都不往 .knowledge/ 之外写任何文件(铁律二)——setup 只打印,hook 只读+HTTP。
 package main
 
@@ -81,7 +82,13 @@ url = "http://127.0.0.1:%d/mcp/main?repo=%s"`, port, url.QueryEscape(root))
 Authorization = "Bearer %s"`, token)
 }
 
-// runSetup 打印接入三件套:.mcp.json、CLAUDE.md 纪律段、hooks 片段。
+func preCommitHookSnippet() string {
+	return `#!/bin/sh
+# 缺省只告警不阻断；团队准备好后在命令末尾追加 --strict。
+iknowledge precheck --repo .`
+}
+
+// runSetup 只打印接入片段，不改用户配置或 Git hook。
 func runSetup(args []string, out io.Writer) int {
 	fs := flag.NewFlagSet("setup", flag.ContinueOnError)
 	repo := fs.String("repo", ".", "仓库路径")
@@ -129,7 +136,7 @@ func runSetup(args []string, out io.Writer) int {
 	if token != "" {
 		authNote = "\n   ⚠ 已启用鉴权:http 备选片段含 token,勿提交版本库;stdio 桥无此问题(令牌自读)。"
 	}
-	fmt.Fprintf(out, `接入三件套(iknowledge 只打印不代写,铁律二):
+	if _, err := fmt.Fprintf(out, `接入配置(iknowledge 只打印不代写,铁律二):
 
 ① MCP 服务(必装)——贴进 %s/.mcp.json:
 %s
@@ -154,13 +161,21 @@ func runSetup(args []string, out io.Writer) int {
    --dangerously-bypass-approvals-and-sandbox。多仓库共存时把条目名 knowledge
    改成不重复的名字(如 knowledge-<项目名>)。
 
+⑤ Git pre-commit 预检(可选)——合并进 %s/.git/hooks/pre-commit,不要覆盖已有 hook:
+%s
+   效果:提交前呈现历史否决方案、腐烂知识、未决矛盾、雷区,并逐文件核对新增 journal nodes;
+   缺省只告警不阻断,需要门禁时自行追加 --strict。
+
 验证:任一 AI 会话连上后调 kb_status;或手动 iknowledge serve --repo %s 后
   curl "http://127.0.0.1:%d/inject?file=<某个 .go 文件路径>"
 `, root, mcpJSONSnippet(root), mcpJSONHTTPSnippet(root, cfg.Port, token),
 		root, engine.DisciplinePrompt,
 		root, hooksJSONSnippet(),
 		codexTOMLSnippet(root), codexTOMLHTTPSnippet(root, cfg.Port, token),
-		root, root, cfg.Port)
+		root, root, preCommitHookSnippet(), root, cfg.Port); err != nil {
+		fmt.Fprintln(os.Stderr, "错误:写 setup 输出:", err)
+		return 1
+	}
 	return 0
 }
 
@@ -245,12 +260,13 @@ func runHook(args []string, in io.Reader, out io.Writer) int {
 	if err != nil {
 		return 0
 	}
-	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
+		_ = resp.Body.Close()
 		return 0
 	}
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-	if err != nil || len(bytes.TrimSpace(body)) == 0 {
+	closeErr := resp.Body.Close()
+	if err != nil || closeErr != nil || len(bytes.TrimSpace(body)) == 0 {
 		return 0
 	}
 	_ = json.NewEncoder(out).Encode(map[string]any{

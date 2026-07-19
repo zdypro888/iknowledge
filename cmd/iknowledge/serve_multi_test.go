@@ -46,7 +46,9 @@ func TestServeMultiRepo(t *testing.T) {
 			t.Fatal(err)
 		}
 		ports[i] = ln.Addr().(*net.TCPAddr).Port
-		ln.Close()
+		if err := ln.Close(); err != nil {
+			t.Fatal(err)
+		}
 		cfg := fmt.Sprintf("schema: 1\nport: %d\n", ports[i])
 		if err := os.WriteFile(filepath.Join(repo, ".knowledge", "config.yaml"), []byte(cfg), 0o644); err != nil {
 			t.Fatal(err)
@@ -74,8 +76,13 @@ func TestServeMultiRepo(t *testing.T) {
 					RepoRoot string `json:"repoRoot"`
 				} `json:"result"`
 			}
-			json.NewDecoder(resp.Body).Decode(&out)
-			resp.Body.Close()
+			if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+				_ = resp.Body.Close()
+				t.Fatal(err)
+			}
+			if err := resp.Body.Close(); err != nil {
+				t.Fatal(err)
+			}
 			repoRoot = out.Result.RepoRoot
 		}
 		// macOS 的 TempDir 有 /private 前缀差异,按后缀比对。
@@ -85,7 +92,9 @@ func TestServeMultiRepo(t *testing.T) {
 	}
 
 	// SIGINT 优雅停机(runServe 的 NotifyContext 捕获,测试进程不受影响)。
-	syscall.Kill(os.Getpid(), syscall.SIGINT)
+	if err := syscall.Kill(os.Getpid(), syscall.SIGINT); err != nil {
+		t.Fatal(err)
+	}
 	select {
 	case c := <-code:
 		if c != 0 {

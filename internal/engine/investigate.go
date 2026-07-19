@@ -16,7 +16,7 @@ import (
 
 // InvestigateArgs 入参。
 type InvestigateArgs struct {
-	Question string `json:"question"`
+	Question string `json:"question" redact:"true"`
 	Scope    string `json:"scope,omitempty"`
 }
 
@@ -25,7 +25,9 @@ type InvestigateArgs struct {
 // 委派模式(主):秒回侦查简报;自派备模式(config scout=self):PTY 驱动侦察兵
 // 进程执行简报,阻塞等交卷(impl §7.5)。简报附"来时路"(线索文件的近期
 // git 提交)——git 子进程在锁外跑(#21 同族)。
-func (e *Engine) Investigate(a InvestigateArgs, sid, author string) (string, error) {
+func (e *Engine) Investigate(a InvestigateArgs, sid, author string) (out string, err error) {
+	redaction := RedactSecrets(&a)
+	defer appendRedactionNotice(&out, &err, redaction)
 	if err := e.requireInit(); err != nil {
 		return "", err
 	}
@@ -219,15 +221,17 @@ func (e *Engine) briefingLocked(job *scoutJob, selfMode bool) (string, []string)
 // FindingsArgs 是 kb_submit_findings 入参。
 type FindingsArgs struct {
 	Job        string   `json:"job"`
-	Conclusion string   `json:"conclusion"`
+	Conclusion string   `json:"conclusion" redact:"true"`
 	Locations  []string `json:"locations,omitempty"`
-	Plan       string   `json:"plan,omitempty"`
-	Risks      string   `json:"risks,omitempty"`
+	Plan       string   `json:"plan,omitempty" redact:"true"`
+	Risks      string   `json:"risks,omitempty" redact:"true"`
 }
 
 // SubmitFindings 侦察兵交卷:findings 落库存档 + 销 job(impl §7.3)。
 // 委派模式下不路由——子代理自己的返回值就是回程通道。
-func (e *Engine) SubmitFindings(a FindingsArgs, sid, author string) (string, error) {
+func (e *Engine) SubmitFindings(a FindingsArgs, sid, author string) (out string, err error) {
+	redaction := RedactSecrets(&a)
+	defer appendRedactionNotice(&out, &err, redaction)
 	if err := e.requireInit(); err != nil {
 		return "", err
 	}

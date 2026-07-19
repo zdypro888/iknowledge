@@ -109,7 +109,7 @@ func ensureServe(s *store.Store, base string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	defer logF.Close()
+	defer func() { _ = logF.Close() }()
 	cmdArgs := []string{"serve", "--repo", s.RepoRoot()}
 	// token 文件是持久化的本机 auth 模式标记：机器重启后 stdio 自动拉起
 	// serve 时必须继续传 --auth，不能把旧 token 仅当请求头后静默降级为裸服务。
@@ -122,7 +122,7 @@ func ensureServe(s *store.Store, base string) (string, error) {
 	if err := cmd.Start(); err != nil {
 		return "", fmt.Errorf("拉起 serve: %w", err)
 	}
-	go cmd.Wait() // 回收僵尸(serve 常驻,正常情况下不返回)
+	go func() { _ = cmd.Wait() }() // 回收僵尸(serve 常驻,正常情况下不返回)
 	deadline := time.Now().Add(8 * time.Second)
 	var lastProbe error
 	for time.Now().Before(deadline) {
@@ -212,8 +212,8 @@ func proxyStdio(in io.Reader, out io.Writer, endpoint string, s *store.Store, ba
 		// 短期 session 到期后重握手并把同一 JSON-RPC 请求安全重试一次。
 		// 401 发生在 handler 进入业务前，不会造成写工具重复执行。
 		if err == nil && resp.StatusCode == http.StatusUnauthorized {
-			io.Copy(io.Discard, resp.Body)
-			resp.Body.Close()
+			_, _ = io.Copy(io.Discard, resp.Body)
+			_ = resp.Body.Close()
 			fresh, refreshErr := s.AcquireLocalAuthSession(context.Background(), base, "/mcp/main",
 				&http.Client{Timeout: 3 * time.Second})
 			if refreshErr == nil {
@@ -308,9 +308,6 @@ func parseBridgeRequest(line []byte) (id json.RawMessage, hasID bool, code int, 
 		return nil, false, 0, "" // 合法 notification。
 	}
 	trimmed := bytes.TrimSpace(id)
-	if bytes.Equal(trimmed, []byte("null")) {
-		return nil, false, -32600, "invalid request: id must not be null"
-	}
 	var value any
 	dec := json.NewDecoder(bytes.NewReader(trimmed))
 	dec.UseNumber()
@@ -318,6 +315,8 @@ func parseBridgeRequest(line []byte) (id json.RawMessage, hasID bool, code int, 
 		return nil, false, -32600, "invalid request id"
 	}
 	switch value.(type) {
+	case nil:
+		return id, true, 0, "" // JSON-RPC 不推荐 null ID，但它仍是请求而非通知。
 	case string, json.Number:
 		return id, true, 0, ""
 	default:

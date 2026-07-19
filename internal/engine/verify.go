@@ -16,12 +16,14 @@ import (
 type VerifyArgs struct {
 	Entry    string `json:"entry"` // "node-id#entry-id"
 	Verdict  string `json:"verdict"`
-	Evidence string `json:"evidence,omitempty"`
-	Reason   string `json:"reason,omitempty"`
+	Evidence string `json:"evidence,omitempty" redact:"true"`
+	Reason   string `json:"reason,omitempty" redact:"true"`
 }
 
 // Verify confirm(升级)/ refute(勘误,须证据,级联回收)/ obsolete(体面退休)。
-func (e *Engine) Verify(a VerifyArgs, sid, author string) (string, error) {
+func (e *Engine) Verify(a VerifyArgs, sid, author string) (out string, err error) {
+	redaction := RedactSecrets(&a)
+	defer appendRedactionNotice(&out, &err, redaction)
 	if err := e.requireInit(); err != nil {
 		return "", err
 	}
@@ -387,18 +389,20 @@ type AdoptArgs struct {
 	Orphan string `json:"orphan"`
 	Action string `json:"action"` // claim | bury
 	To     string `json:"to,omitempty"`
-	Reason string `json:"reason,omitempty"`
+	Reason string `json:"reason,omitempty" redact:"true"`
 }
 
 // Adopt claim(认领,等价一次申报式迁移)/ bury(送葬,归档进 journal 可溯)。
-func (e *Engine) Adopt(a AdoptArgs, sid, author string) (string, error) {
+func (e *Engine) Adopt(a AdoptArgs, sid, author string) (out string, err error) {
+	redaction := RedactSecrets(&a)
+	defer appendRedactionNotice(&out, &err, redaction)
 	// claim 与 record_change 的“申报式迁移”是同一事务语义，直接复用其
 	// 先规划、分片提交、journal 提交、失败回滚与 NodeEffects 管线。
 	if a.Action == "claim" {
 		if strings.TrimSpace(a.Orphan) == "" || strings.TrimSpace(a.To) == "" {
 			return "", kbErr("NODE_NOT_FOUND", "claim 必须给 orphan 与 to(新节点 ID)", "补全后重试")
 		}
-		out, err := e.RecordChange(ChangeArgs{
+		out, err = e.RecordChange(ChangeArgs{
 			Nodes: []string{a.To}, What: "认领孤儿 " + a.Orphan + " → " + a.To,
 			Why:         "kb_adopt claim(等价申报式迁移)",
 			Remaps:      []model.Remap{{From: a.Orphan, To: []string{a.To}}},

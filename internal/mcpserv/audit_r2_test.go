@@ -37,7 +37,9 @@ func TestOriginValidation(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			resp.Body.Close()
+			if err := resp.Body.Close(); err != nil {
+				t.Fatal(err)
+			}
 			if tc.wantOK && resp.StatusCode != http.StatusOK {
 				t.Fatalf("合法来源被拒:HTTP %d", resp.StatusCode)
 			}
@@ -54,7 +56,9 @@ func TestOriginValidation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	resp.Body.Close()
+	if err := resp.Body.Close(); err != nil {
+		t.Fatal(err)
+	}
 	if resp.StatusCode != http.StatusForbidden {
 		t.Fatalf("/inject 带外部 Origin 应 403,实得 HTTP %d", resp.StatusCode)
 	}

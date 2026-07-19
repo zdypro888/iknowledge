@@ -308,6 +308,8 @@ type UsageRecord struct {
 	Hit       bool   `json:"hit,omitempty"`       // recall/map 是否命中
 	HitStatus string `json:"hitStatus,omitempty"` // 命中节点状态(undigested 命中率数据源)
 	Stale     bool   `json:"stale,omitempty"`     // recall 读取时对账发现失配(未记账变更事件)
+	Warnings  int    `json:"warnings,omitempty"`  // precheck 实际发现的告警总数
+	Blocked   bool   `json:"blocked,omitempty"`   // strict precheck 是否据此拒绝提交
 	MS        int64  `json:"ms"`
 }
 

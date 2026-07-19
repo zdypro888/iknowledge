@@ -39,6 +39,39 @@ func TestImportRestrictsBundleEntries(t *testing.T) {
 	}
 }
 
+func TestImportRedactsSecretsInDryRunAndWrite(t *testing.T) {
+	e, repo := initEngine(t, map[string]string{"a.go": "package a\n\nfunc F() {}\n"})
+	secret := "sk-abcdefghijklmnopqrstuvwxyz123456"
+	body := "schema: 1\npassword: \"abcdefghijklmnop\"\nnodes: []\nnote: leaked " + secret + "\n"
+	bundle := makeTestBundle(t, map[string]string{"tree/imported.go.yaml": body})
+
+	rep, err := e.ImportWithOptions(bytes.NewReader(bundle), ImportOptions{DryRun: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rep.Redacted != 2 || len(rep.Entries) != 1 || rep.Entries[0].Redacted != 2 {
+		t.Fatalf("dry-run 未报告脱敏:%+v", rep)
+	}
+	path := filepath.Join(repo, ".knowledge/tree/imported.go.yaml")
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("dry-run 不应写入:%v", err)
+	}
+
+	rep, err = e.ImportWithOptions(bytes.NewReader(bundle), ImportOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rep.Redacted != 2 || strings.Contains(string(data), secret) ||
+		!strings.Contains(string(data), "[REDACTED:openai-key]") ||
+		!strings.Contains(string(data), `password: "[REDACTED:credential]"`) {
+		t.Fatalf("导入未脱敏: report=%+v\n%s", rep, data)
+	}
+}
+
 func TestImportDryRunAndBackupReport(t *testing.T) {
 	e, repo := initEngine(t, map[string]string{"a.go": "package a\n\nfunc F() {}\n"})
 	var buf bytes.Buffer

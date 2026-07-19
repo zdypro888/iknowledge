@@ -79,9 +79,9 @@ func (Golang) FileCalls(path string, src []byte) (*FileCalls, error) {
 
 	// 声明清单:与 Parse 同序同法,含 ~n 消歧——先收 (声明, 规范名) 再统一消歧。
 	type declRef struct {
-		fn    *ast.FuncDecl   // 函数/方法(nil 表示 GenDecl 名)
-		spec  *ast.ValueSpec  // var(nil 表示非 var)
-		valAt int             // var 多名时该名在 spec.Names 的下标
+		fn    *ast.FuncDecl  // 函数/方法(nil 表示 GenDecl 名)
+		spec  *ast.ValueSpec // var(nil 表示非 var)
+		valAt int            // var 多名时该名在 spec.Names 的下标
 	}
 	var refs []declRef
 	var names []string

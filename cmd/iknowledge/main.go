@@ -15,12 +15,12 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
-	"runtime/debug"
 	"sort"
 	"strings"
 	"syscall"
 	"time"
 
+	"github.com/zdypro888/iknowledge/internal/buildinfo"
 	"github.com/zdypro888/iknowledge/internal/engine"
 	"github.com/zdypro888/iknowledge/internal/mcpserv"
 	"github.com/zdypro888/iknowledge/internal/store"
@@ -36,17 +36,15 @@ const usage = `iknowledge——AI 代码知识库(MCP 服务)
   iknowledge status --repo <path> [--prompt]                   库状态;--prompt 打印纪律提示词
   iknowledge doctor --repo <path> [--deploy] [--strict]        自检:初始化/配置/parser/维护欠账/PATH 部署
   iknowledge maintain --repo <path> [--plan]                   打印维护欠账清单/路线(只读;取用/销账走 MCP kb_maintain)
-  iknowledge setup  --repo <path>                              打印接入三件套(.mcp.json/纪律段/hook),只打印不代写
+  iknowledge brief --repo <path> [--budget 1200]               一屏项目简报(WIP/风险/近期决策/维护债)
+  iknowledge precheck --repo <path> [--working] [--strict]     提交前检查已知否决/腐烂/矛盾/记账;缺省仅告警
+  iknowledge setup  --repo <path>                              打印 MCP/纪律/hook/pre-commit 接入片段,只打印不代写
   iknowledge trust-scout --repo <path>                         本机授权当前 scout:self/command 配置(配置变化即失效)
   iknowledge hook   [--repo <path>]                            宿主 hook 桥(Claude Code PostToolUse):注入所触文件的知识
   iknowledge export  --repo <path> [-o file.kbundle]           导出知识为 .kbundle(tar.gz;备份/迁移;缺省输出 stdout)
   iknowledge import  --repo <path> -i file.kbundle [--dry-run] [--backup] [--force] [--remap from=to]  导入 .kbundle(默认不覆盖异内容)
   iknowledge version                                           版本自报(排障:确认在跑哪个构建)
 `
-
-// buildVersion 由 release workflow 用 -X main.buildVersion=<tag> 注入。go install
-// 或本地 go build 仍回退到 Go build info，不维护另一份手写版本常量。
-var buildVersion string
 
 func main() {
 	os.Exit(run(os.Args[1:]))
@@ -70,6 +68,10 @@ func run(args []string) int {
 		return runDoctor(args[1:], os.Stdout)
 	case "maintain":
 		return runMaintain(args[1:], os.Stdout)
+	case "brief":
+		return runBrief(args[1:], os.Stdout)
+	case "precheck":
+		return runPrecheck(args[1:], os.Stdout)
 	case "setup":
 		return runSetup(args[1:], os.Stdout)
 	case "trust-scout":
@@ -403,23 +405,8 @@ func runVersion() int {
 }
 
 func versionText() string {
-	version, revision, dirty := "(devel)", "", false
-	if buildVersion != "" {
-		version = buildVersion
-	}
-	if bi, ok := debug.ReadBuildInfo(); ok {
-		if buildVersion == "" && bi.Main.Version != "" {
-			version = bi.Main.Version
-		}
-		for _, s := range bi.Settings {
-			switch s.Key {
-			case "vcs.revision":
-				revision = s.Value
-			case "vcs.modified":
-				dirty = s.Value == "true"
-			}
-		}
-	}
+	info := buildinfo.Read()
+	version, revision, dirty := info.Version, info.Revision, info.Dirty
 	if len(revision) > 12 {
 		revision = revision[:12]
 	}

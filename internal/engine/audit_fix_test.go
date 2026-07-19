@@ -20,7 +20,7 @@ func TestPathTraversalBlocked(t *testing.T) {
 	if err := os.WriteFile(outside, []byte("package x\n\nfunc Secret() {}\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	defer os.Remove(outside)
+	defer func() { _ = os.Remove(outside) }()
 
 	for _, node := range []string{"../secret.go#Secret", "../../etc/passwd#x", "/etc/passwd#x"} {
 		_, err := e.Remember(RememberArgs{Node: node,
@@ -35,12 +35,14 @@ func TestPathTraversalBlocked(t *testing.T) {
 	}
 	// .knowledge 里绝不出现仓库外路径的分片。
 	var leaked []string
-	filepath.WalkDir(filepath.Join(repo, ".knowledge"), func(p string, d os.DirEntry, err error) error {
+	if err := filepath.WalkDir(filepath.Join(repo, ".knowledge"), func(p string, d os.DirEntry, err error) error {
 		if err == nil && strings.Contains(p, "secret") {
 			leaked = append(leaked, p)
 		}
 		return nil
-	})
+	}); err != nil {
+		t.Fatal(err)
+	}
 	if len(leaked) > 0 {
 		t.Errorf("路径穿越写出了分片:%v", leaked)
 	}
@@ -55,8 +57,10 @@ func TestMaliciousShardNodeIDDropped(t *testing.T) {
 		t.Fatal(err)
 	}
 	// 放到会被扫描的位置。
-	os.Rename(filepath.Join(repo, ".knowledge", "tree", "a.go.yaml.evil"),
-		filepath.Join(repo, ".knowledge", "tree", "evil.go.yaml"))
+	if err := os.Rename(filepath.Join(repo, ".knowledge", "tree", "a.go.yaml.evil"),
+		filepath.Join(repo, ".knowledge", "tree", "evil.go.yaml")); err != nil {
+		t.Fatal(err)
+	}
 	if err := e.EnsureRuntime(); err != nil {
 		t.Fatal(err)
 	}

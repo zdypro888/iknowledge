@@ -36,19 +36,21 @@ iknowledge version    # 验证
 # 2. 初始化你的仓库(纯 AST 骨架秒建,零 LLM 成本;48 万行仓库实测约 13 秒)
 iknowledge init --repo /path/to/your/repo
 
-# 3. 打印接入三件套,按提示各贴一处(iknowledge 只打印、不代写你的文件)
+# 3. 打印接入指南,按需粘贴各段(iknowledge 只打印、不代写你的文件)
 iknowledge setup --repo /path/to/your/repo
 
 # (无需手动启动服务:.mcp.json 用 stdio 形态时,AI 会话会自动带起后台 serve)
 ```
 
-`setup` 打印的三件套,各贴进目标仓库的三个文件:
+`setup` 会打印五段标注明确的接入配置:
 
 | 贴到哪 | 是什么 | 作用 |
 |---|---|---|
 | `.mcp.json` | MCP stdio 桥(`command: iknowledge stdio`) | agent 看见 16 个 kb_* 工具;桥按需自动拉起后台 serve,零服务管理(必装) |
 | `CLAUDE.md` | 纪律提示词 | AI 干活的规矩:读前查库、改后记账、悟到就沉淀(必装) |
 | `.claude/settings.json` | hook 片段 | AI 每 Read/Edit 一个文件,该文件的知识+过时警报自动进上下文(推荐) |
+| `~/.codex/config.toml` + 仓库 `AGENTS.md` | Codex MCP + 纪律 | 使用 Codex 宿主时接入(可选) |
+| `.git/hooks/pre-commit` | `iknowledge precheck --repo .` | 提交前呈现历史否决、腐烂知识、矛盾与漏记账;缺省只告警,自行加 `--strict` 才阻断(可选) |
 
 多仓库共存没问题:每个仓库端口独立(`18000 + hash(路径) % 2000`);一个进程可以同时服务多个仓库(`iknowledge serve --repo A --repo B`,每仓仍用自己的端口,客户端配置不用改)。
 
@@ -99,6 +101,8 @@ WantedBy=default.target
 iknowledge status --repo .     # 看覆盖率/新鲜度/维护欠账 + 热点待消化清单(git 改动频率 × 被调中心度)
 iknowledge doctor --repo . --deploy   # 初始化/配置/parser/部署自检;会提示误留的 serve 进程
 iknowledge maintain --repo . --plan   # 只读打印维护路线(清账让 AI 走 kb_maintain)
+iknowledge brief --repo . --budget 1200   # 新会话一屏简报:WIP/风险/近期决策/维护债
+iknowledge precheck --repo .          # 用已知风险与变更账本检查暂存源码
 iknowledge import --repo . -i backup.kbundle --dry-run --backup   # bundle 迁移前先预演并备份
 # 已有非 journal 文件内容不同时,核对报告后才显式加 --force;所有 hard cap 仍不可绕过
 git add .knowledge && git commit   # 知识随代码提交,团队共享、跟分支走
@@ -156,10 +160,11 @@ curl -fsSL https://raw.githubusercontent.com/zdypro888/iknowledge/main/uninstall
 
 ## 状态
 
-第一期已全量交付并持续加固:现为 16 个 MCP 工具 + `/mcp/main`、`/mcp/scout` 双端点 + `GET /inject` 与只读腿(`/recall` `/map` `/status`)+ `iknowledge hook/setup/maintain/doctor` 套件。2026-07-11 对抗审计又集中加固了可崩溃恢复的多文件事务、严格/便携 bundle、解析边界与语义哈希、代际索引、并发快照、源码/存储 symlink 边界、listener 身份、自派侦查信任和跨平台校验安装。2026-07-04 补齐原二/三/四期计划:全仓调用图与结构扩展检索、热点待消化清单、矛盾裁决登记、非代码知识复核提醒、`--auth` 鉴权、单进程多仓库、Windows 支持、PTY 自派侦查备模式。**客户端双实测通过**(Claude Code + Codex,含 instructions 语义)。**M1.4 A/B 验收达标**:10 个固定定位任务,接知识库(种子覆盖 19%)vs 裸 grep 同模型双跑——中位 token 省 41%(59% ≤ 60% 阈值)、8/10 任务更省、用时更短;协议、工装(`cmd/kbeval`)与两轮全量数据在 [eval/m14/](eval/m14/)。
+第一期已全量交付并持续加固:现为 16 个 MCP 工具 + `/mcp/main`、`/mcp/scout` 双端点 + `GET /inject` 与只读腿(`/recall` `/map` `/status`)+ `iknowledge hook/setup/maintain/doctor/brief/precheck` 套件。2026-07-11 对抗审计集中加固了可崩溃恢复的多文件事务、严格/便携 bundle、解析边界与语义哈希、代际索引、并发快照、源码/存储 symlink 边界、listener 身份、自派侦查信任和跨平台校验安装;2026-07-18 又加入语义写入与 bundle 导入默认秘密脱敏、预算化新会话简报、暂存区风险/记账预检。2026-07-04 补齐原二/三/四期计划:全仓调用图与结构扩展检索、热点待消化清单、矛盾裁决登记、非代码知识复核提醒、`--auth` 鉴权、单进程多仓库、Windows 支持、PTY 自派侦查备模式。**客户端双实测通过**(Claude Code + Codex,含 instructions 语义)。**M1.4 A/B 验收达标**:10 个固定定位任务,接知识库(种子覆盖 19%)vs 裸 grep 同模型双跑——中位 token 省 41%(59% ≤ 60% 阈值)、8/10 任务更省、用时更短;协议、工装(`cmd/kbeval`)与两轮全量数据在 [eval/m14/](eval/m14/)。
 
 - [`knowledge.md`](knowledge.md) — 概念设计全案(20 轮设计讨论的收敛:五个维度、自愈机制、经济学、安全、四篇推演)
 - [`knowledge-impl.md`](knowledge-impl.md) — 第一期工程方案(包结构、数据模型、存储、MCP API 全量规范、里程碑)
+- [`vecdb.md`](vecdb.md) — 可选语义/向量检索设计,明确尚未实现
 
 ## 许可证
 

@@ -9,6 +9,8 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+
+	"github.com/zdypro888/iknowledge/internal/buildinfo"
 	"time"
 
 	"github.com/zdypro888/iknowledge/internal/engine"
@@ -140,9 +142,9 @@ func TestRunImportRejectsCaseFoldOverwriteBlackBox(t *testing.T) {
 }
 
 func TestVersionPrefersReleaseInjectedBuildVersion(t *testing.T) {
-	old := buildVersion
-	buildVersion = "v9.8.7-test"
-	t.Cleanup(func() { buildVersion = old })
+	old := buildinfo.Version
+	buildinfo.Version = "v9.8.7-test"
+	t.Cleanup(func() { buildinfo.Version = old })
 	got := versionText()
 	if !strings.Contains(got, "iknowledge v9.8.7-test") || strings.Contains(got, "(devel)") {
 		t.Fatalf("versionText=%q", got)

@@ -36,20 +36,22 @@ iknowledge version    # verify
 # 2. Initialize your repo (pure-AST skeleton, zero LLM cost; ~13 s measured on a 480k-line repo)
 iknowledge init --repo /path/to/your/repo
 
-# 3. Print the three integration snippets; paste each where indicated (iknowledge only prints — it never writes your files)
+# 3. Print the integration guide; paste the sections you use (iknowledge only prints — it never writes your files)
 iknowledge setup --repo /path/to/your/repo
 
 # (No manual server start needed: with the stdio form in .mcp.json,
 #  the first AI session brings the background serve up automatically)
 ```
 
-The three snippets printed by `setup` go into three files of the target repo:
+`setup` prints five clearly labelled sections:
 
 | Where | What | Why |
 |---|---|---|
 | `.mcp.json` | MCP stdio bridge (`command: iknowledge stdio`) | The agent sees the 16 `kb_*` tools; the bridge auto-starts the background serve on demand — zero service management (required) |
 | `CLAUDE.md` | Discipline prompt | The working rules for the AI: query before locating, record after changing, distill what was hard-won (required) |
 | `.claude/settings.json` | Hook snippet | Every time the AI Reads/Edits a file, that file's knowledge + staleness alerts are injected into context automatically (recommended) |
+| `~/.codex/config.toml` + repo `AGENTS.md` | Codex MCP + discipline | Codex integration when that host is used (optional) |
+| `.git/hooks/pre-commit` | `iknowledge precheck --repo .` | Surfaces rejected designs, stale knowledge, disputes and missing change-ledger coverage; warning-only unless you add `--strict` (optional) |
 
 Multiple repos coexist naturally: each repo gets its own port (`18000 + hash(path) % 2000`), and one process can serve several repos at once (`iknowledge serve --repo A --repo B` — each repo keeps its own port, so no client config changes).
 
@@ -100,6 +102,8 @@ You only occasionally need:
 iknowledge status --repo .     # coverage / freshness / maintenance debts + hotspot digestion list (git churn × cross-file fan-in)
 iknowledge doctor --repo . --deploy   # init/config/parser/deploy self-check; also flags accidental serve processes
 iknowledge maintain --repo . --plan   # read-only debt roadmap (repayment goes through kb_maintain, done by the AI)
+iknowledge brief --repo . --budget 1200   # bounded new-session briefing: WIP, risks, recent decisions, debts
+iknowledge precheck --repo .          # inspect staged source against known risks and change-ledger coverage
 iknowledge import --repo . -i backup.kbundle --dry-run --backup   # preview/backup before bundle migration
 # Existing different non-journal files require an explicit, reviewed --force; hard caps remain enforced.
 git add .knowledge && git commit   # knowledge ships with the code: team-shared, branch-aware
@@ -158,10 +162,11 @@ Do the per-project sentence first, then the machine-level script (reversed order
 
 ## Status
 
-Phase 1 fully delivered and continuously hardened: now 16 MCP tools + the `/mcp/main` and `/mcp/scout` endpoints + `GET /inject` and the read-only legs (`/recall` `/map` `/status`) + the `iknowledge hook/setup/maintain/doctor` suite. A 2026-07-11 adversarial audit additionally hardened crash-recoverable multi-file transactions, strict/portable bundles, parser boundaries and semantic hashes, generation-aware indexes, concurrent snapshots, source/storage symlink confinement, listener identity, self-scout trust, and checksummed cross-platform installation. On 2026-07-04 the originally-deferred phase 2/3/4 items landed: full-repo call graph & structural search expansion, hotspot digestion list, dispute registration, review reminders for non-code knowledge, `--auth`, multi-repo single daemon, Windows support, and the PTY self-dispatch scout fallback. **Both clients field-tested** (Claude Code + Codex, including instructions semantics). **M1.4 A/B acceptance passed**: 10 fixed code-location tasks, knowledge-base-connected (19 % seeded coverage) vs bare grep, same model — median tokens down 41 % (59 % ≤ the 60 % threshold), cheaper on 8/10 tasks, faster wall-clock; protocol, harness (`cmd/kbeval`) and both rounds of raw data live in [eval/m14/](eval/m14/).
+Phase 1 fully delivered and continuously hardened: now 16 MCP tools + the `/mcp/main` and `/mcp/scout` endpoints + `GET /inject` and the read-only legs (`/recall` `/map` `/status`) + the `iknowledge hook/setup/maintain/doctor/brief/precheck` suite. A 2026-07-11 adversarial audit additionally hardened crash-recoverable multi-file transactions, strict/portable bundles, parser boundaries and semantic hashes, generation-aware indexes, concurrent snapshots, source/storage symlink confinement, listener identity, self-scout trust, and checksummed cross-platform installation. The 2026-07-18 additions provide default secret redaction for semantic writes and bundle imports, a bounded new-session briefing, and staged-change risk/accounting precheck. On 2026-07-04 the originally-deferred phase 2/3/4 items landed: full-repo call graph & structural search expansion, hotspot digestion list, dispute registration, review reminders for non-code knowledge, `--auth`, multi-repo single daemon, Windows support, and the PTY self-dispatch scout fallback. **Both clients field-tested** (Claude Code + Codex, including instructions semantics). **M1.4 A/B acceptance passed**: 10 fixed code-location tasks, knowledge-base-connected (19 % seeded coverage) vs bare grep, same model — median tokens down 41 % (59 % ≤ the 60 % threshold), cheaper on 8/10 tasks, faster wall-clock; protocol, harness (`cmd/kbeval`) and both rounds of raw data live in [eval/m14/](eval/m14/).
 
 - [`knowledge.md`](knowledge.md) — the concept design (the convergence of 20 design rounds: five dimensions, self-healing, economics, security, four thought-experiments) *(Chinese)*
 - [`knowledge-impl.md`](knowledge-impl.md) — the phase-1 engineering spec (package layout, data model, storage, full MCP API spec, milestones) *(Chinese)*
+- [`vecdb.md`](vecdb.md) — the optional semantic/vector-search design; explicitly not implemented yet *(Chinese)*
 
 ## License
 
