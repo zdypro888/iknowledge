@@ -24,8 +24,8 @@ func (e *Engine) Task(a TaskArgs, sid, author string) (out string, err error) {
 	return e.TaskContext(context.Background(), a, sid, author)
 }
 
-// TaskContext adds the semantic decision firewall to task start while keeping
-// the original Task API for non-MCP callers. The firewall is advisory: an
+// TaskContext adds a historical decision advisory to task start while keeping
+// the original Task API for non-MCP callers. The advisory never blocks: an
 // unavailable provider never prevents WIP creation, but request cancellation
 // still stops the operation before it mutates task state.
 func (e *Engine) TaskContext(ctx context.Context, a TaskArgs, sid, author string) (out string, err error) {
@@ -51,7 +51,7 @@ func (e *Engine) TaskContext(ctx context.Context, a TaskArgs, sid, author string
 	}
 	decisionWarning := ""
 	if a.Action == "start" {
-		decisionWarning = e.semanticDecisionFirewall(ctx, taskDecisionQuery(a.WIP), a.WIP.Touching)
+		decisionWarning = e.semanticDecisionAdvisory(ctx, taskDecisionQuery(a.WIP), a.WIP.Touching)
 		if err := ctx.Err(); err != nil {
 			return "", err
 		}
@@ -220,22 +220,22 @@ func taskDecisionQuery(w model.WIP) string {
 }
 
 const (
-	semanticFirewallMaxNeighborScope = 100
-	semanticFirewallMaxExactWarnings = 20
-	semanticFirewallMaxOtherWarnings = 6
+	semanticAdvisoryMaxNeighborScope = 100
+	semanticAdvisoryMaxExactWarnings = 20
+	semanticAdvisoryMaxOtherWarnings = 6
 )
 
-// semanticDecisionFirewall compares a proposed task with risk/history cards.
+// semanticDecisionAdvisory compares a proposed task with risk/history cards.
 // Similarity is discovery only: it never blocks, never automatically overturns
 // a decision, and always returns truth-graph references for exact review.
-func (e *Engine) semanticDecisionFirewall(ctx context.Context, query string, touching []string) string {
+func (e *Engine) semanticDecisionAdvisory(ctx context.Context, query string, touching []string) string {
 	if strings.TrimSpace(query) == "" {
 		return ""
 	}
 	candidates, semanticWarning := e.semanticCandidates(ctx, query)
 	statusNote := ""
 	if semanticWarning != "" {
-		statusNote = "\n⚠ 语义决策防火墙状态提示: " + semanticWarning + "；任务不会因此阻断，本次告警可能不完整。"
+		statusNote = "\n⚠ 历史决策提醒状态: " + semanticWarning + "；任务不会因此阻断，本次提醒可能不完整。"
 	}
 	if err := e.rt.mu.RLockContext(ctx); err != nil {
 		// TaskContext checks ctx immediately after this advisory helper returns and
@@ -252,7 +252,7 @@ func (e *Engine) semanticDecisionFirewall(ctx context.Context, query string, tou
 	if len(candidates.risk)+len(candidates.history) > 0 {
 		if manifestErr != nil {
 			if statusNote == "" {
-				statusNote = "\n⚠ 语义决策防火墙状态提示: " + manifestErr.Error() + "；任务不会因此阻断，本次告警可能不完整。"
+				statusNote = "\n⚠ 历史决策提醒状态: " + manifestErr.Error() + "；任务不会因此阻断，本次提醒可能不完整。"
 			}
 		} else {
 			// Preserve the complete configured Top-K until touching/one-hop priority is
@@ -280,9 +280,9 @@ func (e *Engine) semanticDecisionFirewall(ctx context.Context, query string, tou
 			roots = append(roots, id)
 		}
 	}
-	neighbors := e.structuralNeighborsLocked(roots, semanticFirewallMaxNeighborScope+1)
-	if len(neighbors) > semanticFirewallMaxNeighborScope {
-		neighbors = neighbors[:semanticFirewallMaxNeighborScope]
+	neighbors := e.structuralNeighborsLocked(roots, semanticAdvisoryMaxNeighborScope+1)
+	if len(neighbors) > semanticAdvisoryMaxNeighborScope {
+		neighbors = neighbors[:semanticAdvisoryMaxNeighborScope]
 		statusNote += "\n⚠ 结构一跳范围超过 100 个节点；已检查优先级最高的 100 个，touching 精确节点仍全部检查，其余结构告警可能不完整。"
 	}
 	for _, neighbor := range neighbors {
@@ -330,12 +330,12 @@ func (e *Engine) semanticDecisionFirewall(ctx context.Context, query string, tou
 		}
 		return ordered[i].nodeID < ordered[j].nodeID
 	})
-	selected := make([]warning, 0, semanticFirewallMaxExactWarnings+semanticFirewallMaxOtherWarnings)
+	selected := make([]warning, 0, semanticAdvisoryMaxExactWarnings+semanticAdvisoryMaxOtherWarnings)
 	exactN, otherN, omittedExact, omittedOther := 0, 0, 0, 0
 	omittedExactNodes := map[string]bool{}
 	for _, item := range ordered {
 		if item.proximity == 2 {
-			if exactN >= semanticFirewallMaxExactWarnings {
+			if exactN >= semanticAdvisoryMaxExactWarnings {
 				omittedExact++
 				omittedExactNodes[item.nodeID] = true
 				continue
@@ -344,7 +344,7 @@ func (e *Engine) semanticDecisionFirewall(ctx context.Context, query string, tou
 			selected = append(selected, item)
 			continue
 		}
-		if otherN >= semanticFirewallMaxOtherWarnings {
+		if otherN >= semanticAdvisoryMaxOtherWarnings {
 			omittedOther++
 			continue
 		}
@@ -353,7 +353,7 @@ func (e *Engine) semanticDecisionFirewall(ctx context.Context, query string, tou
 	}
 	ordered = selected
 	var b strings.Builder
-	b.WriteString("\n⚠ 语义决策防火墙（仅告警，不阻断；相似不等于裁决）:")
+	b.WriteString("\n⚠ 历史决策提醒（仅供参考，不阻断；相似不等于裁决）:")
 	for _, item := range ordered {
 		label := "历史"
 		if item.lane == semanticLaneRisk {
@@ -431,7 +431,7 @@ func (e *Engine) mergeScopedManifestEvidenceLocked(in []semanticEvidence, manife
 }
 
 // mergeScopedTruthRiskEvidenceLocked is the model-free core of the decision
-// firewall. Directly touched/adjacent code with a live pitfall, suspect state,
+// advisory. Directly touched/adjacent code with a live pitfall, suspect state,
 // pending anchor, orphan, or open dispute always emits a warning, even if the
 // task wording shares no lexical token and no embedding provider is configured.
 func (e *Engine) mergeScopedTruthRiskEvidenceLocked(in []semanticEvidence, scope, exactScope map[string]bool) []semanticEvidence {

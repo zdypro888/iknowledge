@@ -41,11 +41,11 @@ iknowledge 需要的是一个受控的“第三候选发现通道”，不是一
 - 不切分或上传源码全文，不做通用源码问答 RAG；
 - 不让语义相似代替调用图、流程、精确节点解析或源文件核验；
 - 不把向量候选误写成一层已实现的逐条 lineage/supersedes/confidence/dispute 裁决；精确节点下钻仍由既有快照/历史逻辑呈现当前状态和负知识；
-- 当前不把 semantic 候选直接接入 `kb_diagnose`；风险卡已服务 `kb_recall` 与任务开始时的决策防火墙，diagnose 若接入仍需自己的行为评测；
+- 当前不把 semantic 候选直接接入 `kb_diagnose`；风险卡已服务 `kb_recall` 与任务开始时的历史决策提醒，diagnose 若接入仍需自己的行为评测；
 - 首版不实现 HNSW、分布式索引、多租户服务或百万级数据；
 - 不内置 embedding 模型，也不要求 Docker、Python、SQLite、Faiss 或常驻向量数据库；
 - 当前不依赖 Eino/eino-ext、chromem-go 或 Zvec。
-- 不让“语义决策防火墙”自动拒绝任务、推翻决定或修改知识；它只给出带精确引用的告警，源码与人工/AI 复核仍负责裁决。
+- 不让“历史决策提醒”自动拒绝任务、推翻决定或修改知识；它只给出带精确引用的辅助提醒，源码与人工/AI 复核仍负责裁决。
 
 ## 3. 用户模式与安全授权
 
@@ -250,7 +250,7 @@ vector       L2-normalized float32[]
 - 查询对 `current/risk/history` 一次 Flat 扫描，但每条 lane 独立按 NodeID distinct Top-K；当前 manifest 过滤发生在节点竞争与 Top-K **之前**，失效高分卡不能挤掉仍有效的低分回填。同一节点即使有多张高分卡，在同一 lane 也只占一个名额，同分按 record ID 稳定选择；
 - change/flow 证据按其发生时刻解析 NodeID，再沿 lineage 映射到全部当前继承者；不能把旧 ID 后来复用的无关新符号误当历史主体，也不能在一次 split 后只保留字典序第一个继承者；
 - current 才参与 lexical RRF；risk/history 始终分栏呈现为 advisory。cosine 只负责发现，不是 confidence，也不能把 rejected/historical 自动判成当前方案；
-- 任务决策防火墙不把 Top-K 当直接风险的安全边界：对 `touching` 全部当前 heirs 做 typed risk/history manifest 补齐并直接检查 truth 中的 pitfall/suspect/pending/orphan/open-dispute；结构一跳按确定性优先级最多检查 100 个节点。即使无模型、无词面命中或第二个 split heir 落在 Top-K 外也不得漏掉 touching 直接风险；一跳超限必须显式提示不完整；
+- 历史决策提醒不把 Top-K 当直接风险的完整性边界：对 `touching` 全部当前 heirs 做 typed risk/history manifest 补齐并直接检查 truth 中的 pitfall/suspect/pending/orphan/open-dispute；结构一跳按确定性优先级最多检查 100 个节点。即使无模型、无词面命中或第二个 split heir 落在 Top-K 外也不得漏掉 touching 直接风险；一跳超限必须显式提示不完整；
 - 每个 hit 都用 `record_id` 对照**当前 immutable source manifest**，同时验证 node ID、lane/source hash 与当前节点存在；缓存不保存卡片正文，也不直接成为答案；
 - 需要条目状态、dispute 双向关系或完整决策史时，必须按 facets/references/node ID 精确下钻；向量层不替代既有 lineage/supersedes/confidence 裁决。
 
@@ -340,7 +340,7 @@ vector payload: codec header + record table(id/node_id/kind/source_hash)
 
 preview 对文档、批次、响应、record、dimensions 和 vector payload 设置有界上限，超限时该 semantic 通道报资源边界并回退 lexical/structural；这是降低资源风险的工程边界，不作“绝不会 OOM”的绝对承诺。preview 不会在启动时主动为所有仓重建。多 repo 已有进程级 coordinator：steady load、hot enable、外部 generation 替换和本进程 rebuild 都共享 1GiB 逻辑矩阵预算，typed source manifest 则共享独立 384MiB 累计预算；disabled/clear/no-index/shutdown 归还对应额度。它们不是 LRU：容量不足会给出可操作错误；重建只有在需要时才先逐出**本仓**可重建内存，磁盘 generation 不删。Go runtime、估算偏差、provider response 等额外开销仍存在，因此这些是逻辑授权上限，不是 RSS/OOM 保证。
 
-## 8. 三通道召回与语义决策防火墙
+## 8. 三通道召回与历史决策提醒
 
 普通 `kb_recall` 的固定顺序如下：
 
@@ -353,12 +353,12 @@ preview 对文档、批次、响应、record、dimensions 和 vector payload 设
 7. **来源可解释**：输出显式列出 keyword rank/score、semantic rank/cosine 和 RRF；cosine 不是 confidence，风险/历史必须沿 refs 精确复核；
 8. **裁决边界**：semantic 层不自动执行 lineage/supersedes/confidence/dispute 裁决，不按相似度 refute/obsolete 条目，也不修改任务或代码。
 
-“语义决策防火墙”已接到 `kb_task start`：它把 task/intent/plan/todo 聚成脱敏 query。独立
+“历史决策提醒”已接到 `kb_task start`：它把 task/intent/plan/todo 聚成脱敏 query。独立
 `lexical-risk` 倒排让精确 pitfall/dispute 风险在 semantic 禁用时仍可告警且绝不进入 current；
-启用 semantic 后再用 risk/history 卡发现同义改写，并把 touching 节点的直接风险优先显示。全部 touching current heirs 会精确检查；结构一跳按稳定优先级最多检查 100 个节点，超限时明确提示其余结构告警可能不完整。输出明确标注“仅告警，不阻断；
+启用 semantic 后再用 risk/history 卡发现同义改写，并把 touching 节点的直接风险优先显示。全部 touching current heirs 会精确检查；结构一跳按稳定优先级最多检查 100 个节点，超限时明确提示其余结构提醒可能不完整。输出明确标注“仅供参考，不阻断；
 相似不等于裁决”，附 node/facets/refs/cosine，帮助 AI 在动手前发现换一种说法的历史否决、
-pitfall、dispute 或旧方案。provider/索引不可用时 WIP 仍正常建立，但返回显式“本次告警可能
-不完整”的状态提示；只有调用方取消才在写任务态前传播 cancellation。回执最多展开 20 条 touching 精确告警与 6 条其他告警；touching 超出输出预算时必须列出每个被省略的 **current heir ID**，而不是只给一个无法下钻的数量。防火墙永远不拒绝任务、
+pitfall、dispute 或旧方案。provider/索引不可用时 WIP 仍正常建立，但返回显式“本次提醒可能
+不完整”的状态提示；只有调用方取消才在写任务态前传播 cancellation。回执最多展开 20 条 touching 精确提醒与 6 条其他提醒；touching 超出输出预算时必须列出每个被省略的 **current heir ID**，而不是只给一个无法下钻的数量。这项提醒永远不拒绝任务、
 不替用户作决定、不把历史自动改写为当前结论。
 
 `kb_diagnose` 仍走已有 pitfall/flow/rejected 反查，没有直接继承这条 semantic candidate
@@ -435,7 +435,7 @@ sqlite-vec 官方 Go 文档同时给出 CGO binding 和基于 `ncruces/go-sqlite
 1. **核心契约（已交付）**：canonical-repo 仓外配置、query profile/policy、typed cards、Flat/codec、三 lane distinct-node Top-K、格式/限额/竞态测试；
 2. **provider（已交付）**：标准库 Ollama/OpenAI-compatible HTTP，请求 context、脱敏、redirect/坏响应降级，以及 rebuild 双模式同批 canary 和 query+canary；
 3. **MCP/Recall（已交付）**：`kb_status` 健康与 `kb_semantic status|sync`、精确短路、current+lexical RRF、risk/history advisory、partial source-hash 复用、结构邻居与来源解释；
-4. **决策防火墙（已交付）**：`kb_task start` 对 risk/history 做语义防撞，仅告警、不阻断、不裁决；
+4. **历史决策提醒（已交付，辅助能力）**：`kb_task start` 对 risk/history 做相似线索发现，仅供参考、不阻断、不裁决；
 5. **离线算法回归基线（已交付）**：`cmd/kbsemeval` 读取版本化 `eval/semantic/v1/qrels.jsonl`，完全离线使用预计算、人工标注的小向量 fixture，验证三 lane Recall@K/MRR、lane precision、distinct-node rate，以及 `expected_hits` 指定的逐 lane 精确获胜记录与稳定顺序。严格默认门要求三 lane 都有 qrels、各 lane Recall@K=1、lane precision=1、distinct-node rate=1 且 `ranking_violations=0`：
 
 ```bash
@@ -458,7 +458,7 @@ miss 固化独立的中英 query/qrels，绝不能从模型输出反向调 qrels
 - 在 1 万、2.5 万、10 万记录上记录构建时间、文件/常驻大小、P50/P95；25k Flat scan 的目标 P95 ≤ 50ms。
 
 现有离线算法 qrels 已让“向量排序/分 lane/distinct/稳定获胜记录”可回归；“相似只发现证据、
-不越权裁决”则由 engine 的 recall 渲染与任务决策防火墙测试守住，不伪装成向量指标。两者都
+不越权裁决”则由 engine 的 recall 渲染与任务决策提醒测试守住，不伪装成向量指标。两者都
 尚未满足上述 100 条真实模型与 lexical 基线对照，所以仍只算 preview，不算模型质量晋级完成。
 通过这些门槛也**不会**把 local 或 remote 设为默认；enabled 永远是每仓本机用户的显式选择。
 
@@ -467,8 +467,8 @@ miss 固化独立的中英 query/qrels，绝不能从模型输出反向调 qrels
 已交付 preview 采用项目内 `internal/vector` 的纯 Go Flat snapshot，以及 `internal/semantic` 的自有薄 Embedder + 标准库 OpenAI-compatible/Ollama HTTP；Eino、chromem-go 只作参考，Zvec 保留为规模增长后的隔离 adapter。
 
 向量只补“候选发现”，不改变真相来源。当前实现把 current 与 lexical 做 RRF，把 risk/history
-隔离为可解释 advisory，并用 source hash 在 partial 代安全复用未变化卡片；任务开始时的决策
-防火墙也只告警。用户未通过仓外 CLI 显式 configure/enable 时，仓库内容永远不能开启外发；
+隔离为可解释 advisory，并用 source hash 在 partial 代安全复用未变化卡片；任务开始时的历史
+决策提醒也只作辅助。用户未通过仓外 CLI 显式 configure/enable 时，仓库内容永远不能开启外发；
 批量类型卡只在用户 CLI rebuild 或其预先授权的 MCP sync 中发送。任何 provider/模型硬不一致
 都拒用 semantic，普通故障回到已经可用的 lexical/structural 路径。离线算法基线已交付，真实
 模型质量晋级仍未完成，因此 preview 继续默认禁用。

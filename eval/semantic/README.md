@@ -25,7 +25,7 @@ invalid CLI usage.
 The safety statement “similarity discovers evidence; it never adjudicates” is
 not a vector metric and is deliberately not faked from fixture annotations.
 Production behavior is covered by engine-level tests of recall rendering and
-the task decision firewall (`semantic_decision_firewall_test.go`), which assert
+the task decision advisory (`semantic_decision_advisory_test.go`), which assert
 that risk/history remain advisory and do not block task creation.
 
 This is an **algorithm regression baseline, not a real embedding-model quality

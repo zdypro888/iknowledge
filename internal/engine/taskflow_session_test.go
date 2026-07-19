@@ -29,20 +29,20 @@ func TestTaskContextCancellationNeverCreatesWIP(t *testing.T) {
 	}
 }
 
-func TestDecisionFirewallLockWaitHonorsContext(t *testing.T) {
+func TestDecisionAdvisoryLockWaitHonorsContext(t *testing.T) {
 	e, _ := initEngine(t, map[string]string{"a.go": "package p\n\nfunc A() {}\n"})
 	e.rt.mu.Lock()
 	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Millisecond)
 	defer cancel()
 	started := time.Now()
-	out := e.semanticDecisionFirewall(ctx, "change A", []string{"a.go#A"})
+	out := e.semanticDecisionAdvisory(ctx, "change A", []string{"a.go#A"})
 	elapsed := time.Since(started)
 	e.rt.mu.Unlock()
 	if out != "" || !errors.Is(ctx.Err(), context.DeadlineExceeded) {
-		t.Fatalf("firewall canceled output=%q context=%v", out, ctx.Err())
+		t.Fatalf("advisory canceled output=%q context=%v", out, ctx.Err())
 	}
 	if elapsed > time.Second {
-		t.Fatalf("firewall lock wait ignored context for %v", elapsed)
+		t.Fatalf("advisory lock wait ignored context for %v", elapsed)
 	}
 }
 
