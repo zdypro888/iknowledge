@@ -1,6 +1,7 @@
-# 知识库第一期实现方案(工程细节)
+# iknowledge 工程实现规范
 
-> 概念与完整设计见 `knowledge.md`(本文档实现其 §15 路线图的第一期)。
+> 概念与完整设计见 `knowledge.md`;本文档是现行工程事实与实现契约。分期和里程碑章节保留
+> 来时路与验收口径,不表示当前能力仍停留在第一期。
 > 风格约定:沿用 [aibridge](https://github.com/zdypro888/aibridge) 的工程风格——零重依赖
 > (第一期仅 `gopkg.in/yaml.v3`)、手写 JSON-RPC 2.0 的 MCP server(参照 aibridge 的
 > `internal/bridge/mcp.go`)、`internal/` 分包、表驱动测试。
@@ -1129,18 +1130,26 @@ CLI precheck 同源追加 `tool=cli_precheck,source=cli,warnings,blocked`;kb_sta
 
 ### 8.1 可选语义检索 preview(已实现,默认禁用)
 
-完整规范以 `vecdb.md` 为正本;本节锁住已实现包/运行时的边界,防后续把 preview
-误改成“再启动一个向量 MCP”或“把 provider 塞进仓内 config”。
+本节是 semantic/vector preview 的**唯一工程契约**;概念与裁决边界见 `knowledge.md` §10.2,
+离线 fixture 格式与评测命令见 `eval/semantic/README.md`。不得把 preview 改成“再启动一个
+向量 MCP”或“把 provider 塞进仓内 config”。
 
 - **模式/持久授权**:默认 disabled;用户只能经 `iknowledge semantic configure/enable`
   在 canonical repo 对应的仓外私有 `semantic-config-v1.json` 选择 loopback Ollama 或 remote
   HTTPS OpenAI-compatible endpoint。它们是 `internal/semantic` 的 HTTP provider,**不是第三方
   MCP**;Eino/eino-ext 仍不是依赖。配置写一次后跨 MCP 会话/进程重启持续生效,路径不同的
-  clone 进入独立分区。仓内 YAML/journal/config、bundle、import 与 MCP 都不能修改 endpoint/
-  model/profile/policy/enabled。API key 只读固定环境变量；变量必须由实际发 HTTP 的进程继承：
+  clone 进入独立分区。状态路径为 `<user-config>/iknowledge/state/repos/<sha256(canonical-repo)>/semantic-config-v1.json`,
+  Unix 目录/文件分别为 0700/0600。仓内 YAML/journal/config、bundle、import 与 MCP 都不能修改 endpoint/
+  model/profile/policy/enabled。API key 只读 `IKNOWLEDGE_EMBEDDING_API_KEY`;远程 key 非空时必须由
+  `IKNOWLEDGE_EMBEDDING_API_ORIGIN` 绑定唯一规范 origin,避免多仓 daemon 把凭据发给另一 provider。
+  变量必须由实际发 HTTP 的进程继承：
   CLI rebuild 读取当前 shell，MCP sync/recall 读取长驻 serve 从 stdio/桌面 AI 或 service 宿主
   继承的环境。另一终端稍后 `export` 不改变已运行 daemon；remote 必须配置实际宿主环境并重启，
   不得把 key 写入仓库。
+- **HTTP/外发边界**:loopback endpoint 才允许 HTTP,非回环必须 HTTPS;拒绝 userinfo、query、fragment、
+  歧义路径与跨 origin redirect。批量重建只发送从健康 truth snapshot 生成且先脱敏的类型卡,
+  普通 semantic recall 只发送脱敏查询,不发送源码切块。provider 响应逐项校验数量、维度、有限数、
+  非零向量、JSON 深度与总大小;错误/状态/日志不记录 Authorization、原始 body 或未脱敏文本。
 - **query profile**:`semantic configure --query-profile auto` 在 CLI 保存时具体化——model 名含
   `qwen3-embedding` → `qwen3-code-v1`,否则 `plain`;状态中不存在 `auto`。改变 model 且未显式
   profile 会重新 auto,防旧 instruction 泄漏。Qwen profile 只预处理 query,documents 不加
@@ -1199,11 +1208,11 @@ CLI precheck 同源追加 `tool=cli_precheck,source=cli,warnings,blocked`;kb_sta
 - **历史决策提醒（辅助能力）**:`kb_task start` 以 task/intent/plan/todo 检索 risk/history,并优先 touching
   直接风险。Top-K 不是直接风险的安全边界：`touching` 按全部 current heirs 解析并从 current
   manifest 补齐 typed risk/history，再直接查 truth 中 pitfall/suspect/pending/orphan/open-dispute；
-  结构一跳按确定性优先级最多检查 100 个节点，超限时显式提示其余告警可能不完整。
+  结构一跳按确定性优先级最多检查 100 个节点，超限时显式提示其余提醒可能不完整。
   因此无 embedding、无词面命中或 split 的第二 heir 落在 Top-K 外也不漏 touching 直接风险。
-  回执最多展开 20 条 touching 精确告警与 6 条其他告警；省略的 touching current heir ID 必须
+  回执最多展开 20 条 touching 精确提醒与 6 条其他提醒；省略的 touching current heir ID 必须
   逐个列出供精确下钻。回执明确
-  “仅告警、不阻断；相似不等于裁决”,附 truth refs;不得自动拒绝任务、
+  “仅供参考、不阻断；相似不等于裁决”,附 truth refs;不得自动拒绝任务、
   refute/obsolete 知识或修改源码。`kb_diagnose` 尚未直接接 semantic pipeline,需独立评测。
 - **缓存/status/资源**:`.knowledge/local/vector.idx` 是 0600、带版本头/checksum
   的不可变派生文件,只存指纹 metadata、record table 与 float32,不存正文/key/raw model/
@@ -1231,6 +1240,10 @@ CLI precheck 同源追加 `tool=cli_precheck,source=cli,warnings,blocked`;kb_sta
   两包均 standard-library-only。Eino/eino-ext 仅作接口参考,当前不是依赖。nbco 同时需要 agent graph、model/tool、session、
   middleware 与多 provider,使用 Eino 能摊销框架;iknowledge 只有批量 text→vector 这一条
   边界,自有 Embedder + 标准库 `net/http` 已足够。Zvec 只能是越过规模/延迟门槛后的隔离 adapter。
+- **后端升级门**:只有有效类型卡持续超过 100,000、目标最低规格机器的 Flat scan P95 持续
+  超过 50ms、常用仓因既定内存上限无法保持 snapshot,或出现明确百万级/复杂过滤/高并发需求时,
+  才评估 HNSW/Zvec。adapter 必须隔离在可选 module/build flavor,保持同一 record/source-hash/
+  generation/fallback 契约,不能让默认用户引入 CGO 或原生库。
 - **离线算法基线/质量门**:`cmd/kbsemeval --input eval/semantic/v1/qrels.jsonl` 已用 4 个
   手工预计算向量 case 严格回归三 lane Recall@K/MRR、lane precision、distinct-node rate、
   `expected_hits` 精确获胜顺序与 `ranking_violations=0`;它完全离线且**不是模型质量声明**。

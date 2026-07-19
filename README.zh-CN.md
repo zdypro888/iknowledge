@@ -158,15 +158,9 @@ curl -fsSL https://raw.githubusercontent.com/zdypro888/iknowledge/main/uninstall
 - **要不要先"全库分析"?** 不用。init 只建结构骨架(AST,免费);语义知识按需生长——批量消化又贵又浅还立刻开始腐烂,详见设计文档"冷启动:允许空洞的塔"。
 - **知识错了怎么办?** AI 读原文发现冲突时,按纪律以原文为准并 `kb_verify refute` 勘误;基于错误知识推导出的条目会被级联降为 suspect。两条知识互相矛盾且当场断不了对错时,可登记 disputes 待裁决,双方并存呈现、都标"裁决前别信"。升级 verified 与勘误义务对称:confirm 也必须附验证依据并留确认记录,没验证过的结论洗不成可信知识。分居不同节点的矛盾,用 `kb_maintain patrol` 按关键词簇聚成一张简报跨节点并读裁决。
 - **代码改了知识会不会过时?** 会,而且系统知道:锚定哈希检测腐烂;自身名免疫的结构哈希寻找改名/挪动候选;doc 敏感迁移护栏阻止“改名时顺手改了契约”被静默判新鲜。无法证明安全的迁移会保留知识与血缘,但降为 `suspect` 等重验;同会话内重读变更节点会收到过时警报,suspect 进入维护欠账队列。
-- **语义/向量检索会上传仓库,或需要另一个 MCP 服务吗?** 可选 **preview 已实现且缺省禁用**。本机 Ollama 与远程 OpenAI-compatible endpoint 都由 iknowledge 内部 HTTP provider 直连,**不是第三方 MCP**;Eino 仍只是参考,不是依赖。配置按 canonical repo 在仓外私有态写一次,跨 MCP 会话与进程重启持续生效,无需每次重填;另一 clone/路径进入独立安全分区。`--query-profile auto` 保存时会具体化:Qwen3 Embedding 选 `qwen3-code-v1`,其他模型选 `plain`,不会每次调用临时猜。iknowledge 绝不自动安装 Ollama、下载模型或静默换模型。
+- **语义/向量检索会上传仓库,或需要另一个 MCP 服务吗?** 可选 **preview 已实现且缺省禁用**。本机 Ollama 与远程 HTTPS OpenAI-compatible endpoint 都由 iknowledge 内部 HTTP provider 直连,不是另一个 MCP 服务。纯 Go Flat 派生索引只含脱敏的 `current / risk / history` 知识卡,绝不含源码切块；只有 current 与 lexical 做 RRF,risk/history 只是历史决策提醒,不阻断、不裁决。provider、索引或资源异常时完整回退关键词/结构检索。
 
-  派生索引只含脱敏的 `current / risk / history` 类型知识卡:当前契约/用法、pitfall/dispute/仍生效否决/stale flow、决策史/时代/推翻来路,绝不含源码切块。一次 Flat 扫描为三条 lane 各自产生 NodeID 去重 Top-K;只有 current 与 lexical 做 RRF,risk/history 永远是告警/历史线索。任务开始时会对 touching 解析出的全部 current heirs 做 typed-card 补齐和 truth 精确检查；结构一跳按确定性优先级最多检查 100 个节点。直接风险不能因 Top-K、split 的第二 heir、任务换了说法或根本没启用 embedding 而漏掉；一跳超限会明确提示不完整，不冒充安全通过。回执最多展开 20 条 touching 精确提醒和 6 条其他提醒，并列出因输出预算省略的直接节点 ID 供精确复核。候选标题不直接印未复核 summary，必须按节点精确下钻看 confidence/dispute。知识变化时进入安全 `partial`:旧代只有 record ID、节点、lane 与 source hash 都仍匹配当前 manifest 的卡片可复用。rebuild 每批把 document/query 双模式 canary 放进同一 provider 请求,普通 query 也与 query-canary 同请求,用于发现常见的意外模型漂移并在不一致时拒绝混合 generation；它不是远端模型身份证明,强身份仍依赖受信 endpoint 与 immutable revision。任务启动时的**历史决策提醒**只是辅助：仅供参考、不阻断、不裁决。
-
-  重建授权持久且显式:`manual`(默认)、仅回环的 `ai-local`、非回环 HTTPS 的 `ai-remote`。`kb_status` 不联网就能报告 semantic 健康;只有 next_action 明确为 `kb_semantic action=sync` 且用户此前选择 ai policy 时,AI 才可在本 MCP 会话同步一次,绝不能改 endpoint/model/profile/policy。server 原子执行“一次尝试”硬闸:首次 sync 即使失败也消耗本会话额度,重复调用会在接触 provider 前返回 `SEMANTIC_SYNC_ALREADY_ATTEMPTED`;MCP sync 另有 8 分钟、3000 张 source card/100 batch 上限，超限时 status 直接提示用户跑 CLI rebuild，不浪费这次尝试。用户始终可手动运行 CLI `semantic rebuild`。远程 API key 只读固定环境变量 `IKNOWLEDGE_EMBEDDING_API_KEY`,且非空时必须用 `IKNOWLEDGE_EMBEDDING_API_ORIGIN` 绑定唯一规范 origin；多仓 daemon 不会把同一凭据误送到另一个服务。这两个变量必须由**实际发 HTTP 的进程继承**：手动 CLI rebuild 是当前 shell，MCP sync/recall 则是长驻 `serve` 及拉起它的桌面 AI 宿主。在另一终端 `export` 不会修改已经运行的 daemon，GUI 启动的桌面 App 通常也不会继承稍后加到 shell 的变量；应把 secret 配进 launchd/systemd/桌面宿主环境并重启宿主或 serve，绝不能写进仓库配置。多仓启动前和运行中还共享 1GiB vector 额度、1 个 provider slot 与 2 个 Flat 扫描 slot；hot enable、换代、clear/disable 都纳入 reserve/release，不能按仓库数放大内存或远程费用。详见 [`vecdb.md`](vecdb.md)。
-
-  typed source manifest 另有独立的 daemon 级 `384 MiB` 逻辑预算：稳态按实际保守估算记账，构造期按 `192 MiB` 授权且全进程只允许一个；等待、DTO 抓取与卡片构造均响应取消，disabled/clear/no-index/shutdown 归还缓存额度。因此多仓不能靠逐个 `kb_status` 绕过 vector 预算累积 manifest。
-
-  最短本机用法如下(需你自行安装并运行 Ollama/模型;iknowledge 绝不自动安装、启动或部署它们)。`qwen3-embedding:0.6b` 实际输出 1024 维,`--dimensions 0` 会安全自动探测:
+  配置按 canonical repo 写入仓外用户私有态,不会进入 Git。`manual` 是默认重建策略；`ai-local`/`ai-remote` 只授权 AI 按 status 指引每会话尝试同步一次。远程 key 只读 `IKNOWLEDGE_EMBEDDING_API_KEY`,并须由 `IKNOWLEDGE_EMBEDDING_API_ORIGIN` 绑定唯一目标。iknowledge 不自动安装 Ollama、下载模型或静默换模型。最短本机用法如下:
 
   ```bash
   ollama pull qwen3-embedding:0.6b
@@ -174,9 +168,7 @@ curl -fsSL https://raw.githubusercontent.com/zdypro888/iknowledge/main/uninstall
   iknowledge semantic rebuild --repo .
   ```
 
-  若要授权 AI 在需要时同步本机索引,把 policy 改为 `ai-local`;远程同步必须另行明确选择 `ai-remote`,且 endpoint 必须是非回环 HTTPS。
-
-  若 nbco 已经通过本机 Ollama 部署 `bge-m3`,iknowledge 可填相同 endpoint/model 复用该模型服务;两边的文档、fingerprint 与向量索引完全独立,iknowledge 不会读写 nbco 的 Qdrant 或索引。
+  若要授权 AI 在需要时同步本机索引,把 policy 改为 `ai-local`;远程同步必须另行明确选择 `ai-remote`,且 endpoint 必须是非回环 HTTPS。完整实现、安全、资源与后端升级契约见 [knowledge-impl.md §8.1](knowledge-impl.md#81-可选语义检索-preview已实现默认禁用);确定性 fixture 与真实模型晋级协议见 [eval/semantic/README.md](eval/semantic/README.md)。当前 4 个手工 case 只守算法回归,不代表真实模型质量,所以 preview 仍保持显式启用。
 - **安全模型?** 缺省监听 `127.0.0.1`,Origin 校验挡浏览器 DNS rebinding。stdio/hook/scout 即使业务 Bearer 关闭也会做仅回环可用的双向 HMAC listener 身份校验;共享机器再用 `serve --auth`,让业务端点额外要求根 Bearer 或 scope 短 session。长期密钥/scout 信任按 canonical repo 分仓写用户私有配置态(Unix 文件 0600),旧仓内 token 只触发安全轮换、绝不复用。`.knowledge` 写入与源码读取都拒绝根以下 symlink,git tracked symlink 不能引流到仓外。显式非回环明文 HTTP 仍不提供传输保密。
 - **没有子代理能力的宿主怎么用侦查?** `kb_investigate` 缺省是委派模式。宿主没有子代理时,设 `scout: self`,核对命令后运行 `iknowledge trust-scout --repo .`。授权在仓外用户私有态,绑定精确模式/命令且配置一变即失效;仓库内 executable 一律拒绝。仓内临时 MCP 配置只含短期 HMAC session,不含根密钥。之后服务端用 PTY 拉起受信侦察兵并等协议交卷。仅 macOS/Linux。
 - **自定义子代理(审计 agent 等)没有 kb_* 工具怎么查库?** 用只读腿:`curl "http://127.0.0.1:<端口>/recall?q=<词>"`(`/map`、`/status` 同理)——有 shell 就能查,零 MCP 配置,输出与工具一致;侦查简报也会自动附上这条降级路径。只读:记账与沉淀仍由主 AI 收尾。
@@ -186,11 +178,11 @@ curl -fsSL https://raw.githubusercontent.com/zdypro888/iknowledge/main/uninstall
 
 第一期已全量交付并持续加固:现为 17 个 MCP 工具 + `/mcp/main`、`/mcp/scout` 双端点 + `GET /inject` 与只读腿(`/recall` `/map` `/status`)+ `iknowledge hook/setup/maintain/doctor/brief/precheck/semantic` 套件。2026-07-11 对抗审计集中加固了可崩溃恢复的多文件事务、严格/便携 bundle、解析边界与语义哈希、代际索引、并发快照、源码/存储 symlink 边界、listener 身份、自派侦查信任和跨平台校验安装;2026-07-18 又加入语义写入与 bundle 导入默认秘密脱敏、预算化新会话简报、暂存区风险/记账预检。2026-07-04 补齐原二/三/四期计划:全仓调用图与结构扩展检索、热点待消化清单、矛盾裁决登记、非代码知识复核提醒、`--auth` 鉴权、单进程多仓库、Windows 支持、PTY 自派侦查备模式。**客户端双实测通过**(Claude Code + Codex,含 instructions 语义)。**M1.4 A/B 验收达标**:10 个固定定位任务,接知识库(种子覆盖 19%)vs 裸 grep 同模型双跑——中位 token 省 41%(59% ≤ 60% 阈值)、8/10 任务更省、用时更短;协议、工装(`cmd/kbeval`)与两轮全量数据在 [eval/m14/](eval/m14/)。
 
-可选语义/向量检索 preview 已交付,但仍需每仓显式开启且缺省禁用。确定性离线算法基线(`cmd/kbsemeval`、[eval/semantic/](eval/semantic/))已守住 lane 隔离、distinct-node 排名与精确稳定的获胜记录顺序;“只告警不裁决”由 engine 测试另行守住。基线使用手工预计算向量,**不代表真实模型质量**。100+ 条独立中英 qrels 的真实模型 vs lexical 晋级评测仍未完成,因此词法/结构检索仍是基线与回退路径。
+可选语义/向量检索 preview 已交付,但仍需每仓显式开启且缺省禁用。确定性离线算法基线(`cmd/kbsemeval`、[eval/semantic/](eval/semantic/))已守住 lane 隔离、distinct-node 排名与精确稳定的获胜记录顺序;“只提醒不裁决”由 engine 测试另行守住。基线使用手工预计算向量,**不代表真实模型质量**。100+ 条独立中英 qrels 的真实模型 vs lexical 晋级评测仍未完成,因此词法/结构检索仍是基线与回退路径。
 
 - [`knowledge.md`](knowledge.md) — 概念设计全案(20 轮设计讨论的收敛:五个维度、自愈机制、经济学、安全、四篇推演)
-- [`knowledge-impl.md`](knowledge-impl.md) — 第一期工程方案(包结构、数据模型、存储、MCP API 全量规范、里程碑)
-- [`vecdb.md`](vecdb.md) — 已实现的可选语义/向量检索 preview 及其晋级门槛
+- [`knowledge-impl.md`](knowledge-impl.md) — 现行工程实现规范(包结构、数据模型、存储、MCP API、semantic preview、里程碑)
+- [`eval/semantic/README.md`](eval/semantic/README.md) — semantic 检索算法回归 fixture 与真实模型质量晋级协议
 
 ## 许可证
 
