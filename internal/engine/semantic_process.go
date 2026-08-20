@@ -8,9 +8,9 @@ import (
 
 const (
 	// SemanticProcessResidentMaxMiB is the hard logical resident budget used by
-	// one multi-repository daemon. Each loaded or rebuilding repository reserves
-	// its configured max_vector_mib, so hot enable/config changes cannot bypass
-	// the startup preflight.
+	// one multi-repository daemon. Startup still preflights configured ceilings;
+	// runtime load/rebuild reservations use an authenticated matrix shape when
+	// known and fall back to max_vector_mib only before an auto-dimension probe.
 	SemanticProcessResidentMaxMiB = 1024
 	// SemanticProcessSourceMaxMiB independently bounds cached typed-card
 	// manifests plus the one in-progress source build. Vector authorization stays
@@ -24,16 +24,17 @@ const (
 // one daemon. CLI processes intentionally do not install one: they operate on
 // a single repository and remain bounded by that repository's vector limits.
 //
-// Reservations are conservative authorizations (max_vector_mib), not sampled
-// heap usage. Resident and in-progress rebuild matrices are counted separately,
-// while resident leases ensure external generation replacement cannot overlap
-// an old matrix still used by a search.
+// Reservations are logical matrix authorizations, not sampled heap usage.
+// Checksummed outer metadata is bound to the inner codec shape before an exact
+// resident allocation is trusted. Resident, new-build, and decoded-reuse
+// matrices are counted separately; resident leases ensure external generation
+// replacement cannot overlap an old matrix still used by a search.
 type SemanticProcessCoordinator struct {
 	mu                sync.Mutex
 	maxResidentBytes  uint64
 	usedResidentBytes uint64
 	resident          map[*Engine]uint64
-	transient         map[*Engine]uint64
+	transient         map[*Engine]semanticTransientReservation
 	maxSourceBytes    uint64
 	usedSourceBytes   uint64
 	sourceResident    map[*Engine]uint64
@@ -45,6 +46,11 @@ type SemanticProcessCoordinator struct {
 	searchGate        chan struct{}
 }
 
+type semanticTransientReservation struct {
+	totalBytes       uint64
+	newResidentBytes uint64
+}
+
 // NewSemanticProcessCoordinator creates the shared semantic resource boundary
 // for a daemon. Non-positive budgets fall back to the production hard limit.
 func NewSemanticProcessCoordinator(maxResidentMiB int) *SemanticProcessCoordinator {
@@ -54,7 +60,7 @@ func NewSemanticProcessCoordinator(maxResidentMiB int) *SemanticProcessCoordinat
 	return &SemanticProcessCoordinator{
 		maxResidentBytes: uint64(maxResidentMiB) << 20,
 		resident:         make(map[*Engine]uint64),
-		transient:        make(map[*Engine]uint64),
+		transient:        make(map[*Engine]semanticTransientReservation),
 		maxSourceBytes:   uint64(SemanticProcessSourceMaxMiB) << 20,
 		sourceResident:   make(map[*Engine]uint64),
 		sourceTransient:  make(map[*Engine]uint64),
@@ -178,38 +184,69 @@ func (c *SemanticProcessCoordinator) reserveResident(owner *Engine, bytes uint64
 	return nil
 }
 
-func (c *SemanticProcessCoordinator) reserveTransient(owner *Engine, bytes uint64) error {
+func (c *SemanticProcessCoordinator) reserveTransient(owner *Engine, totalBytes, newResidentBytes uint64) error {
+	if c == nil || owner == nil {
+		return nil
+	}
+	if newResidentBytes > totalBytes {
+		return fmt.Errorf("semantic transient 新 resident 授权 %.1fMiB 超过总授权 %.1fMiB",
+			float64(newResidentBytes)/(1<<20), float64(totalBytes)/(1<<20))
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	current := c.transient[owner]
+	other := c.usedResidentBytes - current.totalBytes
+	if other > c.maxResidentBytes || totalBytes > c.maxResidentBytes-other {
+		return fmt.Errorf("semantic 进程驻留预算不足: 已授权 %.1fMiB，本次重建另需 %.1fMiB，硬上限 %.1fMiB；请 clear/disable 其他仓库、降低 --max-vector-mib，或拆分 daemon",
+			float64(other)/(1<<20), float64(totalBytes)/(1<<20), float64(c.maxResidentBytes)/(1<<20))
+	}
+	c.transient[owner] = semanticTransientReservation{totalBytes: totalBytes, newResidentBytes: newResidentBytes}
+	c.usedResidentBytes = other + totalBytes
+	return nil
+}
+
+func (c *SemanticProcessCoordinator) validateTransientPromotion(owner *Engine, residentBytes uint64) error {
 	if c == nil || owner == nil {
 		return nil
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	current := c.transient[owner]
-	other := c.usedResidentBytes - current
-	if other > c.maxResidentBytes || bytes > c.maxResidentBytes-other {
-		return fmt.Errorf("semantic 进程驻留预算不足: 已授权 %.1fMiB，本次重建另需 %.1fMiB，硬上限 %.1fMiB；请 clear/disable 其他仓库、降低 --max-vector-mib，或拆分 daemon",
-			float64(other)/(1<<20), float64(bytes)/(1<<20), float64(c.maxResidentBytes)/(1<<20))
+	return c.validateTransientPromotionLocked(owner, residentBytes)
+}
+
+func (c *SemanticProcessCoordinator) validateTransientPromotionLocked(owner *Engine, residentBytes uint64) error {
+	transient, ok := c.transient[owner]
+	if !ok {
+		return fmt.Errorf("semantic rebuild publication lost transient budget")
 	}
-	c.transient[owner] = bytes
-	c.usedResidentBytes = other + bytes
+	if residentBytes > transient.newResidentBytes {
+		return fmt.Errorf("semantic rebuild resident authorization %.1fMiB exceeds new-matrix authorization %.1fMiB",
+			float64(residentBytes)/(1<<20), float64(transient.newResidentBytes)/(1<<20))
+	}
 	return nil
 }
 
-func (c *SemanticProcessCoordinator) promoteTransient(owner *Engine) {
+func (c *SemanticProcessCoordinator) promoteTransient(owner *Engine, residentBytes uint64) error {
 	if c == nil || owner == nil {
-		return
+		return nil
 	}
 	c.mu.Lock()
+	defer c.mu.Unlock()
+	if err := c.validateTransientPromotionLocked(owner, residentBytes); err != nil {
+		return err
+	}
 	oldResident := c.resident[owner]
-	newResident := c.transient[owner]
+	transient := c.transient[owner]
 	c.usedResidentBytes -= oldResident
+	c.usedResidentBytes -= transient.totalBytes
 	delete(c.transient, owner)
-	if newResident == 0 {
+	if residentBytes == 0 {
 		delete(c.resident, owner)
 	} else {
-		c.resident[owner] = newResident
+		c.resident[owner] = residentBytes
+		c.usedResidentBytes += residentBytes
 	}
-	c.mu.Unlock()
+	return nil
 }
 
 func (c *SemanticProcessCoordinator) releaseResident(owner *Engine) {
@@ -227,7 +264,7 @@ func (c *SemanticProcessCoordinator) releaseTransient(owner *Engine) {
 		return
 	}
 	c.mu.Lock()
-	c.usedResidentBytes -= c.transient[owner]
+	c.usedResidentBytes -= c.transient[owner].totalBytes
 	delete(c.transient, owner)
 	c.mu.Unlock()
 }
@@ -238,7 +275,7 @@ func (c *SemanticProcessCoordinator) releaseAll(owner *Engine) {
 	}
 	c.mu.Lock()
 	c.usedResidentBytes -= c.resident[owner]
-	c.usedResidentBytes -= c.transient[owner]
+	c.usedResidentBytes -= c.transient[owner].totalBytes
 	c.usedSourceBytes -= c.sourceResident[owner]
 	c.usedSourceBytes -= c.sourceTransient[owner]
 	c.usedSourceBytes -= c.sourceDocuments[owner]
@@ -256,7 +293,7 @@ func (c *SemanticProcessCoordinator) reservedBytes(owner *Engine) uint64 {
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return c.resident[owner] + c.transient[owner]
+	return c.resident[owner] + c.transient[owner].totalBytes
 }
 
 // SetSemanticProcessCoordinator attaches an Engine to its daemon-wide

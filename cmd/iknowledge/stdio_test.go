@@ -4,10 +4,13 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -164,6 +167,224 @@ func TestProxyStdioRejectsMalformedInputAndInvalidJSONResponse(t *testing.T) {
 		if !json.Valid([]byte(line)) || !strings.Contains(line, `"jsonrpc":"2.0"`) {
 			t.Fatalf("line %d 不是完整 JSON-RPC error: %s", i, line)
 		}
+	}
+}
+
+func TestProxyStdioReinitializesUnknownSessionAfterServeRestart(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		triggerMethod string
+		oldStatuses   []int
+		input         []string
+		wantRequests  []string
+	}{
+		{
+			name:          "tool request",
+			triggerMethod: "tools/call",
+			oldStatuses:   []int{http.StatusNotFound},
+			input: []string{
+				`{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"clientInfo":{"name":"restart-test"}}}`,
+				`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"kb_status","arguments":{}}}`,
+			},
+			wantRequests: []string{
+				"initialize:",
+				"tools/call:session-old",
+				"initialize:",
+				"tools/call:session-new",
+			},
+		},
+		{
+			name:          "notification",
+			triggerMethod: "notifications/initialized",
+			oldStatuses:   []int{http.StatusNotFound},
+			input: []string{
+				`{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"clientInfo":{"name":"restart-test"}}}`,
+				`{"jsonrpc":"2.0","method":"notifications/initialized"}`,
+				`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"kb_status","arguments":{}}}`,
+			},
+			wantRequests: []string{
+				"initialize:",
+				"notifications/initialized:session-old",
+				"initialize:",
+				"notifications/initialized:session-new",
+				"tools/call:session-new",
+			},
+		},
+		{
+			name:          "401 then 404",
+			triggerMethod: "tools/call",
+			oldStatuses:   []int{http.StatusUnauthorized, http.StatusNotFound},
+			input: []string{
+				`{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"clientInfo":{"name":"restart-test"}}}`,
+				`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"kb_status","arguments":{}}}`,
+			},
+			wantRequests: []string{
+				"initialize:",
+				"tools/call:session-old",
+				"tools/call:session-old",
+				"initialize:",
+				"tools/call:session-new",
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("IKNOWLEDGE_STATE_HOME", t.TempDir())
+			s, err := store.Open(t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			var requests []string
+			initializes := 0
+			toolExecutions := 0
+			oldAttempts := 0
+			initializeBody := ""
+			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				body, _ := io.ReadAll(r.Body)
+				var req struct {
+					ID     json.RawMessage `json:"id"`
+					Method string          `json:"method"`
+				}
+				_ = json.Unmarshal(body, &req)
+				sid := r.Header.Get("Mcp-Session-Id")
+				requests = append(requests, req.Method+":"+sid)
+				w.Header().Set("Content-Type", "application/json")
+				if req.Method == "initialize" {
+					initializes++
+					if initializes == 1 {
+						initializeBody = string(body)
+					} else if string(body) != initializeBody {
+						t.Errorf("隐式 initialize 未原样保留客户端参数:\n got %s\nwant %s", body, initializeBody)
+					}
+					freshSID := "session-old"
+					if initializes == 2 {
+						freshSID = "session-new"
+					}
+					w.Header().Set("Mcp-Session-Id", freshSID)
+					_, _ = fmt.Fprintf(w, `{"jsonrpc":"2.0","id":%s,"result":{"serverInfo":{"name":"knowledge"}}}`, req.ID)
+					return
+				}
+				if sid == "session-old" && req.Method == tc.triggerMethod && oldAttempts < len(tc.oldStatuses) {
+					status := tc.oldStatuses[oldAttempts]
+					oldAttempts++
+					http.Error(w, http.StatusText(status), status)
+					return
+				}
+				if req.Method == "notifications/initialized" {
+					w.WriteHeader(http.StatusAccepted)
+					return
+				}
+				toolExecutions++
+				_, _ = fmt.Fprintf(w, `{"jsonrpc":"2.0","id":%s,"result":{"content":[{"type":"text","text":"ok"}]}}`, req.ID)
+			}))
+			t.Cleanup(ts.Close)
+
+			var out bytes.Buffer
+			if code := proxyStdio(strings.NewReader(strings.Join(tc.input, "\n")+"\n"), &out, ts.URL, s, ts.URL, "", time.Second); code != 0 {
+				t.Fatalf("proxy code=%d out=%s", code, out.String())
+			}
+			lines := strings.Split(strings.TrimSpace(out.String()), "\n")
+			if len(lines) != 2 || !strings.Contains(lines[1], `"text":"ok"`) {
+				t.Fatalf("隐藏握手/notification 不应产生额外响应，且原工具调用应成功:\n%s", out.String())
+			}
+			if !slices.Equal(requests, tc.wantRequests) {
+				t.Fatalf("请求序列=%v, want %v", requests, tc.wantRequests)
+			}
+			if initializes != 2 || toolExecutions != 1 {
+				t.Fatalf("initialize=%d tool executions=%d, want 2/1", initializes, toolExecutions)
+			}
+		})
+	}
+}
+
+func TestProxyStdioReauthenticatesEachRestartRecoveryRequest(t *testing.T) {
+	repo := setupGitRepo(t)
+	e, _ := initRepo(t, repo, engine.InitOptions{})
+	identity, err := e.Store.EnsureLocalIdentity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldServe, newServe := mcpserv.New(e), mcpserv.New(e)
+	oldServe.LocalIdentity, newServe.LocalIdentity = identity, identity
+	oldHandler, newHandler := oldServe.Handler(), newServe.Handler()
+	var mainCalls, authSessionCalls atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == store.LocalAuthSessionPath {
+			authSessionCalls.Add(1)
+		}
+		if r.URL.Path == "/mcp/main" {
+			if mainCalls.Add(1) == 1 {
+				oldHandler.ServeHTTP(w, r)
+				return
+			}
+			newHandler.ServeHTTP(w, r)
+			return
+		}
+		if mainCalls.Load() == 0 {
+			oldHandler.ServeHTTP(w, r)
+			return
+		}
+		newHandler.ServeHTTP(w, r)
+	}))
+	t.Cleanup(ts.Close)
+	authSession, ok, err := serveUp(e.Store, ts.URL, false)
+	if err != nil || !ok {
+		t.Fatalf("初始身份握手失败: ok=%v err=%v", ok, err)
+	}
+
+	input := strings.Join([]string{
+		`{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"clientInfo":{"name":"reauth-test"}}}`,
+		`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"kb_status","arguments":{}}}`,
+	}, "\n") + "\n"
+	var out bytes.Buffer
+	if code := proxyStdio(strings.NewReader(input), &out, ts.URL+"/mcp/main", e.Store, ts.URL, authSession, 5*time.Second); code != 0 {
+		t.Fatalf("proxy code=%d out=%s", code, out.String())
+	}
+	if strings.Contains(out.String(), "404") || !strings.Contains(out.String(), "repoRoot") {
+		t.Fatalf("daemon 换代后调用未自愈:\n%s", out.String())
+	}
+	if got := mainCalls.Load(); got != 4 {
+		t.Fatalf("HTTP MCP 请求=%d, want 4(initial initialize, old-sid 404, hidden initialize, replay)", got)
+	}
+	// 1 次初始 serveUp + client initialize 前 + old-sid 请求前 + hidden initialize 前 + replay 前。
+	if got := authSessionCalls.Load(); got != 5 {
+		t.Fatalf("本机双向认证=%d, want 5；恢复链中的每次 HTTP 请求前都必须重新认证", got)
+	}
+}
+
+func TestReinitializeProxySessionValidatesHandshakeEnvelope(t *testing.T) {
+	initialize := []byte(`{"jsonrpc":"2.0","id":0,"method":"initialize","params":{}}`)
+	for _, tc := range []struct {
+		name    string
+		status  int
+		body    string
+		sid     string
+		wantSID string
+		wantErr bool
+	}{
+		{name: "valid", body: `{"jsonrpc":"2.0","id":0,"result":{}}`, sid: "fresh", wantSID: "fresh"},
+		{name: "non-2xx", status: http.StatusInternalServerError, body: `{"jsonrpc":"2.0","id":0,"result":{}}`, sid: "fake", wantErr: true},
+		{name: "rpc error", body: `{"jsonrpc":"2.0","id":0,"error":{"code":-32603,"message":"no"}}`, sid: "fake", wantErr: true},
+		{name: "mismatched id", body: `{"jsonrpc":"2.0","id":9,"result":{}}`, sid: "fake", wantErr: true},
+		{name: "missing sid", body: `{"jsonrpc":"2.0","id":0,"result":{}}`, wantErr: true},
+		{name: "invalid envelope", body: `{}`, sid: "fake", wantErr: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				if tc.sid != "" {
+					w.Header().Set("Mcp-Session-Id", tc.sid)
+				}
+				w.Header().Set("Content-Type", "application/json")
+				if tc.status != 0 {
+					w.WriteHeader(tc.status)
+				}
+				_, _ = io.WriteString(w, tc.body)
+			}))
+			t.Cleanup(ts.Close)
+			got, err := reinitializeProxySession(ts.Client(), ts.URL, initialize, json.RawMessage("0"), "")
+			if (err != nil) != tc.wantErr || got != tc.wantSID {
+				t.Fatalf("sid=%q err=%v, want sid=%q wantErr=%v", got, err, tc.wantSID, tc.wantErr)
+			}
+		})
 	}
 }
 

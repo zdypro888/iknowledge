@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -11,6 +12,33 @@ import (
 	"testing"
 	"time"
 )
+
+func TestLocalAuthClassifiesOnlyChallengeBadRequestAsUnsupportedScope(t *testing.T) {
+	t.Setenv(stateHomeEnv, t.TempDir())
+	s, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name   string
+		status int
+		want   bool
+	}{
+		{name: "challenge bad request", status: http.StatusBadRequest, want: true},
+		{name: "challenge server error", status: http.StatusInternalServerError, want: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fake := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				http.Error(w, "rejected", tc.status)
+			}))
+			t.Cleanup(fake.Close)
+			_, err := s.AcquireLocalAuthSession(context.Background(), fake.URL, "/runtime", fake.Client())
+			if errors.Is(err, ErrLocalAuthScopeUnsupported) != tc.want {
+				t.Fatalf("error=%v unsupported=%v, want %v", err, errors.Is(err, ErrLocalAuthScopeUnsupported), tc.want)
+			}
+		})
+	}
+}
 
 func TestLocalAuthRejectsForgedServerWithoutLeakingRoot(t *testing.T) {
 	t.Setenv(stateHomeEnv, t.TempDir())

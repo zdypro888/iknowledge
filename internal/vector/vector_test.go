@@ -182,6 +182,59 @@ func TestBuilderBatchesEqualBuild(t *testing.T) {
 	}
 }
 
+func TestBuilderAppendFromSnapshotReusesOnlyExactRecord(t *testing.T) {
+	ctx := context.Background()
+	old, err := Build(3, []Record{
+		{ID: "a", NodeID: "node-a", Kind: "current", SourceHash: [32]byte{1}, Vector: []float32{3, 4, 0}},
+		{ID: "b", NodeID: "node-b", Kind: "risk", SourceHash: [32]byte{2}, Vector: []float32{0, 2, 0}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	meta, ok := old.RecordMetadataAt(1)
+	if !ok || meta.ID != "b" || meta.NodeID != "node-b" || meta.Kind != "risk" || meta.SourceHash != ([32]byte{2}) {
+		t.Fatalf("metadata=%+v ok=%v", meta, ok)
+	}
+	if _, ok := old.RecordMetadataAt(2); ok {
+		t.Fatal("out-of-range metadata unexpectedly succeeded")
+	}
+
+	plan, err := Preflight(ctx, 3, []Record{
+		{ID: "b", NodeID: "node-b", Kind: "risk", SourceHash: [32]byte{2}},
+		{ID: "c", NodeID: "node-c", Kind: "history", SourceHash: [32]byte{3}},
+	}, DefaultLimits())
+	if err != nil {
+		t.Fatal(err)
+	}
+	builder, err := NewBuilder(ctx, plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := builder.AppendFromSnapshot(ctx, old, 0); !errors.Is(err, ErrInvalidInput) {
+		t.Fatalf("mismatched reuse error=%v, want ErrInvalidInput", err)
+	}
+	if err := builder.AppendFromSnapshot(ctx, old, 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := builder.Append(ctx, [][]float32{{0, 0, -5}}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := builder.Finish(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want, err := Build(3, []Record{
+		{ID: "b", NodeID: "node-b", Kind: "risk", SourceHash: [32]byte{2}, Vector: []float32{0, 1, 0}},
+		{ID: "c", NodeID: "node-c", Kind: "history", SourceHash: [32]byte{3}, Vector: []float32{0, 0, -1}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(got.records, want.records) || !reflect.DeepEqual(got.vectors, want.vectors) {
+		t.Fatalf("reused snapshot differs:\n got=%#v %#v\nwant=%#v %#v", got.records, got.vectors, want.records, want.vectors)
+	}
+}
+
 func TestBuilderFailureDoesNotAdvanceAndCanRetry(t *testing.T) {
 	plan, err := Preflight(context.Background(), 2, []Record{
 		{ID: "a", NodeID: "a", Kind: "summary"},

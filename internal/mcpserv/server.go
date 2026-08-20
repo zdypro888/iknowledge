@@ -34,6 +34,18 @@ func serverVersion() string { return buildinfo.Read().Version }
 // Server 是一个仓库的 MCP 服务。
 type Server struct {
 	E *engine.Engine
+	// Build/StartedAt are captured once at daemon construction. They let a stdio
+	// bridge detect an upgraded on-disk binary instead of silently talking to a
+	// month-old resident process. Shutdown is installed by the serve owner and
+	// is reachable only through the authenticated local runtime endpoint.
+	Build     buildinfo.RuntimeIdentity
+	StartedAt time.Time
+	Shutdown  func()
+	// RuntimeRepos lists every repository owned by the surrounding serve
+	// process. A generation rollover shuts down the whole process, so the stdio
+	// bridge must relaunch the complete group rather than only the endpoint that
+	// happened to receive /runtime/shutdown.
+	RuntimeRepos []string
 	// AuthToken 非空即启用 Bearer 鉴权(impl §1 --auth,2026-07-04 自四期提前):
 	// 全部端点(含 /inject)要求 Authorization: Bearer <token>。Handler() 前设置。
 	AuthToken string
@@ -81,7 +93,7 @@ const sessionTTL = 24 * time.Hour
 // New 建服务。
 func New(e *engine.Engine) *Server {
 	return &Server{
-		E: e, sessions: map[string]*session{},
+		E: e, Build: buildinfo.Runtime(), StartedAt: time.Now().UTC(), sessions: map[string]*session{},
 		authChallenges: map[string]localAuthChallenge{}, authSessions: map[string]localAuthSession{},
 	}
 }
@@ -114,6 +126,9 @@ func (s *Server) Handler() http.Handler {
 	protected.HandleFunc("/recall", s.serveRecall)
 	protected.HandleFunc("/map", s.serveMap)
 	protected.HandleFunc("/status", s.serveStatus)
+	protected.HandleFunc("/doctor", s.serveDoctor)
+	protected.HandleFunc("/runtime", s.serveRuntime)
+	protected.HandleFunc("/runtime/shutdown", s.serveRuntimeShutdown)
 
 	// 本机 challenge/session 端点必须在根 Bearer guard 之外，否则客户端为了
 	// 认证 server 又得先把根密钥发给未知 listener，正是此协议要消除的漏洞。
@@ -331,7 +346,7 @@ func validLocalAuthScope(scope string) bool {
 		return false
 	}
 	switch scope {
-	case "/mcp/main", "/inject", "/recall", "/map", "/status":
+	case "/mcp/main", "/inject", "/recall", "/map", "/status", "/doctor", "/runtime", "/runtime/shutdown":
 		return true
 	}
 	return strings.HasPrefix(scope, "/mcp/scout/") && len(strings.TrimPrefix(scope, "/mcp/scout/")) > 0
@@ -498,10 +513,77 @@ func (s *Server) handleInitialize(w http.ResponseWriter, req rpcRequest) {
 	writeRPCResult(w, req.ID, map[string]any{
 		"protocolVersion": protocolVersion,
 		"capabilities":    map[string]any{"tools": map[string]any{"listChanged": true}},
-		"serverInfo":      map[string]any{"name": "knowledge", "version": serverVersion()},
-		"repoRoot":        s.E.Store.RepoRoot(),
-		"instructions":    engine.InitializeInstructions,
+		"serverInfo": map[string]any{
+			"name": "knowledge", "version": s.Build.Version,
+			"revision": s.Build.Revision, "dirty": s.Build.Dirty,
+			"executableSHA256": s.Build.ExecutableSHA256,
+		},
+		"repoRoot":     s.E.Store.RepoRoot(),
+		"instructions": engine.InitializeInstructions,
 	})
+}
+
+func (s *Server) serveRuntime(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", http.MethodGet)
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	s.mu.Lock()
+	sessions := len(s.sessions)
+	s.mu.Unlock()
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"schema": 1, "repo_root": s.E.Store.RepoRoot(), "build": s.Build,
+		"repo_roots": s.RuntimeRepos, "started_at": s.StartedAt.Format(time.RFC3339Nano), "sessions": sessions,
+	})
+}
+
+// serveDoctor executes inside the live daemon that owns the repository writer
+// lock. A separate `iknowledge doctor` process cannot safely run Engine.Doctor
+// while serve is active: Sync may reconcile truth, and taking the same lock
+// would correctly fail. This authenticated local read endpoint lets the CLI ask
+// the lock owner for one consistent report instead of either failing or reading
+// around the writer lock.
+func (s *Server) serveDoctor(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", http.MethodGet)
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	rep, err := s.E.Doctor()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"text": rep.Text(), "warnings": len(rep.Warnings),
+	})
+}
+
+func (s *Server) serveRuntimeShutdown(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", http.MethodPost)
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	prefix := store.LocalSessionAuthScheme + " "
+	header := r.Header.Get("Authorization")
+	if !strings.HasPrefix(header, prefix) ||
+		!s.localAuthSessionValid(strings.TrimPrefix(header, prefix), r.URL.Path, time.Now()) {
+		w.Header().Set("WWW-Authenticate", store.LocalSessionAuthScheme)
+		http.Error(w, "local runtime authentication required", http.StatusUnauthorized)
+		return
+	}
+	if s.Shutdown == nil {
+		http.Error(w, "runtime shutdown unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusAccepted)
+	_, _ = io.WriteString(w, `{"status":"draining"}`+"\n")
+	go s.Shutdown()
 }
 
 func (s *Server) author(sid string) string {
@@ -513,26 +595,49 @@ func (s *Server) author(sid string) string {
 	return "anonymous"
 }
 
+const semanticSyncSkippedText = "semantic_sync: skipped | reason=already-attempted-in-session | provider_contacted=false\n" +
+	"本次为幂等 no-op；需要人工重试时使用 CLI semantic rebuild。"
+
 // claimSemanticSync 把“每个 MCP 会话最多一次 semantic sync”从提示词纪律
-// 提升为服务端不变量。即使第一次因 provider 瞬时故障失败，也不允许 AI 在同一
-// 会话里自动重试并反复产生费用；用户仍可显式通过 CLI 重建，或在新会话先重新
-// 查看 kb_status 后再按持久策略决定。
-func (s *Server) claimSemanticSync(sid string) error {
+// 提升为服务端不变量。claimed=false 表示同会话已有调用抢到额度；调用方必须
+// 返回成功的零 provider no-op，而不是让 AI 把保护性拒绝误判为应重试的故障。
+// 即使第一次因 provider 瞬时故障失败，额度也保持已消费；用户仍可显式通过 CLI
+// 重建，或在新会话先重新查看 kb_status 后再按持久策略决定。
+func (s *Server) claimSemanticSync(sid string) (claimed bool, err error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	sess, ok := s.sessions[sid]
 	if !ok {
-		return &engine.KBError{Code: "SESSION_NOT_FOUND", Msg: "MCP 会话不存在", Hint: "重新 initialize 后先调用 kb_status"}
+		return false, &engine.KBError{Code: "SESSION_NOT_FOUND", Msg: "MCP 会话不存在", Hint: "重新 initialize 后先调用 kb_status"}
 	}
 	if sess.semanticSyncAttempted {
-		return &engine.KBError{
-			Code: "SEMANTIC_SYNC_ALREADY_ATTEMPTED",
-			Msg:  "本 MCP 会话已经尝试过一次 semantic sync",
-			Hint: "不要自动重试；查看 kb_status。需要人工重试时使用 CLI semantic rebuild",
-		}
+		return false, nil
 	}
 	sess.semanticSyncAttempted = true
-	return nil
+	return true, nil
+}
+
+func (s *Server) semanticSyncAttempted(sid string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	sess, ok := s.sessions[sid]
+	return ok && sess.semanticSyncAttempted
+}
+
+// suppressSemanticAction removes only the MCP action line emitted by Status.
+// The remaining repository health report stays byte-for-byte unchanged. This
+// is deliberately applied after StatusContext returns, so a concurrent sync
+// claim that happens during status calculation is also observed.
+func suppressSemanticAction(text string) string {
+	lines := strings.Split(text, "\n")
+	kept := lines[:0]
+	for _, line := range lines {
+		if strings.HasPrefix(line, "semantic_action:") {
+			continue
+		}
+		kept = append(kept, line)
+	}
+	return strings.Join(kept, "\n")
 }
 
 // handleToolCall 分发 + 使用日志(impl §7.6)。
@@ -551,7 +656,7 @@ func (s *Server) handleToolCall(ctx context.Context, w http.ResponseWriter, req 
 	}
 
 	start := time.Now()
-	text, meta, err := s.dispatch(ctx, p.Name, p.Arguments, sid)
+	text, meta, err := s.dispatch(ctx, p.Name, p.Arguments, role, sid)
 	rec := engine.UsageRecord{
 		At: time.Now().UTC().Format(time.RFC3339), Session: sid, Tool: p.Name,
 		OK: err == nil, Hit: meta.Hit, HitStatus: meta.HitStatus, Stale: meta.Stale,
@@ -576,7 +681,7 @@ func (s *Server) handleToolCall(ctx context.Context, w http.ResponseWriter, req 
 func monthNow() string { return time.Now().UTC().Format("2006-01") }
 
 // dispatch 把工具名路由到 engine;author 由会话推导(不接受 AI 自报,impl §7.1)。
-func (s *Server) dispatch(ctx context.Context, name string, args json.RawMessage, sid string) (string, engine.ReadMeta, error) {
+func (s *Server) dispatch(ctx context.Context, name string, args json.RawMessage, role, sid string) (string, engine.ReadMeta, error) {
 	author := s.author(sid)
 	var meta engine.ReadMeta
 	un := func(v any) error {
@@ -602,6 +707,9 @@ func (s *Server) dispatch(ctx context.Context, name string, args json.RawMessage
 
 	case "kb_status":
 		text, err := s.E.StatusContext(ctx)
+		if err == nil && s.semanticSyncAttempted(sid) {
+			text = suppressSemanticAction(text)
+		}
 		return text, meta, err
 
 	case "kb_semantic":
@@ -616,8 +724,12 @@ func (s *Server) dispatch(ctx context.Context, name string, args json.RawMessage
 			text, err := s.E.SemanticStatusTextContext(ctx)
 			return text, meta, err
 		case "sync":
-			if err := s.claimSemanticSync(sid); err != nil {
+			claimed, err := s.claimSemanticSync(sid)
+			if err != nil {
 				return "", meta, err
+			}
+			if !claimed {
+				return semanticSyncSkippedText, meta, nil
 			}
 			text, err := s.E.SyncSemantic(ctx)
 			return text, meta, err
@@ -701,6 +813,27 @@ func (s *Server) dispatch(ctx context.Context, name string, args json.RawMessage
 		var a engine.TaskArgs
 		if err := un(&a); err != nil {
 			return "", meta, kbInvalid(err)
+		}
+		// /mcp/scout 是受限角色。它保留既有的本会话 WIP 生命周期，
+		// 但不能借新增 owner 参数删除其他会话的任务，或间接写入
+		// 一条宣称别人任务已完成的 journal。
+		if role == "scout" && strings.TrimSpace(a.Owner) != "" {
+			return "", meta, &engine.KBError{
+				Code: "INVALID_ARGUMENT", Msg: "scout 角色不得代为收口其他 owner 的 WIP",
+				Hint: "由 main 会话核实 stale 目标后执行 owner + reason 收口",
+			}
+		}
+		// 没有 Mcp-Session-Id 时 author 只能退化为 anonymous，它不能证明
+		// 请求方就是某份 WIP 的原会话。只读 get 仍保留旧客户兼容；
+		// 任何写 action 都必须先 initialize，防止冒名 anonymous 绕过 stale 闸门。
+		switch a.Action {
+		case "start", "update", "complete", "abandon":
+			if sid == "" {
+				return "", meta, &engine.KBError{
+					Code: "SESSION_NOT_FOUND", Msg: "kb_task 写操作需要有效 MCP 会话",
+					Hint: "重新 initialize 并回带 Mcp-Session-Id；无会话连接仅可 kb_task get",
+				}
+			}
 		}
 		text, err := s.E.TaskContext(ctx, a, sid, author)
 		return text, meta, err

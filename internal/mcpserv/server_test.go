@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/zdypro888/iknowledge/internal/engine"
+	"github.com/zdypro888/iknowledge/internal/model"
 	"github.com/zdypro888/iknowledge/internal/store"
 )
 
@@ -118,12 +119,16 @@ func initialize(t *testing.T, url string) string {
 		t.Error("initialize 缺 instructions")
 	} else {
 		for _, required := range []string{
-			"每个会话先 kb_status", "provider=unchecked", "next_action=kb_semantic action=sync",
-			"policy=ai-local/ai-remote", "本会话最多同步一次", "绝不替用户配置、下载或切换模型",
+			"每个会话先 kb_status", "内部运行态", "不要向用户复述",
+			"semantic_action: kb_semantic action=sync", "ai-local/ai-remote", "静默同步一次",
+			"绝不替用户配置、下载或切换模型",
 		} {
 			if !strings.Contains(instructions, required) {
 				t.Errorf("initialize instructions 缺 %q: %s", required, instructions)
 			}
+		}
+		if strings.Contains(instructions, "provider=unchecked") {
+			t.Errorf("initialize instructions 不应诱导复述 provider=unchecked: %s", instructions)
 		}
 	}
 	if _, ok := out.Result["repoRoot"]; !ok {
@@ -334,6 +339,83 @@ func TestToolVisibilityByEndpoint(t *testing.T) {
 	}
 }
 
+func TestKBTaskWritesRequireSessionButAnonymousGetRemainsAvailable(t *testing.T) {
+	ts, _ := newTestServer(t)
+	main := ts.URL + "/mcp/main"
+	text, isErr := toolCall(t, main, "", "kb_task", map[string]any{
+		"action": "start", "wip": map[string]any{"task": "不得建立的 anonymous WIP"},
+	})
+	if !isErr || !strings.Contains(text, "SESSION_NOT_FOUND") {
+		t.Fatalf("无会话 kb_task 写操作应拒绝: isErr=%v text=%s", isErr, text)
+	}
+	text, isErr = toolCall(t, main, "", "kb_task", map[string]any{"action": "get"})
+	if isErr || !strings.Contains(text, "无活跃 wip") {
+		t.Fatalf("anonymous kb_task get 应保留只读兼容: isErr=%v text=%s", isErr, text)
+	}
+}
+
+func TestScoutKBTaskCannotCloseAnotherOwner(t *testing.T) {
+	ts, repo := newTestServer(t)
+	scout := ts.URL + "/mcp/scout/job_x"
+	sid := initialize(t, scout)
+
+	// 受限端点不应向侦察兵广告 main-only 的跨会话参数。
+	listed, _ := call(t, scout, sid, "tools/list", nil)
+	var taskDef map[string]any
+	for _, raw := range listed.Result["tools"].([]any) {
+		definition := raw.(map[string]any)
+		if definition["name"] == "kb_task" {
+			taskDef = definition
+			break
+		}
+	}
+	if taskDef == nil {
+		t.Fatal("scout tools/list 缺 kb_task")
+	}
+	schema := taskDef["inputSchema"].(map[string]any)
+	properties := schema["properties"].(map[string]any)
+	for _, forbidden := range []string{"owner", "reason"} {
+		if _, ok := properties[forbidden]; ok {
+			t.Fatalf("scout kb_task schema 不应暴露 %s: %v", forbidden, properties)
+		}
+	}
+
+	st, err := store.Open(repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	const target = "codex@stale-scout-target"
+	if err := st.SaveWIP(model.WIP{Owner: target, Task: "其他会话的旧任务", Updated: now.Add(-8 * 24 * time.Hour)}); err != nil {
+		t.Fatal(err)
+	}
+	text, isErr := toolCall(t, scout, sid, "kb_task", map[string]any{
+		"action": "complete", "owner": target, "reason": "侦察兵不应有此权限",
+	})
+	if !isErr || !strings.Contains(text, "scout 角色不得") {
+		t.Fatalf("scout 跨 owner 收口应拒绝: isErr=%v text=%s", isErr, text)
+	}
+	wips, err := st.LoadWIPs()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(wips) != 1 || wips[0].Owner != target {
+		t.Fatalf("scout 越权拒绝后目标 WIP 发生变化: %+v", wips)
+	}
+
+	// 保留既有兼容面：侦察兵仍能管理它自己的 WIP。
+	text, isErr = toolCall(t, scout, sid, "kb_task", map[string]any{
+		"action": "start", "wip": map[string]any{"task": "侦察中"},
+	})
+	if isErr {
+		t.Fatalf("scout 自身 start 不应被拒绝: %s", text)
+	}
+	text, isErr = toolCall(t, scout, sid, "kb_task", map[string]any{"action": "abandon"})
+	if isErr || !strings.Contains(text, "显式放弃") {
+		t.Fatalf("scout 自身 abandon 应保留: isErr=%v text=%s", isErr, text)
+	}
+}
+
 // TestFullAgentLoop 模拟一个 agent 的完整纪律循环(e2e,协议层)。
 func TestFullAgentLoop(t *testing.T) {
 	ts, repo := newTestServer(t)
@@ -342,8 +424,8 @@ func TestFullAgentLoop(t *testing.T) {
 
 	// ① kb_status / kb_map 导航。
 	text, isErr := toolCall(t, main, sid, "kb_status", map[string]any{})
-	if isErr || !strings.Contains(text, "节点:") ||
-		!strings.Contains(text, "semantic: unconfigured | provider: unchecked | next_action:") {
+	if isErr || !strings.Contains(text, "节点:") || strings.Contains(text, "provider=unchecked") ||
+		strings.Contains(text, "semantic 配置") {
 		t.Fatalf("status: %s", text)
 	}
 	text, isErr = toolCall(t, main, sid, "kb_map", map[string]any{})
@@ -439,19 +521,21 @@ func TestFullAgentLoop(t *testing.T) {
 	}
 }
 
-func TestKBStatusToolDescribesSemanticNextAction(t *testing.T) {
+func TestKBStatusToolDescribesSilentSemanticAction(t *testing.T) {
 	def, ok := allTools["kb_status"].(map[string]any)
 	if !ok {
 		t.Fatalf("kb_status definition=%T", allTools["kb_status"])
 	}
 	description, _ := def["description"].(string)
 	for _, required := range []string{
-		"semantic", "每会话先读", "provider=unchecked", "next_action", "kb_semantic action=sync",
-		"policy=ai-local/ai-remote", "不要重复配置或同步",
+		"每会话先读", "静默消费", "不向用户复述", "semantic_action", "kb_semantic action=sync",
 	} {
 		if !strings.Contains(description, required) {
 			t.Fatalf("kb_status description missing %q: %s", required, description)
 		}
+	}
+	if strings.Contains(description, "provider=unchecked") {
+		t.Fatalf("kb_status description still contains provider noise: %s", description)
 	}
 }
 
@@ -462,8 +546,8 @@ func TestKBSemanticToolSchemaAndDiscipline(t *testing.T) {
 	}
 	description, _ := def["description"].(string)
 	for _, required := range []string{
-		"next_action", "kb_semantic action=sync", "ai-local/ai-remote", "每会话最多 sync 一次",
-		"ready/none", "绝不修改 endpoint/model/profile/policy", "下载或切换模型",
+		"semantic_action", "ai-local/ai-remote", "每会话最多一次",
+		"绝不修改 endpoint/model/profile/policy", "下载或切换模型",
 	} {
 		if !strings.Contains(description, required) {
 			t.Fatalf("kb_semantic description missing %q: %s", required, description)
@@ -482,6 +566,34 @@ func TestKBSemanticToolSchemaAndDiscipline(t *testing.T) {
 	enum, _ := action["enum"].([]string)
 	if len(enum) != 2 || enum[0] != "status" || enum[1] != "sync" {
 		t.Fatalf("kb_semantic action enum=%v", enum)
+	}
+}
+
+func TestKBTaskSchemaDescribesGuardedCrossSessionClosure(t *testing.T) {
+	def, ok := allTools["kb_task"].(map[string]any)
+	if !ok {
+		t.Fatalf("kb_task definition=%T", allTools["kb_task"])
+	}
+	description, _ := def["description"].(string)
+	for _, required := range []string{"至少 7 天", "精确 owner", "必填 reason", "complete/abandon"} {
+		if !strings.Contains(description, required) {
+			t.Fatalf("kb_task description missing %q: %s", required, description)
+		}
+	}
+	schema, ok := def["inputSchema"].(map[string]any)
+	if !ok {
+		t.Fatalf("kb_task inputSchema=%T", def["inputSchema"])
+	}
+	required, _ := schema["required"].([]string)
+	if len(required) != 1 || required[0] != "action" {
+		t.Fatalf("kb_task required=%v", required)
+	}
+	properties, _ := schema["properties"].(map[string]any)
+	for _, field := range []string{"owner", "reason"} {
+		property, ok := properties[field].(map[string]any)
+		if !ok || property["type"] != "string" {
+			t.Fatalf("kb_task %s schema=%v", field, properties[field])
+		}
 	}
 }
 
@@ -509,12 +621,15 @@ func TestSemanticAutomationDisciplinePrompt(t *testing.T) {
 	} {
 		t.Run(name, func(t *testing.T) {
 			for _, required := range []string{
-				"每个会话先 kb_status", "provider=unchecked", "kb_semantic action=sync",
-				"policy=ai-local/ai-remote", "最多", "一次", "绝不替用户配置、下载或切换模型",
+				"每个会话先 kb_status", "内部运行态", "用户复述", "kb_semantic action=sync",
+				"ai-local/ai-remote", "静默", "一次", "绝不替用户配置、下载或切换模型",
 			} {
 				if !strings.Contains(prompt, required) {
 					t.Fatalf("%s prompt missing %q:\n%s", name, required, prompt)
 				}
+			}
+			if strings.Contains(prompt, "provider=unchecked") {
+				t.Fatalf("%s prompt still contains provider noise:\n%s", name, prompt)
 			}
 		})
 	}
@@ -550,7 +665,7 @@ func TestKBSemanticStatusInputAndManualAuthorization(t *testing.T) {
 	sid := initialize(t, main)
 
 	text, isErr := toolCall(t, main, sid, "kb_semantic", map[string]any{"action": "status"})
-	if isErr || !strings.Contains(text, "status: unconfigured") || !strings.Contains(text, "provider: unchecked") {
+	if isErr || !strings.Contains(text, "status: unconfigured") || !strings.Contains(text, "provider_probe: deferred") {
 		t.Fatalf("unconfigured semantic status isErr=%v:\n%s", isErr, text)
 	}
 	for name, args := range map[string]map[string]any{
@@ -616,8 +731,8 @@ func TestKBSemanticAuthorizedSyncIsProviderIdempotent(t *testing.T) {
 		t.Fatalf("remember before semantic sync: %s", text)
 	}
 	text, isErr = toolCall(t, main, sid, "kb_status", map[string]any{})
-	if isErr || !strings.Contains(text, "semantic: configured-no-index") ||
-		!strings.Contains(text, "next_action: kb_semantic action=sync") || !strings.Contains(text, "policy=ai-local") {
+	if isErr || !strings.Contains(text, "semantic_action: kb_semantic action=sync") ||
+		!strings.Contains(text, "policy=ai-local") || strings.Contains(text, "provider=unchecked") {
 		t.Fatalf("pre-sync status isErr=%v:\n%s", isErr, text)
 	}
 	if got := requests.Load(); got != 0 {
@@ -633,7 +748,7 @@ func TestKBSemanticAuthorizedSyncIsProviderIdempotent(t *testing.T) {
 		t.Fatal("authorized sync did not contact configured provider")
 	}
 	text, isErr = toolCall(t, main, sid, "kb_status", map[string]any{})
-	if isErr || !strings.Contains(text, "semantic: ready") || !strings.Contains(text, "next_action: none") {
+	if isErr || strings.Contains(text, "semantic:") || strings.Contains(text, "next_action") || strings.Contains(text, "provider") {
 		t.Fatalf("post-sync status isErr=%v:\n%s", isErr, text)
 	}
 	if got := requests.Load(); got != afterSync {
@@ -641,13 +756,27 @@ func TestKBSemanticAuthorizedSyncIsProviderIdempotent(t *testing.T) {
 	}
 
 	// “每会话最多同步一次”是服务端不变量，不只依赖提示词纪律。
-	// 误调第二次必须零 provider 请求而非再次付费/占用本机模型。
+	// 误调第二次必须以成功 no-op 收敛，且零 provider 请求。
 	text, isErr = toolCall(t, main, sid, "kb_semantic", map[string]any{"action": "sync"})
-	if !isErr || !strings.Contains(text, "KB_ERR:SEMANTIC_SYNC_ALREADY_ATTEMPTED") {
+	if isErr || !strings.Contains(text, "semantic_sync: skipped") ||
+		!strings.Contains(text, "provider_contacted=false") {
 		t.Fatalf("duplicate sync isErr=%v:\n%s", isErr, text)
 	}
 	if got := requests.Load(); got != afterSync {
 		t.Fatalf("duplicate ready sync contacted provider: before=%d after=%d", afterSync, got)
+	}
+	usage, err := s.LoadUsage()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var semanticCalls []store.UsageRecord
+	for _, rec := range usage {
+		if rec.Session == sid && rec.Tool == "kb_semantic" {
+			semanticCalls = append(semanticCalls, rec)
+		}
+	}
+	if len(semanticCalls) != 2 || !semanticCalls[1].OK || semanticCalls[1].ErrCode != "" {
+		t.Fatalf("duplicate sync should be logged as success, got %+v", semanticCalls)
 	}
 }
 
@@ -689,8 +818,24 @@ func TestKBSemanticFailedSyncCannotRetryProviderInSameSession(t *testing.T) {
 		t.Fatalf("first sync did not reach provider: %+v", out.Error)
 	}
 
-	text, isErr := toolCall(t, main, sid, "kb_semantic", map[string]any{"action": "sync"})
-	if !isErr || !strings.Contains(text, "KB_ERR:SEMANTIC_SYNC_ALREADY_ATTEMPTED") {
+	// 尽管本地索引仍需同步，当前会话已经消费过自动额度，status 不得再次
+	// 广告 semantic_action 诱导 agent 重试。
+	text, isErr := toolCall(t, main, sid, "kb_status", map[string]any{})
+	if isErr || strings.Contains(text, "semantic_action:") {
+		t.Fatalf("status after attempted sync isErr=%v:\n%s", isErr, text)
+	}
+	otherSID := initialize(t, main)
+	otherStatus, otherErr := toolCall(t, main, otherSID, "kb_status", map[string]any{})
+	if otherErr || !strings.Contains(otherStatus, "semantic_action: kb_semantic action=sync") {
+		t.Fatalf("independent session lost semantic action isErr=%v:\n%s", otherErr, otherStatus)
+	}
+	if got := requests.Load(); got != afterFirst {
+		t.Fatalf("session-aware statuses contacted provider: before=%d after=%d", afterFirst, got)
+	}
+
+	text, isErr = toolCall(t, main, sid, "kb_semantic", map[string]any{"action": "sync"})
+	if isErr || !strings.Contains(text, "semantic_sync: skipped") ||
+		!strings.Contains(text, "provider_contacted=false") {
 		t.Fatalf("second sync isErr=%v:\n%s", isErr, text)
 	}
 	if got := requests.Load(); got != afterFirst {

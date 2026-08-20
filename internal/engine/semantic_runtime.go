@@ -51,6 +51,11 @@ const (
 
 var semanticIndexMagic = [8]byte{'I', 'K', 'S', 'E', 'M', 'I', 'D', 'X'}
 
+var (
+	errSemanticIndexChanged  = errors.New("semantic index generation changed")
+	errSemanticSourceChanged = errors.New("semantic source generation changed")
+)
+
 type semanticIndexMetadata struct {
 	Schema              int    `json:"schema"`
 	Generation          string `json:"generation"`
@@ -90,6 +95,21 @@ type semanticFileIdentity struct {
 	VectorChecksum   [32]byte
 }
 
+// semanticIncrementalAssessment caches one bounded local planning result. The
+// key includes every input that can change reuse safety, so source, settings or
+// atomic index replacement automatically invalidates it without a background
+// lifecycle. Provider failures are deliberately not cached here; a transient
+// outage may recover. Deterministic canary-space drift is cached to prevent a
+// new MCP session from repeating the same probe forever.
+type semanticIncrementalAssessment struct {
+	valid       bool
+	identity    semanticFileIdentity
+	source      [32]byte
+	settings    string
+	pending     int
+	blockReason string
+}
+
 // semanticRuntime 与主知识 runtime 分锁。snapshot 一经发布便不可变；Flat
 // 搜索持短期 resident lease，provider 网络不持有该锁或主 rt.mu。
 type semanticRuntime struct {
@@ -117,19 +137,21 @@ type semanticRuntime struct {
 	corruptFile semanticFileIdentity
 	corruptErr  string
 	lastError   string
+	incremental semanticIncrementalAssessment
 
 	failureUntil time.Time
 
-	queryCache   map[string]semanticQueryCacheEntry
-	syncMu       sync.Mutex
-	syncFlight   *semanticSyncFlight
-	rebuildGate  chan struct{}
-	sourceGate   chan struct{}
-	providerGate chan struct{}
-	searchGate   chan struct{}
-	process      *SemanticProcessCoordinator
-	building     bool
-	closing      bool
+	queryCache     map[string]semanticQueryCacheEntry
+	syncMu         sync.Mutex
+	syncFlight     *semanticSyncFlight
+	rebuildGate    chan struct{}
+	sourceGate     chan struct{}
+	assessmentGate chan struct{}
+	providerGate   chan struct{}
+	searchGate     chan struct{}
+	process        *SemanticProcessCoordinator
+	building       bool
+	closing        bool
 }
 
 // SemanticRebuildReport 是显式重建结果。重建不会由 serve/recall 自动触发。
@@ -138,6 +160,8 @@ type SemanticRebuildReport struct {
 	Dimensions    int
 	VectorBytes   uint64
 	MetadataBytes uint64
+	Reused        int
+	Embedded      int
 	Model         string
 	Endpoint      string
 	Fingerprint   string
@@ -287,6 +311,28 @@ func (e *Engine) syncSemanticOwner(ctx context.Context) (string, error) {
 	if health.Status == SemanticHealthReady && health.PayloadLoaded {
 		return "semantic 索引已经 ready，无需调用 provider。", nil
 	}
+	// Status is the single offline planner for interactive work. Enforce its
+	// decision here as a server-side capability boundary so an old prompt, a
+	// stale client, or a direct tool call cannot bypass a known canary/delta
+	// block and repeatedly contact the provider. CLI rebuild remains the
+	// explicit escape hatch because it has a larger time budget and user intent.
+	if health.NextAction != "kb_semantic action=sync" {
+		action := health.NextAction
+		if action == "" || action == "none" {
+			action = "请先用 kb_status 重新读取本地状态"
+		}
+		detail := fmt.Sprintf("semantic 当前不可由 MCP 安全同步: status=%s", health.Status)
+		if health.Detail != "" {
+			detail += "; " + health.Detail
+		}
+		code := "SEMANTIC_SYNC_NOT_ACTIONABLE"
+		if health.syncTooLarge {
+			// Preserve the established machine-readable contract for oversized
+			// work while still rejecting it at the offline planning boundary.
+			code = "SEMANTIC_SYNC_TOO_LARGE"
+		}
+		return "", kbErr(code, detail, action)
+	}
 	report, err := e.rebuildSemanticHeld(ctx, &cfg)
 	if err != nil {
 		return "", err
@@ -295,9 +341,225 @@ func (e *Engine) syncSemanticOwner(ctx context.Context) (string, error) {
 }
 
 func (r SemanticRebuildReport) Text() string {
-	return fmt.Sprintf("semantic 索引已重建: records=%d dimensions=%d vector=%.1fMiB metadata=%.1fKiB\nmodel=%s\nendpoint=%s\nfingerprint=%s",
-		r.Records, r.Dimensions, float64(r.VectorBytes)/(1<<20), float64(r.MetadataBytes)/(1<<10),
+	return fmt.Sprintf("semantic 索引已重建: records=%d reused=%d embedded=%d dimensions=%d vector=%.1fMiB metadata=%.1fKiB\nmodel=%s\nendpoint=%s\nfingerprint=%s",
+		r.Records, r.Reused, r.Embedded, r.Dimensions, float64(r.VectorBytes)/(1<<20), float64(r.MetadataBytes)/(1<<10),
 		r.Model, r.Endpoint, r.Fingerprint)
+}
+
+func semanticSyncTooLargeError(total, pending int, repo string) *KBError {
+	detail := fmt.Sprintf("semantic source 有 %d 条卡片，超过 MCP 同步上限 %d", total, semanticMCPSyncMaxRecords)
+	if pending < total {
+		detail = fmt.Sprintf("semantic 增量需 embedding %d/%d 条卡片，超过 MCP 同步上限 %d",
+			pending, total, semanticMCPSyncMaxRecords)
+	}
+	return kbErr("SEMANTIC_SYNC_TOO_LARGE", detail,
+		"请由用户运行 iknowledge semantic rebuild --repo "+repo)
+}
+
+// semanticIncrementalFits checks that the decoded old matrix and the new
+// builder each fit their bounded transient vector authorizations. The old
+// on-disk generation may also be resident, but that copy is accounted
+// independently by the process coordinator.
+func semanticIncrementalFits(cfg SemanticSettings, old semanticIndexInspection, sourceRecords int) bool {
+	newBytes, ok := semanticMatrixBytes(cfg, sourceRecords, old.meta.Dimensions)
+	return ok && old.vectorBytes <= uint64(cfg.MaxVectorMiB)<<20 && newBytes <= uint64(cfg.MaxVectorMiB)<<20
+}
+
+func semanticMatrixBytes(cfg SemanticSettings, records, dimensions int) (uint64, bool) {
+	if cfg.MaxVectorMiB <= 0 || records < 0 || dimensions <= 0 {
+		return 0, false
+	}
+	dimensions64 := uint64(dimensions)
+	if dimensions64 > ^uint64(0)/4 {
+		return 0, false
+	}
+	dimensionBytes := dimensions64 * 4
+	if uint64(records) > ^uint64(0)/dimensionBytes {
+		return 0, false
+	}
+	bytes := uint64(records) * dimensionBytes
+	return bytes, bytes <= uint64(cfg.MaxVectorMiB)<<20
+}
+
+func semanticReusableRows(ctx context.Context, snapshot *vector.Snapshot, docs []semanticDocument) ([]int, int, error) {
+	rows := make([]int, len(docs))
+	for i := range rows {
+		rows[i] = -1
+	}
+	if snapshot == nil {
+		return rows, 0, nil
+	}
+	status := snapshot.Status()
+	byID := make(map[string]int, status.Records)
+	for row := 0; row < status.Records; row++ {
+		if row&255 == 0 {
+			if err := ctx.Err(); err != nil {
+				return nil, 0, err
+			}
+		}
+		meta, ok := snapshot.RecordMetadataAt(row)
+		if !ok {
+			return nil, 0, fmt.Errorf("semantic reuse: old snapshot row %d missing", row)
+		}
+		if _, duplicate := byID[meta.ID]; duplicate {
+			return nil, 0, fmt.Errorf("semantic reuse: duplicate old record ID %q", meta.ID)
+		}
+		byID[meta.ID] = row
+	}
+	reused := 0
+	for i, doc := range docs {
+		row, ok := byID[doc.RecordID]
+		if !ok {
+			continue
+		}
+		meta, ok := snapshot.RecordMetadataAt(row)
+		if !ok || meta.NodeID != doc.NodeID || meta.Kind != doc.Kind || meta.SourceHash != doc.SourceHash {
+			continue
+		}
+		rows[i] = row
+		reused++
+	}
+	return rows, reused, nil
+}
+
+func semanticReusableMetadataCount(ctx context.Context, records []vector.RecordMetadata, current map[string]semanticSourceRecord) (int, error) {
+	reused := 0
+	for i, record := range records {
+		if i&255 == 0 {
+			if err := ctx.Err(); err != nil {
+				return 0, err
+			}
+		}
+		want, ok := current[record.ID]
+		if ok && want.NodeID == record.NodeID && want.Kind == record.Kind && want.SourceHash == record.SourceHash {
+			reused++
+		}
+	}
+	return reused, nil
+}
+
+func semanticAssessmentKeyMatches(assessment semanticIncrementalAssessment, cfg SemanticSettings, identity semanticFileIdentity, source [32]byte) bool {
+	return assessment.valid && assessment.identity == identity && assessment.source == source &&
+		assessment.settings == SemanticSettingsFingerprint(cfg)
+}
+
+func (e *Engine) semanticIncrementalAssessment(cfg SemanticSettings, identity semanticFileIdentity, source [32]byte) (semanticIncrementalAssessment, bool) {
+	e.semantic.mu.Lock()
+	defer e.semantic.mu.Unlock()
+	assessment := e.semantic.incremental
+	return assessment, semanticAssessmentKeyMatches(assessment, cfg, identity, source)
+}
+
+func (e *Engine) rememberSemanticIncrementalAssessment(cfg SemanticSettings, identity semanticFileIdentity, source [32]byte, pending int, blockReason string) {
+	e.semantic.mu.Lock()
+	if semanticAssessmentKeyMatches(e.semantic.incremental, cfg, identity, source) &&
+		e.semantic.incremental.blockReason != "" && blockReason == "" {
+		e.semantic.mu.Unlock()
+		return
+	}
+	e.semantic.incremental = semanticIncrementalAssessment{
+		valid: true, identity: identity, source: source,
+		settings: SemanticSettingsFingerprint(cfg), pending: pending, blockReason: blockReason,
+	}
+	e.semantic.mu.Unlock()
+}
+
+func (e *Engine) clearSemanticIncrementalAssessment() {
+	e.semantic.mu.Lock()
+	e.semantic.incremental = semanticIncrementalAssessment{}
+	e.semantic.mu.Unlock()
+}
+
+// inspectSemanticReusablePending performs a bounded full integrity scan while
+// retaining only one vector row and compact record metadata. It is used only
+// for a large partial generation, where total record count alone cannot decide
+// whether MCP's 3000-document limit applies to a small executable delta.
+func (e *Engine) inspectSemanticReusablePending(ctx context.Context, cfg SemanticSettings, inspection semanticIndexInspection, source semanticSourceManifest) (int, error) {
+	gate := e.semanticSearchGate()
+	select {
+	case gate <- struct{}{}:
+		defer func() { <-gate }()
+	case <-ctx.Done():
+		return 0, ctx.Err()
+	}
+	f, err := e.Store.OpenKnowledgeFileRead(semanticIndexRel)
+	if err != nil {
+		return 0, err
+	}
+	defer f.Close()
+	identity, err := readSemanticFileIdentity(ctx, f)
+	if err != nil {
+		return 0, err
+	}
+	if identity != inspection.identity {
+		return 0, fmt.Errorf("%w during incremental assessment", errSemanticIndexChanged)
+	}
+	meta, err := decodeSemanticIndexMetadataContext(ctx, f)
+	if err != nil {
+		return 0, err
+	}
+	if meta != inspection.meta {
+		return 0, fmt.Errorf("%w: metadata changed during incremental assessment", errSemanticIndexChanged)
+	}
+	records, err := vector.ScanRecordMetadataExpectedWithLimitsContext(ctx, f, meta.Records, meta.Dimensions, semanticVectorLimits(cfg))
+	if err != nil {
+		return 0, err
+	}
+	reused, err := semanticReusableMetadataCount(ctx, records, source.records)
+	if err != nil {
+		return 0, err
+	}
+	// Reopen by path only after all work based on the scanned metadata has
+	// finished. This final identity check is the function's last observation,
+	// so an atomic replacement during the potentially large comparison cannot
+	// be cached as an assessment of the new generation.
+	current, err := e.Store.OpenKnowledgeFileRead(semanticIndexRel)
+	if err != nil {
+		return 0, fmt.Errorf("%w after incremental assessment: %v", errSemanticIndexChanged, err)
+	}
+	currentIdentity, identityErr := readSemanticFileIdentity(ctx, current)
+	closeErr := current.Close()
+	if err := errors.Join(identityErr, closeErr); err != nil {
+		return 0, fmt.Errorf("%w after incremental assessment: %v", errSemanticIndexChanged, err)
+	}
+	if currentIdentity != inspection.identity {
+		return 0, fmt.Errorf("%w after incremental assessment", errSemanticIndexChanged)
+	}
+	return len(source.records) - reused, nil
+}
+
+func (e *Engine) assessSemanticIncrementalPending(ctx context.Context, cfg SemanticSettings, inspection semanticIndexInspection, sourceFingerprint [32]byte) (semanticIncrementalAssessment, error) {
+	if assessment, ok := e.semanticIncrementalAssessment(cfg, inspection.identity, sourceFingerprint); ok {
+		return assessment, nil
+	}
+	release, err := e.acquireSemanticAssessment(ctx)
+	if err != nil {
+		return semanticIncrementalAssessment{}, err
+	}
+	defer release()
+	// A queued status must consume the winner's cache result rather than scan the
+	// same large payload again after it acquires the per-repository gate.
+	if assessment, ok := e.semanticIncrementalAssessment(cfg, inspection.identity, sourceFingerprint); ok {
+		return assessment, nil
+	}
+	_, manifest, lease, err := e.semanticSourceSnapshotLease(ctx, false)
+	if err != nil {
+		return semanticIncrementalAssessment{}, fmt.Errorf("%w before incremental assessment: %v", errSemanticSourceChanged, err)
+	}
+	if manifest.fingerprint != sourceFingerprint {
+		manifest = semanticSourceManifest{}
+		lease.Release()
+		return semanticIncrementalAssessment{}, errSemanticSourceChanged
+	}
+	pending, err := e.inspectSemanticReusablePending(ctx, cfg, inspection, manifest)
+	manifest = semanticSourceManifest{}
+	lease.Release()
+	if err != nil {
+		return semanticIncrementalAssessment{}, err
+	}
+	e.rememberSemanticIncrementalAssessment(cfg, inspection.identity, sourceFingerprint, pending, "")
+	assessment, _ := e.semanticIncrementalAssessment(cfg, inspection.identity, sourceFingerprint)
+	return assessment, nil
 }
 
 func newSemanticEmbedder(cfg SemanticSettings) (semantic.Embedder, error) {
@@ -372,6 +634,32 @@ func (e *Engine) semanticSourceGate() chan struct{} {
 		e.semantic.sourceGate = make(chan struct{}, 1)
 	}
 	return e.semantic.sourceGate
+}
+
+func (e *Engine) semanticAssessmentGate() chan struct{} {
+	e.semantic.mu.Lock()
+	defer e.semantic.mu.Unlock()
+	if e.semantic.assessmentGate == nil {
+		e.semantic.assessmentGate = make(chan struct{}, 1)
+	}
+	return e.semantic.assessmentGate
+}
+
+func (e *Engine) acquireSemanticAssessment(ctx context.Context) (func(), error) {
+	if ctx == nil {
+		return nil, fmt.Errorf("semantic assessment: nil context")
+	}
+	gate := e.semanticAssessmentGate()
+	select {
+	case gate <- struct{}{}:
+		if err := ctx.Err(); err != nil {
+			<-gate
+			return nil, err
+		}
+		return func() { <-gate }, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
 }
 
 func (e *Engine) acquireSemanticSourceBuild(ctx context.Context) (func(), error) {
@@ -511,17 +799,50 @@ func (e *Engine) rebuildSemanticHeld(ctx context.Context, authorized *SemanticSe
 		docs = nil
 		sourceLease.ReleaseDocuments()
 	}()
-	if authorized != nil && len(docs) > semanticMCPSyncMaxRecords {
-		return SemanticRebuildReport{}, kbErr("SEMANTIC_SYNC_TOO_LARGE",
-			fmt.Sprintf("semantic source 有 %d 条卡片，超过 MCP 同步上限 %d", len(docs), semanticMCPSyncMaxRecords),
-			"请由用户运行 iknowledge semantic rebuild --repo "+e.Store.RepoRoot())
+	var reuseInspection semanticIndexInspection
+	reuseCandidate := false
+	if authorized != nil {
+		inspection, inspectErr := e.inspectSemanticIndexMetadata(ctx, cfg)
+		if inspectErr == nil {
+			wantEmbedder, fingerprintErr := semanticOfflineEmbedderFingerprint(cfg)
+			meta := inspection.meta
+			reuseCandidate = fingerprintErr == nil &&
+				meta.SettingsFingerprint == SemanticSettingsFingerprint(cfg) &&
+				meta.EmbedderFingerprint == wantEmbedder &&
+				meta.ProbeFingerprint != "" && meta.QueryProbeFingerprint != "" &&
+				(cfg.Dimensions == 0 || meta.Dimensions == cfg.Dimensions) &&
+				semanticIncrementalFits(cfg, inspection, len(docs))
+			if reuseCandidate {
+				reuseInspection = inspection
+			}
+		} else if err := ctx.Err(); err != nil {
+			return SemanticRebuildReport{}, err
+		}
+		// Without a safely reusable generation this remains a full rebuild, so
+		// the original zero-provider interactive limit still applies.
+		if !reuseCandidate && len(docs) > semanticMCPSyncMaxRecords {
+			return SemanticRebuildReport{}, semanticSyncTooLargeError(len(docs), len(docs), e.Store.RepoRoot())
+		}
 	}
 	// Reserve the daemon-wide worst-case matrix budget before constructing a
 	// credential-bearing client or sending even the probe. beginSemanticBuild
 	// waits for active Flat scans and counts old+new separately; at a full cap it
 	// may drop only this repository's rebuildable resident cache. The old file
 	// remains atomic and reloadable if this rebuild later fails.
-	if err := e.beginSemanticBuildContext(ctx, cfg); err != nil {
+	buildBytes := uint64(cfg.MaxVectorMiB) << 20
+	reuseBytes := uint64(0)
+	if reuseCandidate {
+		// loadSemanticIndex binds the inner codec header to this checksummed outer
+		// shape before allocating, so the exact old matrix declaration is a safe
+		// transient reservation alongside the new builder's configured ceiling.
+		reuseBytes = reuseInspection.vectorBytes
+		buildBytes, _ = semanticMatrixBytes(cfg, len(docs), reuseInspection.meta.Dimensions)
+	} else if cfg.Dimensions > 0 {
+		if exactBytes, ok := semanticMatrixBytes(cfg, len(docs), cfg.Dimensions); ok {
+			buildBytes = exactBytes
+		}
+	}
+	if err := e.beginSemanticBuildReservationContext(ctx, cfg, buildBytes, reuseBytes); err != nil {
 		return SemanticRebuildReport{}, err
 	}
 	buildActive := true
@@ -530,6 +851,50 @@ func (e *Engine) rebuildSemanticHeld(ctx context.Context, authorized *SemanticSe
 			e.abortSemanticBuild()
 		}
 	}()
+
+	// A candidate old generation becomes reusable only after full payload
+	// checksum/codec validation. Its matrix plus the new builder were required
+	// above to fit inside this build's transient vector authorization.
+	reuseRows := make([]int, len(docs))
+	for i := range reuseRows {
+		reuseRows[i] = -1
+	}
+	var reuseSnapshot *vector.Snapshot
+	var reuseMeta semanticIndexMetadata
+	reused := 0
+	if reuseCandidate {
+		snapshot, meta, _, loadErr := e.loadSemanticIndexExpected(ctx, cfg, sourceFingerprint, &reuseInspection)
+		if loadErr == nil {
+			rows, count, rowsErr := semanticReusableRows(ctx, snapshot, docs)
+			if rowsErr != nil {
+				return SemanticRebuildReport{}, rowsErr
+			}
+			reuseSnapshot, reuseMeta, reuseRows, reused = snapshot, meta, rows, count
+		} else {
+			if err := ctx.Err(); err != nil {
+				return SemanticRebuildReport{}, err
+			}
+			if errors.Is(loadErr, errSemanticIndexChanged) {
+				return SemanticRebuildReport{}, loadErr
+			}
+			blockReason := "旧 semantic generation 完整性校验失败，不能增量复用: " + loadErr.Error()
+			e.rememberSemanticIncrementalAssessment(cfg, reuseInspection.identity, sourceFingerprint, len(docs), blockReason)
+			e.semantic.mu.Lock()
+			e.semantic.corruptFile, e.semantic.corruptErr = reuseInspection.identity, loadErr.Error()
+			e.semantic.mu.Unlock()
+		}
+	}
+	pending := len(docs) - reused
+	if reuseCandidate && reuseSnapshot != nil {
+		e.rememberSemanticIncrementalAssessment(cfg, reuseInspection.identity, sourceFingerprint, pending, "")
+	}
+	if authorized != nil && pending > semanticMCPSyncMaxRecords {
+		if reuseCandidate {
+			e.rememberSemanticIncrementalAssessment(cfg, reuseInspection.identity, sourceFingerprint, pending,
+				fmt.Sprintf("semantic 增量需 embedding %d 条卡片，超过 MCP 上限 %d", pending, semanticMCPSyncMaxRecords))
+		}
+		return SemanticRebuildReport{}, semanticSyncTooLargeError(len(docs), pending, e.Store.RepoRoot())
+	}
 	// Size authorization is evaluated before constructing a credential-bearing
 	// remote client or sending the initial canary probe. Oversized interactive
 	// work therefore fails with exactly zero provider requests.
@@ -552,6 +917,33 @@ func (e *Engine) rebuildSemanticHeld(ctx context.Context, authorized *SemanticSe
 	}
 	probeFingerprint := semanticVectorFingerprint(documentProbe)
 	queryProbeFingerprint := semanticVectorFingerprint(queryProbe)
+	if reuseSnapshot != nil && (reuseMeta.Dimensions != dimensions ||
+		reuseMeta.ProbeFingerprint != probeFingerprint ||
+		reuseMeta.QueryProbeFingerprint != queryProbeFingerprint) {
+		// An unchanged tag may now resolve to a different backend. Never mix
+		// vector spaces: small MCP sources fall back to a full rebuild, while a
+		// large source stops after this canary-only request and keeps the old file.
+		reuseSnapshot, reuseMeta, reused = nil, semanticIndexMetadata{}, 0
+		for i := range reuseRows {
+			reuseRows[i] = -1
+		}
+		pending = len(docs)
+		if authorized != nil && pending > semanticMCPSyncMaxRecords {
+			e.rememberSemanticIncrementalAssessment(cfg, reuseInspection.identity, sourceFingerprint, pending,
+				"当前 document/query canary 与旧 generation 不一致，禁止跨向量空间增量复用")
+			return SemanticRebuildReport{}, semanticSyncTooLargeError(len(docs), pending, e.Store.RepoRoot())
+		}
+	}
+	actualBuildBytes, ok := semanticMatrixBytes(cfg, len(docs), dimensions)
+	if !ok {
+		return SemanticRebuildReport{}, fmt.Errorf("semantic matrix records=%d dimensions=%d 超出配置上限", len(docs), dimensions)
+	}
+	if actualBuildBytes != buildBytes {
+		if err := e.resizeSemanticBuildReservationContext(ctx, actualBuildBytes, reuseBytes); err != nil {
+			return SemanticRebuildReport{}, err
+		}
+		buildBytes = actualBuildBytes
+	}
 
 	// 先对 dimensions、metadata、record count 和最终矩阵字节数做完整预检。
 	// 除固定单条 probe 外，任何批量/付费文档请求都必须发生在预检之后。
@@ -571,41 +963,83 @@ func (e *Engine) rebuildSemanticHeld(ctx context.Context, authorized *SemanticSe
 	}
 	// Builder 已复制紧凑 metadata，尽早释放预检输入。
 	records = nil
-	const documentBatchSize = semanticEmbedBatchSize - 2 // reserve document + query mode canaries
-	for start := 0; start < len(docs); start += documentBatchSize {
-		end := min(start+documentBatchSize, len(docs))
-		texts := make([]string, end-start)
-		for i := range texts {
-			texts[i] = docs[start+i].Text
-		}
-		vectors, batchProbe, batchQueryProbe, err := e.embedSemanticDocumentsDualCanary(ctx, embedder, texts, authorizeRequest)
-		if err != nil {
-			return SemanticRebuildReport{}, fmt.Errorf("semantic embedding 批次 %d..%d: %w", start, end, err)
-		}
-		if len(vectors) != len(texts) {
-			return SemanticRebuildReport{}, fmt.Errorf("semantic embedding 批次返回 %d 条，期望 %d", len(vectors), len(texts))
-		}
-		if err := validateSemanticVector(batchProbe, dimensions); err != nil {
-			return SemanticRebuildReport{}, fmt.Errorf("semantic embedding 批次 %d..%d canary: %w", start, end, err)
-		}
-		if observed := semanticVectorFingerprint(batchProbe); observed != probeFingerprint {
-			return SemanticRebuildReport{}, fmt.Errorf("semantic embedding 批次 %d..%d 检测到实际模型漂移，已放弃混合向量 generation", start, end)
-		}
-		if err := validateSemanticVector(batchQueryProbe, dimensions); err != nil {
-			return SemanticRebuildReport{}, fmt.Errorf("semantic embedding 批次 %d..%d query canary: %w", start, end, err)
-		}
-		if observed := semanticVectorFingerprint(batchQueryProbe); observed != queryProbeFingerprint {
-			return SemanticRebuildReport{}, fmt.Errorf("semantic embedding 批次 %d..%d 检测到查询模型漂移，已放弃混合向量 generation", start, end)
-		}
-		for i, values := range vectors {
-			if err := validateSemanticVector(values, dimensions); err != nil {
-				return SemanticRebuildReport{}, fmt.Errorf("semantic record %s: %w", docs[start+i].RecordID, err)
-			}
-		}
-		if err := builder.Append(ctx, vectors); err != nil {
-			return SemanticRebuildReport{}, fmt.Errorf("semantic embedding 批次 %d..%d 写入矩阵: %w", start, end, err)
+	rememberBatchCanaryBlock := func(reason string) {
+		if authorized != nil && reuseCandidate && len(docs) > semanticMCPSyncMaxRecords {
+			e.rememberSemanticIncrementalAssessment(cfg, reuseInspection.identity, sourceFingerprint, pending, reason)
 		}
 	}
+	const documentBatchSize = semanticEmbedBatchSize - 2 // reserve document + query mode canaries
+	for start := 0; start < len(docs); {
+		end := start
+		missing := make([]int, 0, documentBatchSize)
+		texts := make([]string, 0, documentBatchSize)
+		for end < len(docs) && len(texts) < documentBatchSize {
+			if reuseRows[end] < 0 {
+				missing = append(missing, end)
+				texts = append(texts, docs[end].Text)
+			}
+			end++
+		}
+		var vectors [][]float32
+		if len(texts) > 0 {
+			var batchProbe, batchQueryProbe []float32
+			vectors, batchProbe, batchQueryProbe, err = e.embedSemanticDocumentsDualCanary(ctx, embedder, texts, authorizeRequest)
+			if err != nil {
+				return SemanticRebuildReport{}, fmt.Errorf("semantic embedding 批次 %d..%d: %w", start, end, err)
+			}
+			if len(vectors) != len(texts) {
+				return SemanticRebuildReport{}, fmt.Errorf("semantic embedding 批次返回 %d 条，期望 %d", len(vectors), len(texts))
+			}
+			if err := validateSemanticVector(batchProbe, dimensions); err != nil {
+				// A changed dimension is deterministic vector-space drift. Other
+				// malformed responses (zero/non-finite/empty) may be a transient
+				// provider failure and must remain retryable rather than poisoning
+				// this generation's local assessment cache.
+				if len(batchProbe) > 0 && len(batchProbe) != dimensions {
+					rememberBatchCanaryBlock("semantic embedding 批次 document canary 维度发生漂移，禁止继续复用旧 generation")
+				}
+				return SemanticRebuildReport{}, fmt.Errorf("semantic embedding 批次 %d..%d canary: %w", start, end, err)
+			}
+			if observed := semanticVectorFingerprint(batchProbe); observed != probeFingerprint {
+				rememberBatchCanaryBlock("semantic embedding 批次检测到 document canary 漂移，禁止继续复用旧 generation")
+				return SemanticRebuildReport{}, fmt.Errorf("semantic embedding 批次 %d..%d 检测到实际模型漂移，已放弃混合向量 generation", start, end)
+			}
+			if err := validateSemanticVector(batchQueryProbe, dimensions); err != nil {
+				if len(batchQueryProbe) > 0 && len(batchQueryProbe) != dimensions {
+					rememberBatchCanaryBlock("semantic embedding 批次 query canary 维度发生漂移，禁止继续复用旧 generation")
+				}
+				return SemanticRebuildReport{}, fmt.Errorf("semantic embedding 批次 %d..%d query canary: %w", start, end, err)
+			}
+			if observed := semanticVectorFingerprint(batchQueryProbe); observed != queryProbeFingerprint {
+				rememberBatchCanaryBlock("semantic embedding 批次检测到 query canary 漂移，禁止继续复用旧 generation")
+				return SemanticRebuildReport{}, fmt.Errorf("semantic embedding 批次 %d..%d 检测到查询模型漂移，已放弃混合向量 generation", start, end)
+			}
+			for i, values := range vectors {
+				if err := validateSemanticVector(values, dimensions); err != nil {
+					return SemanticRebuildReport{}, fmt.Errorf("semantic record %s: %w", docs[missing[i]].RecordID, err)
+				}
+			}
+		}
+		vectorIndex := 0
+		for i := start; i < end; i++ {
+			if row := reuseRows[i]; row >= 0 {
+				if err := builder.AppendFromSnapshot(ctx, reuseSnapshot, row); err != nil {
+					return SemanticRebuildReport{}, fmt.Errorf("semantic reuse record %s: %w", docs[i].RecordID, err)
+				}
+				continue
+			}
+			if err := builder.Append(ctx, vectors[vectorIndex:vectorIndex+1]); err != nil {
+				return SemanticRebuildReport{}, fmt.Errorf("semantic embedding record %s 写入矩阵: %w", docs[i].RecordID, err)
+			}
+			vectorIndex++
+		}
+		start = end
+	}
+	// All reused rows are now copied into the new builder. Drop the old decoded
+	// matrix before the transient reservation is promoted to the new resident.
+	reuseSnapshot = nil
+	reuseMeta = semanticIndexMetadata{}
+	reuseRows = nil
 	snapshot, err := builder.Finish(ctx)
 	if err != nil {
 		return SemanticRebuildReport{}, err
@@ -630,6 +1064,10 @@ func (e *Engine) rebuildSemanticHeld(ctx context.Context, authorized *SemanticSe
 	}
 	_, expectedMetadataChecksum, err := marshalSemanticIndexMetadata(meta)
 	if err != nil {
+		return SemanticRebuildReport{}, err
+	}
+	residentBytes := status.VectorBytes
+	if err := e.validateSemanticBuildPromotion(residentBytes); err != nil {
 		return SemanticRebuildReport{}, err
 	}
 	writeErr := e.Store.WriteSemanticIndexStreamChecked(func(w io.Writer) error {
@@ -667,13 +1105,14 @@ func (e *Engine) rebuildSemanticHeld(ctx context.Context, authorized *SemanticSe
 	}
 
 	key := semanticLoadedKey(cfg, sourceFingerprint)
-	if err := e.publishSemanticBuild(key, fileIdentity, snapshot, meta); err != nil {
+	if err := e.publishSemanticBuild(key, fileIdentity, snapshot, meta, residentBytes); err != nil {
 		return SemanticRebuildReport{}, err
 	}
+	e.clearSemanticIncrementalAssessment()
 	buildActive = false
 	return SemanticRebuildReport{
 		Records: status.Records, Dimensions: status.Dimensions,
-		VectorBytes: status.VectorBytes, MetadataBytes: status.MetadataBytes,
+		VectorBytes: status.VectorBytes, MetadataBytes: status.MetadataBytes, Reused: reused, Embedded: pending,
 		Model: cfg.Model, Endpoint: cfg.Endpoint, Fingerprint: meta.SettingsFingerprint,
 	}, nil
 }
@@ -683,6 +1122,18 @@ func (e *Engine) beginSemanticBuild(cfg SemanticSettings) error {
 }
 
 func (e *Engine) beginSemanticBuildContext(ctx context.Context, cfg SemanticSettings) error {
+	return e.beginSemanticBuildWithReuseContext(ctx, cfg, 0)
+}
+
+func (e *Engine) beginSemanticBuildWithReuseContext(ctx context.Context, cfg SemanticSettings, reuseBytes uint64) error {
+	return e.beginSemanticBuildReservationContext(ctx, cfg, uint64(cfg.MaxVectorMiB)<<20, reuseBytes)
+}
+
+func (e *Engine) beginSemanticBuildReservationContext(ctx context.Context, cfg SemanticSettings, buildBytes, reuseBytes uint64) error {
+	maxBytes := uint64(cfg.MaxVectorMiB) << 20
+	if cfg.MaxVectorMiB <= 0 || buildBytes > maxBytes || reuseBytes > maxBytes {
+		return fmt.Errorf("semantic rebuild matrix reservation exceeds configured limit")
+	}
 	if err := e.semantic.residentMu.LockContext(ctx); err != nil {
 		return err
 	}
@@ -695,9 +1146,44 @@ func (e *Engine) beginSemanticBuildContext(ctx context.Context, cfg SemanticSett
 	if e.semantic.closing {
 		return fmt.Errorf("semantic daemon 正在关闭")
 	}
+	if err := e.reserveSemanticTransientLocked(buildBytes, reuseBytes); err != nil {
+		return err
+	}
+	// The transient reservation counts the new builder separately from any
+	// published snapshot. Unless the capacity fallback was required, keep the
+	// old immutable generation usable through atomic publication. Failures before
+	// rename leave its disk generation untouched; post-commit validation errors
+	// are reported explicitly as committed-but-stale.
+	e.semantic.building = true
+	return nil
+}
+
+func (e *Engine) resizeSemanticBuildReservationContext(ctx context.Context, buildBytes, reuseBytes uint64) error {
+	if err := e.semantic.residentMu.LockContext(ctx); err != nil {
+		return err
+	}
+	defer e.semantic.residentMu.Unlock()
+	e.semantic.mu.Lock()
+	defer e.semantic.mu.Unlock()
+	if !e.semantic.building {
+		return fmt.Errorf("semantic rebuild publication lost its resident reservation")
+	}
+	if e.semantic.closing {
+		return fmt.Errorf("semantic daemon 正在关闭")
+	}
+	return e.reserveSemanticTransientLocked(buildBytes, reuseBytes)
+}
+
+// reserveSemanticTransientLocked requires residentMu and semantic.mu. It
+// accounts the reusable old matrix separately from the maximum matrix that may
+// be promoted as the new resident generation.
+func (e *Engine) reserveSemanticTransientLocked(buildBytes, reuseBytes uint64) error {
 	if e.semantic.process != nil {
-		bytes := uint64(cfg.MaxVectorMiB) << 20
-		if err := e.semantic.process.reserveTransient(e, bytes); err != nil {
+		if reuseBytes > ^uint64(0)-buildBytes {
+			return fmt.Errorf("semantic incremental reservation overflow")
+		}
+		totalBytes := buildBytes + reuseBytes
+		if err := e.semantic.process.reserveTransient(e, totalBytes, buildBytes); err != nil {
 			// At the 1GiB steady-state ceiling, keeping old+new may not fit.
 			// No scan can retain the old pointer under residentMu, so release only
 			// this repository's resident cache (the atomic disk generation stays)
@@ -711,17 +1197,11 @@ func (e *Engine) beginSemanticBuildContext(ctx context.Context, cfg SemanticSett
 			e.semantic.snapshot, e.semantic.metadata = nil, semanticIndexMetadata{}
 			e.semantic.queryCache = nil
 			e.semantic.process.releaseResident(e)
-			if retryErr := e.semantic.process.reserveTransient(e, bytes); retryErr != nil {
+			if retryErr := e.semantic.process.reserveTransient(e, totalBytes, buildBytes); retryErr != nil {
 				return retryErr
 			}
 		}
 	}
-	// The transient reservation counts the new builder separately from any
-	// published snapshot. Unless the full-cap fallback above was required, keep
-	// the old immutable generation usable through atomic publication. Failures
-	// before rename leave its disk generation untouched; post-commit validation
-	// errors are reported explicitly as committed-but-stale.
-	e.semantic.building = true
 	return nil
 }
 
@@ -735,7 +1215,18 @@ func (e *Engine) abortSemanticBuild() {
 	process.releaseTransient(e)
 }
 
-func (e *Engine) publishSemanticBuild(key string, identity semanticFileIdentity, snapshot *vector.Snapshot, meta semanticIndexMetadata) error {
+func (e *Engine) validateSemanticBuildPromotion(residentBytes uint64) error {
+	e.semantic.mu.Lock()
+	process := e.semantic.process
+	building := e.semantic.building
+	e.semantic.mu.Unlock()
+	if !building {
+		return fmt.Errorf("semantic rebuild publication lost its resident reservation")
+	}
+	return process.validateTransientPromotion(e, residentBytes)
+}
+
+func (e *Engine) publishSemanticBuild(key string, identity semanticFileIdentity, snapshot *vector.Snapshot, meta semanticIndexMetadata, residentBytes uint64) error {
 	e.semantic.residentMu.Lock()
 	defer e.semantic.residentMu.Unlock()
 	e.semantic.mu.Lock()
@@ -746,6 +1237,16 @@ func (e *Engine) publishSemanticBuild(key string, identity semanticFileIdentity,
 	if !e.semantic.building {
 		return fmt.Errorf("semantic rebuild publication lost its resident reservation")
 	}
+	process := e.semantic.process
+	// The transient authorization still covers the local new snapshot while the
+	// old resident charge covers e.semantic.snapshot. Drop the old pointer first,
+	// then atomically promote accounting, then install the new pointer. This order
+	// never exposes old+new matrices while only the smaller new resident is charged.
+	e.semantic.snapshot = nil
+	e.semantic.metadata = semanticIndexMetadata{}
+	if err := process.promoteTransient(e, residentBytes); err != nil {
+		return fmt.Errorf("semantic generation 已提交但驻留预算发布失败；磁盘新代保留并将在下次 recall 重新加载: %w", err)
+	}
 	e.semantic.loadedKey, e.semantic.loadedAt, e.semantic.loadedFile = key, time.Now(), identity
 	e.semantic.snapshot, e.semantic.metadata = snapshot, meta
 	e.semantic.loadErr, e.semantic.lastError = "", ""
@@ -753,7 +1254,6 @@ func (e *Engine) publishSemanticBuild(key string, identity semanticFileIdentity,
 	// 同名 provider 的实际模型可能已重建/漂移，旧 query vector 不得跨代复用。
 	e.semantic.queryCache = nil
 	e.semantic.failureUntil = time.Time{}
-	e.semantic.process.promoteTransient(e)
 	e.semantic.building = false
 	return nil
 }
@@ -942,24 +1442,43 @@ func (e *Engine) ensureSemanticSnapshotLocked(ctx context.Context, cfg SemanticS
 	if e.semantic.building {
 		return nil, semanticIndexMetadata{}, fmt.Errorf("semantic 索引正在重建；本次已降级 lexical，请稍后重试")
 	}
+	inspection, inspectErr := e.inspectSemanticIndexMetadata(ctx, cfg)
+	if inspectErr == nil {
+		inspectErr = validateSemanticIndexProviderBinding(inspection.meta, cfg)
+	}
+	if inspectErr != nil {
+		if errors.Is(inspectErr, context.Canceled) || errors.Is(inspectErr, context.DeadlineExceeded) {
+			return nil, semanticIndexMetadata{}, inspectErr
+		}
+		if os.IsNotExist(inspectErr) {
+			inspectErr = fmt.Errorf("semantic 索引不存在；运行 iknowledge semantic rebuild")
+		}
+		e.semantic.loadedKey, e.semantic.loadErr = key, inspectErr.Error()
+		e.semantic.loadedAt, e.semantic.loadedFile = now, semanticFileIdentity{}
+		e.semantic.snapshot, e.semantic.metadata = nil, semanticIndexMetadata{}
+		e.semantic.queryCache = nil
+		e.semantic.lastError = inspectErr.Error()
+		process.releaseResident(e)
+		return nil, semanticIndexMetadata{}, inspectErr
+	}
+	// residentMu excludes every active scan. Retire the old pointer and its
+	// charge before authorizing a possibly smaller replacement; otherwise another
+	// repository could consume the prematurely released difference while the old
+	// matrix was still reachable here.
+	e.semantic.snapshot, e.semantic.metadata = nil, semanticIndexMetadata{}
+	e.semantic.loadedFile = semanticFileIdentity{}
+	e.semantic.queryCache = nil
+	process.releaseResident(e)
 	if process != nil {
-		if err := process.reserveResident(e, uint64(cfg.MaxVectorMiB)<<20); err != nil {
+		if err := process.reserveResident(e, inspection.vectorBytes); err != nil {
 			e.semantic.loadedKey, e.semantic.loadErr = "", ""
 			e.semantic.loadedAt, e.semantic.loadedFile = time.Time{}, semanticFileIdentity{}
-			e.semantic.snapshot, e.semantic.metadata = nil, semanticIndexMetadata{}
-			e.semantic.queryCache = nil
 			process.releaseResident(e)
 			e.semantic.lastError = err.Error()
 			return nil, semanticIndexMetadata{}, err
 		}
 	}
-	// residentMu excludes every active scan. Drop a different/externally
-	// replaced generation before allocating the new matrix, so logical resident
-	// memory never contains two snapshots for one Engine.
-	e.semantic.snapshot, e.semantic.metadata = nil, semanticIndexMetadata{}
-	e.semantic.loadedFile = semanticFileIdentity{}
-
-	snapshot, meta, identity, err := e.loadSemanticIndex(ctx, cfg, source)
+	snapshot, meta, identity, err := e.loadSemanticIndexExpected(ctx, cfg, source, &inspection)
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 		process.releaseResident(e)
 		return nil, semanticIndexMetadata{}, err
@@ -971,7 +1490,7 @@ func (e *Engine) ensureSemanticSnapshotLocked(ctx context.Context, cfg SemanticS
 		e.semantic.snapshot = nil
 		e.semantic.loadedFile = semanticFileIdentity{}
 		e.semantic.loadErr, e.semantic.lastError = err.Error(), err.Error()
-		if identity != (semanticFileIdentity{}) {
+		if identity != (semanticFileIdentity{}) && !errors.Is(err, errSemanticIndexChanged) {
 			e.semantic.corruptFile, e.semantic.corruptErr = identity, err.Error()
 		}
 		process.releaseResident(e)
@@ -1048,6 +1567,10 @@ func (l *semanticSnapshotLease) validateFile(ctx context.Context) error {
 }
 
 func (e *Engine) loadSemanticIndex(ctx context.Context, cfg SemanticSettings, source [32]byte) (*vector.Snapshot, semanticIndexMetadata, semanticFileIdentity, error) {
+	return e.loadSemanticIndexExpected(ctx, cfg, source, nil)
+}
+
+func (e *Engine) loadSemanticIndexExpected(ctx context.Context, cfg SemanticSettings, source [32]byte, expected *semanticIndexInspection) (*vector.Snapshot, semanticIndexMetadata, semanticFileIdentity, error) {
 	f, err := e.Store.OpenKnowledgeFileRead(semanticIndexRel)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -1060,6 +1583,9 @@ func (e *Engine) loadSemanticIndex(ctx context.Context, cfg SemanticSettings, so
 	if err != nil {
 		return nil, semanticIndexMetadata{}, semanticFileIdentity{}, err
 	}
+	if expected != nil && identity != expected.identity {
+		return nil, semanticIndexMetadata{}, identity, fmt.Errorf("%w before matrix allocation", errSemanticIndexChanged)
+	}
 	maxFile := semanticMaxIndexFileSize(cfg)
 	if identity.Size < semanticWrapperSize || identity.Size > maxFile {
 		return nil, semanticIndexMetadata{}, semanticFileIdentity{}, fmt.Errorf("semantic 索引大小 %d 超出允许范围", identity.Size)
@@ -1070,13 +1596,16 @@ func (e *Engine) loadSemanticIndex(ctx context.Context, cfg SemanticSettings, so
 	if err != nil {
 		return nil, semanticIndexMetadata{}, identity, err
 	}
+	if expected != nil && meta != expected.meta {
+		return nil, semanticIndexMetadata{}, identity, fmt.Errorf("semantic 索引 metadata 与预检 generation 不一致")
+	}
 	// Source drift does not make unchanged records unsafe: every hit is later
 	// rebound to the current manifest by record ID + source hash. Provider/model
 	// drift, however, changes the vector space and remains a hard rejection.
 	if err := validateSemanticIndexProviderBinding(meta, cfg); err != nil {
 		return nil, semanticIndexMetadata{}, identity, err
 	}
-	snapshot, err := vector.DecodeWithLimitsContext(ctx, f, semanticVectorLimits(cfg))
+	snapshot, err := vector.DecodeExpectedWithLimitsContext(ctx, f, meta.Records, meta.Dimensions, semanticVectorLimits(cfg))
 	if err != nil {
 		return nil, semanticIndexMetadata{}, identity, err
 	}
@@ -1436,6 +1965,7 @@ func (e *Engine) ClearSemanticIndex() error {
 	e.semantic.loadedAt, e.semantic.loadedFile = time.Time{}, semanticFileIdentity{}
 	e.semantic.snapshot, e.semantic.metadata = nil, semanticIndexMetadata{}
 	e.semantic.corruptFile, e.semantic.corruptErr = semanticFileIdentity{}, ""
+	e.semantic.incremental = semanticIncrementalAssessment{}
 	e.semantic.queryCache = nil
 	e.semantic.failureUntil, e.semantic.lastError = time.Time{}, ""
 	e.semantic.mu.Unlock()
@@ -1460,9 +1990,9 @@ const (
 )
 
 // SemanticHealth 是 semantic 派生索引的结构化健康快照。Provider 当前固定
-// 为 unchecked：status 绝不联网、不读 API key，也不解码最高 512MiB
-// 的 vector payload。ready 只代表本地 wrapper/metadata/绑定有效；payload
-// 的 checksum 与解码仍延迟到 recall。
+// 为 unchecked：status 绝不联网、不读 API key。ready 只代表本地
+// wrapper/metadata/绑定有效，payload checksum 与矩阵解码仍延迟到
+// recall；仅大型 partial 的首次精确规划会流式校验整个 payload，但不保留矩阵。
 type SemanticHealth struct {
 	Status     SemanticHealthStatus
 	Enabled    bool
@@ -1483,20 +2013,29 @@ type SemanticHealth struct {
 	Detail               string
 	LastError            string
 	PayloadLoaded        bool
+	// syncTooLarge is an internal, structured planner result. Keep the public
+	// text stable while preserving SEMANTIC_SYNC_TOO_LARGE across every health
+	// branch that requires a full >3000-card interactive rebuild.
+	syncTooLarge bool
 }
 
-func semanticHealthValue(value string) string {
-	if strings.TrimSpace(value) == "" {
-		return "-"
+func (h SemanticHealth) operationalText() string {
+	if h.NextAction == "kb_semantic action=sync" &&
+		(h.Policy == string(SemanticRebuildAILocal) || h.Policy == string(SemanticRebuildAIRemote)) {
+		return fmt.Sprintf("semantic_action: kb_semantic action=sync | policy=%s | 静默执行一次，不向用户复述例行状态", h.Policy)
 	}
-	return value
+	needsAttention := h.Status == SemanticHealthCorrupt ||
+		(h.Enabled && h.Configured && h.NextAction != "" && h.NextAction != "none")
+	if !needsAttention {
+		return ""
+	}
+	return fmt.Sprintf("semantic_attention: status=%s | action=%s | 仅当当前任务依赖语义召回或用户询问状态时简短说明一次", h.Status, h.NextAction)
 }
 
-func (h SemanticHealth) compactText() string {
-	return fmt.Sprintf("semantic: %s | provider: %s | next_action: %s\nsemantic 配置: model=%s | profile=%s | policy=%s | dimensions=%d(auto=0) | index_dimensions=%d | records=%d | built_at=%s",
-		h.Status, semanticHealthValue(h.Provider), semanticHealthValue(h.NextAction),
-		semanticHealthValue(h.Model), semanticHealthValue(h.Profile), semanticHealthValue(h.Policy),
-		h.ConfiguredDimensions, h.IndexDimensions, h.Records, semanticHealthValue(h.BuiltAt))
+func semanticHealthSyncTooLarge(h SemanticHealth, sourceRecords int) bool {
+	return sourceRecords > semanticMCPSyncMaxRecords &&
+		(h.Policy == string(SemanticRebuildAILocal) || h.Policy == string(SemanticRebuildAIRemote)) &&
+		strings.HasPrefix(h.NextAction, "iknowledge semantic rebuild --repo ")
 }
 
 func (e *Engine) semanticRebuildNextAction(policy string, sourceRecords int) string {
@@ -1509,6 +2048,15 @@ func (e *Engine) semanticRebuildNextAction(policy string, sourceRecords int) str
 	default:
 		return "iknowledge semantic rebuild --repo " + e.Store.RepoRoot()
 	}
+}
+
+func (e *Engine) semanticIncrementalNextAction(policy string, cfg SemanticSettings, old semanticIndexInspection, sourceRecords int) string {
+	if (policy == string(SemanticRebuildAILocal) || policy == string(SemanticRebuildAIRemote)) &&
+		semanticIncrementalFits(cfg, old, sourceRecords) &&
+		sourceRecords-old.meta.Records <= semanticMCPSyncMaxRecords {
+		return "kb_semantic action=sync"
+	}
+	return e.semanticRebuildNextAction(policy, sourceRecords)
 }
 
 func semanticSyncLimitDetail(sourceRecords int) string {
@@ -1534,8 +2082,8 @@ func semanticOfflineEmbedderFingerprint(cfg SemanticSettings) (string, error) {
 
 // SemanticHealthSnapshot 返回纯本地健康快照。除仓外 config 与 vector.idx
 // wrapper/<=64KiB metadata 外，ai-* policy 还会构造有界 source manifest，
-// 用来避免建议一个注定超限的 MCP sync；绝不读 API key、探测 provider 或
-// 解码 vector payload。
+// 用来避免建议一个注定超限的 MCP sync；绝不读 API key 或探测
+// provider。大型 partial 首次还会流式校验 payload 并缓存精确增量规划。
 func (e *Engine) SemanticHealthSnapshot() (health SemanticHealth) {
 	return e.semanticHealthSnapshotContext(context.Background())
 }
@@ -1556,7 +2104,9 @@ func (e *Engine) SemanticHealthSnapshotContext(ctx context.Context) (SemanticHea
 
 func (e *Engine) semanticHealthSnapshotContext(ctx context.Context) (health SemanticHealth) {
 	health = SemanticHealth{Status: SemanticHealthUnconfigured, Provider: "unchecked", Policy: "manual"}
+	sourceRecords := -1
 	defer func() {
+		health.syncTooLarge = semanticHealthSyncTooLarge(health, sourceRecords)
 		e.semantic.mu.Lock()
 		health.LastError = e.semantic.lastError
 		e.semantic.mu.Unlock()
@@ -1616,9 +2166,9 @@ func (e *Engine) semanticHealthSnapshotContext(ctx context.Context) (health Sema
 	// An ai-* next_action must be executable. Build the same bounded local
 	// manifest up front so status never tells an AI to spend its one session
 	// sync attempt on a source that the interactive path must reject (>3000).
-	// This remains offline: no API key, provider request or vector decode.
+	// This manifest step remains offline and does not touch the vector payload;
+	// a later large-partial assessment may stream it under its own bounded gate.
 	var sourceFingerprint [32]byte
-	sourceRecords := -1
 	sourceReady := false
 	loadSource := func() error {
 		if sourceReady {
@@ -1627,12 +2177,14 @@ func (e *Engine) semanticHealthSnapshotContext(ctx context.Context) (health Sema
 		if err := e.SyncContext(ctx); err != nil {
 			return err
 		}
-		fingerprint, records, err := e.semanticSourceMetadata(ctx)
+		_, manifest, lease, err := e.semanticSourceSnapshotLease(ctx, false)
 		if err != nil {
 			return err
 		}
-		sourceFingerprint = fingerprint
-		sourceRecords = records
+		sourceFingerprint = manifest.fingerprint
+		sourceRecords = len(manifest.records)
+		manifest = semanticSourceManifest{}
+		lease.Release()
 		sourceReady = true
 		return nil
 	}
@@ -1716,10 +2268,45 @@ func (e *Engine) semanticHealthSnapshotContext(ctx context.Context) (health Sema
 		}
 		health.PayloadLoaded = payloadLoaded
 		health.Status = SemanticHealthPartial
-		health.NextAction = e.semanticRebuildNextAction(health.Policy, sourceRecords)
+		health.NextAction = e.semanticIncrementalNextAction(health.Policy, cfg, inspection, sourceRecords)
 		health.Detail = "知识已变化；仅使用 record source hash 仍匹配的旧向量，新改知识等待同步"
-		if detail := semanticSyncLimitDetail(sourceRecords); detail != "" {
-			health.Detail += "；" + detail
+		if health.NextAction == "kb_semantic action=sync" && sourceRecords > semanticMCPSyncMaxRecords {
+			assessment, assessmentErr := e.assessSemanticIncrementalPending(ctx, cfg, inspection, sourceFingerprint)
+			if assessmentErr != nil {
+				if ctx.Err() != nil {
+					return health
+				}
+				switch {
+				case errors.Is(assessmentErr, errSemanticIndexChanged):
+					health.NextAction = "retry kb_status"
+					health.Detail = "semantic generation 在本地评估期间发生替换；下次状态读取将重新判断"
+				case errors.Is(assessmentErr, errSemanticSourceChanged):
+					health.NextAction = "retry kb_status"
+					health.Detail = "semantic source 在本地评估前发生变化；下次状态读取将重新判断"
+				default:
+					e.semantic.mu.Lock()
+					e.semantic.corruptFile, e.semantic.corruptErr = inspection.identity, assessmentErr.Error()
+					e.semantic.mu.Unlock()
+					_ = e.invalidateSemanticSnapshotForStatusContext(ctx, inspection.meta)
+					health.Status = SemanticHealthCorrupt
+					health.NextAction = e.semanticRebuildNextAction(health.Policy, sourceRecords)
+					health.Detail = "旧 semantic generation 完整性校验失败: " + assessmentErr.Error()
+				}
+				return health
+			}
+			switch {
+			case assessment.blockReason != "":
+				health.NextAction = e.semanticRebuildNextAction("manual", sourceRecords)
+				health.Detail += "；" + assessment.blockReason
+			case assessment.pending > semanticMCPSyncMaxRecords:
+				health.NextAction = e.semanticRebuildNextAction("manual", sourceRecords)
+				health.Detail += fmt.Sprintf("；精确增量需 embedding %d 条，超过 MCP 上限 %d", assessment.pending, semanticMCPSyncMaxRecords)
+			}
+		}
+		if health.NextAction != "kb_semantic action=sync" {
+			if detail := semanticSyncLimitDetail(sourceRecords); detail != "" {
+				health.Detail += "；" + detail
+			}
 		}
 		return health
 	}
@@ -1848,8 +2435,8 @@ func (e *Engine) SemanticStatusTextContext(ctx context.Context) (string, error) 
 		state = "enabled"
 	}
 	var b strings.Builder
-	fmt.Fprintf(&b, "semantic: %s\nstatus: %s\nconfig: %s\nprovider: %s\nnext_action: %s\n",
-		state, health.Status, path, health.Provider, health.NextAction)
+	fmt.Fprintf(&b, "semantic: %s\nstatus: %s\nconfig: %s\nprovider_probe: deferred (offline status; not an error)\nnext_action: %s\n",
+		state, health.Status, path, health.NextAction)
 	if health.Configured {
 		fmt.Fprintf(&b, "model: %s\nquery_profile: %s\npolicy: %s\ndimensions: %d(auto=0)\n",
 			health.Model, health.Profile, health.Policy, health.ConfiguredDimensions)
@@ -2035,7 +2622,7 @@ func decodeSemanticIndexContext(ctx context.Context, r io.Reader, limits vector.
 	if err != nil {
 		return semanticIndexMetadata{}, nil, err
 	}
-	snapshot, err := vector.DecodeWithLimitsContext(ctx, r, limits)
+	snapshot, err := vector.DecodeExpectedWithLimitsContext(ctx, r, meta.Records, meta.Dimensions, limits)
 	if err != nil {
 		return semanticIndexMetadata{}, nil, err
 	}
@@ -2098,8 +2685,8 @@ func validateSemanticIndexMetadata(meta semanticIndexMetadata) error {
 		len(meta.Generation) != 32 ||
 		len(meta.SettingsFingerprint) == 0 || len(meta.SettingsFingerprint) > 256 ||
 		len(meta.EmbedderFingerprint) == 0 || len(meta.EmbedderFingerprint) > 256 ||
-		len(meta.ProbeFingerprint) == 0 || len(meta.ProbeFingerprint) > 128 ||
-		len(meta.QueryProbeFingerprint) > 128 ||
+		!validSemanticCanaryFingerprint(meta.ProbeFingerprint) ||
+		(meta.QueryProbeFingerprint != "" && !validSemanticCanaryFingerprint(meta.QueryProbeFingerprint)) ||
 		len(meta.SourceFingerprint) != 64 || len(meta.BuiltAt) == 0 || len(meta.BuiltAt) > 64 {
 		return fmt.Errorf("semantic metadata 字段非法")
 	}
@@ -2113,6 +2700,18 @@ func validateSemanticIndexMetadata(meta semanticIndexMetadata) error {
 		return fmt.Errorf("semantic built_at 非法")
 	}
 	return nil
+}
+
+func validSemanticCanaryFingerprint(value string) bool {
+	// semanticVectorFingerprint is the first 12 SHA-256 bytes encoded as
+	// canonical lower-case hex. Rejecting every other representation during the
+	// offline wrapper read prevents checksum-valid malformed metadata from
+	// inducing an otherwise unnecessary provider probe.
+	if len(value) != 24 || value != strings.ToLower(value) {
+		return false
+	}
+	_, err := hex.DecodeString(value)
+	return err == nil
 }
 
 func writeSemanticAll(w io.Writer, data []byte) error {

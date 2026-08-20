@@ -1,9 +1,11 @@
 package engine
 
 import (
+	"context"
 	"fmt"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/zdypro888/iknowledge/internal/parser"
 )
@@ -91,6 +93,9 @@ type DoctorReport struct {
 	GitFilesOK  bool
 	Debts       int
 	WIPs        int
+	WIPIdle     int
+	WIPStale    int
+	TruthGit    TruthGitHealth
 	Parser      ParserHealthReport
 	Warnings    []string
 }
@@ -112,8 +117,15 @@ func (r DoctorReport) Text() string {
 	} else {
 		b.WriteString("git merge rules: missing(.gitattributes/.gitignore 需重跑 init)\n")
 	}
+	if r.Initialized {
+		fmt.Fprintf(&b, "git truth: %s(%d/%d tracked)", r.TruthGit.State, r.TruthGit.Tracked, r.TruthGit.Files)
+		if r.TruthGit.Detail != "" {
+			fmt.Fprintf(&b, " — %s", r.TruthGit.Detail)
+		}
+		b.WriteByte('\n')
+	}
 	b.WriteString(r.Parser.Text())
-	fmt.Fprintf(&b, "\nmaintain: debts=%d active_wip=%d", r.Debts, r.WIPs)
+	fmt.Fprintf(&b, "\nmaintain: debts=%d active_wip=%d idle_24h=%d stale_7d=%d", r.Debts, r.WIPs, r.WIPIdle, r.WIPStale)
 	for _, w := range r.Warnings {
 		fmt.Fprintf(&b, "\n⚠ %s", w)
 	}
@@ -137,6 +149,10 @@ func (e *Engine) Doctor() (DoctorReport, error) {
 		rep.Warnings = append(rep.Warnings, "先运行 iknowledge init --repo "+e.Store.RepoRoot())
 		return rep, nil
 	}
+	rep.TruthGit = inspectTruthGit(context.Background(), e.Store.RepoRoot(), e.Store.Dir())
+	if !rep.TruthGit.protected() {
+		rep.Warnings = append(rep.Warnings, "知识正本没有完整 Git 保护:"+rep.TruthGit.Detail)
+	}
 	ph, err := e.ParserHealth()
 	if err != nil {
 		rep.Warnings = append(rep.Warnings, "parser health 扫描失败:"+err.Error())
@@ -146,6 +162,19 @@ func (e *Engine) Doctor() (DoctorReport, error) {
 	e.rt.mu.RLock()
 	rep.Debts = len(e.computeDebtsLocked())
 	rep.WIPs = len(e.rt.wips)
+	now := e.now()
+	for _, wip := range e.rt.wips {
+		age := now.Sub(wip.Updated)
+		if wip.Updated.IsZero() || age >= 24*time.Hour {
+			rep.WIPIdle++
+		}
+		if wip.Updated.IsZero() || age >= 7*24*time.Hour {
+			rep.WIPStale++
+		}
+	}
 	e.rt.mu.RUnlock()
+	if rep.WIPStale > 0 {
+		rep.Warnings = append(rep.Warnings, fmt.Sprintf("%d 个 WIP 已超过 7 天未更新；请 complete 或显式归档", rep.WIPStale))
+	}
 	return rep, nil
 }

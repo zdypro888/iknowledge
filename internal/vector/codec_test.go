@@ -208,6 +208,57 @@ func TestDecodeEnforcesLimitsBeforeTrustingPayload(t *testing.T) {
 	}
 }
 
+func TestDecodeExpectedRejectsOuterInnerShapeMismatch(t *testing.T) {
+	snapshot, err := Build(2, []Record{
+		{ID: "aa", NodeID: "n1", Kind: "summary", Vector: []float32{1, 2}},
+		{ID: "bb", NodeID: "n2", Kind: "summary", Vector: []float32{2, 1}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded := mustEncode(t, snapshot)
+	for _, test := range []struct {
+		name       string
+		records    int
+		dimensions int
+		want       error
+	}{
+		{name: "records", records: 1, dimensions: 2, want: ErrCorruptIndex},
+		{name: "dimensions", records: 2, dimensions: 3, want: ErrCorruptIndex},
+		{name: "negative records", records: -1, dimensions: 2, want: ErrInvalidInput},
+		{name: "zero dimensions", records: 2, dimensions: 0, want: ErrInvalidInput},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			_, err := DecodeExpectedWithLimitsContext(context.Background(), bytes.NewReader(encoded), test.records, test.dimensions, DefaultLimits())
+			if !errors.Is(err, test.want) {
+				t.Fatalf("DecodeExpectedWithLimitsContext() error = %v, want %v", err, test.want)
+			}
+		})
+	}
+	decoded, err := DecodeExpectedWithLimitsContext(context.Background(), bytes.NewReader(encoded), 2, 2, DefaultLimits())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := decoded.Status(), snapshot.Status(); got != want {
+		t.Fatalf("Status() = %#v, want %#v", got, want)
+	}
+	metadata, err := ScanRecordMetadataExpectedWithLimitsContext(context.Background(), bytes.NewReader(encoded), 2, 2, DefaultLimits())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(metadata) != 2 || metadata[0].ID != "aa" || metadata[1].NodeID != "n2" {
+		t.Fatalf("scanned metadata = %#v", metadata)
+	}
+
+	corrupt := bytes.Clone(encoded)
+	firstVector := int(headerSize) + int(encodedMetadataSize("aa", "n1", "summary"))
+	binary.LittleEndian.PutUint32(corrupt[firstVector:firstVector+4], math.Float32bits(2))
+	refreshChecksum(corrupt)
+	if _, err := ScanRecordMetadataExpectedWithLimitsContext(context.Background(), bytes.NewReader(corrupt), 2, 2, DefaultLimits()); !errors.Is(err, ErrCorruptIndex) {
+		t.Fatalf("metadata scan accepted invalid vector: %v", err)
+	}
+}
+
 func TestEncodeAndDecodeIOErrors(t *testing.T) {
 	snapshot, err := Build(2, []Record{{ID: "id", NodeID: "node", Kind: "summary", Vector: []float32{1, 2}}})
 	if err != nil {

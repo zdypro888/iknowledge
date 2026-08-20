@@ -99,11 +99,42 @@ func (r *Registry) ForFile(file string) Parser {
 // generatedRe 是 Go 官方生成代码约定(impl §5 排除策略)。
 var generatedRe = regexp.MustCompile(`^// Code generated .* DO NOT EDIT\.$`)
 
-// IsGenerated 判断源码是否为生成代码:首行匹配官方约定(impl §5 定案按首行)。
-// 全程 []byte 操作:原实现两次 string(src) 整文件拷贝,init 全库扫描是热路径。
+// IsGenerated 判断源码是否为生成代码。Go 的官方约定允许标记出现在
+// “首个非注释/空白文本”之前，不要求它恰好是第一行。一些反向生成的
+// protobuf 会先保留来源说明，再写 Code generated 标记；只看首行会把
+// 整份 pb.go 误当手写代码索引。这里只扫描最多 64 KiB 前导注释，遇到代码
+// 立即停止；不会把函数体里的相同字符串当成生成标记。
+// 全程 []byte 操作，避免 init 全库扫描时的整文件 string 拷贝。
 func IsGenerated(src []byte) bool {
-	line, _, _ := bytes.Cut(src, []byte("\n")) // 未含换行时 line 即整个 src
-	return generatedRe.Match(bytes.TrimSuffix(line, []byte("\r")))
+	const maxGeneratedPreamble = 64 << 10
+	if len(src) > maxGeneratedPreamble {
+		src = src[:maxGeneratedPreamble]
+	}
+	for len(src) > 0 {
+		src = bytes.TrimLeft(src, " \t\r\n\f\v")
+		switch {
+		case len(src) == 0:
+			return false
+		case bytes.HasPrefix(src, []byte("//")):
+			line, rest, found := bytes.Cut(src, []byte("\n"))
+			if generatedRe.Match(bytes.TrimSuffix(line, []byte("\r"))) {
+				return true
+			}
+			if !found {
+				return false
+			}
+			src = rest
+		case bytes.HasPrefix(src, []byte("/*")):
+			end := bytes.Index(src[2:], []byte("*/"))
+			if end < 0 {
+				return false
+			}
+			src = src[end+4:]
+		default:
+			return false
+		}
+	}
+	return false
 }
 
 // ExcludedPath 判断 repo 相对路径(正斜杠)是否落在默认排除段内:

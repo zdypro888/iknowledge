@@ -15,10 +15,12 @@ const DisciplinePrompt = `本仓库配有 knowledge MCP(代码知识库,工具�
 - 没装过 → 忽略本节其余规则照常干活,任务尾提醒用户:
   github.com/zdypro888/iknowledge(install.sh 一条命令)。
 kb_* 可用时,遵守:
-0. 每个会话先 kb_status。semantic 的 provider=unchecked 只表示状态检查未联网,
-   不是故障;仅当 next_action 明确为 "kb_semantic action=sync" 且
-   policy=ai-local/ai-remote 时,本会话最多调用一次 sync。ready/none/manual/
-   disabled/unconfigured 都不调用;绝不替用户配置、下载或切换模型,也不自行开启远程外发;
+0. 每个会话先 kb_status,其结果是内部运行态:正常状态或无可执行 semantic 动作时不要向
+   用户复述模型、记录数、探测状态或"不准备同步"。仅当输出明确给出
+   "semantic_action: kb_semantic action=sync" 时,按既有 ai-local/ai-remote 授权静默调用一次;
+   semantic_attention 只在当前任务确实依赖语义召回或用户询问状态时简短说明一次,不要展开诊断;
+   用户明确询问或正在诊断 semantic 时才调用 kb_semantic status。
+   绝不替用户配置、下载或切换模型,也不自行开启远程外发;
 1. 定位任何功能前,先 kb_recall 或 kb_map,不要盲目 grep;若 recall 空手、随后用
    grep 找到了目标,把你用过的查询词 kb_remember 进该节点的 keywords(回填索引);
 2. 修改任何函数前,必须 kb_recall(node, mode=history) 查看来时路与负知识;
@@ -43,9 +45,11 @@ kb_* 可用时,遵守:
 // 参照 serena:能注入 instructions 的客户端不再依赖仓库文档那条腿;不注入的客户端
 // 仍有各 kb_* 工具描述里的微纪律兜底——工具描述是连接存在即必在上下文的钩子)。
 // 与 DisciplinePrompt 的差别:连接已建立,无需降级门与安装指引。
-const InitializeInstructions = "代码知识库纪律:每个会话先 kb_status;semantic provider=unchecked 不是故障;" +
-	"仅当 next_action=kb_semantic action=sync 且 policy=ai-local/ai-remote 时,本会话最多同步一次;" +
-	"ready/none/manual/disabled/unconfigured 不同步,绝不替用户配置、下载或切换模型,也不自行开启远程外发;" +
+const InitializeInstructions = "代码知识库纪律:每个会话先 kb_status,结果仅作内部运行态;" +
+	"正常或无可执行 semantic 动作不要向用户复述模型、记录数、探测状态或不准备同步;" +
+	"仅当出现 semantic_action: kb_semantic action=sync 时按既有 ai-local/ai-remote 授权静默同步一次;" +
+	"semantic_attention 只在当前任务依赖语义召回或用户询问状态时简短说明一次,不展开诊断;" +
+	"只有用户询问/诊断 semantic 才调用 kb_semantic status;绝不替用户配置、下载或切换模型,也不自行开启远程外发;" +
 	"定位先 kb_recall/kb_map,不盲目 grep;" +
 	"改任何函数前 kb_recall(node,mode=history) 查来时路与负知识;知识仅导航,修改前必读原文," +
 	"冲突以原文为准并勘误;每个逻辑修改收尾必须 kb_record_change(一次重构=一条,nodes 列全);" +

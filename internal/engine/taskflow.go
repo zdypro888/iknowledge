@@ -15,9 +15,15 @@ import (
 
 // TaskArgs 是 kb_task 入参。
 type TaskArgs struct {
-	Action string    `json:"action"` // start | update | complete | get
+	Action string    `json:"action"` // start | update | complete | abandon | get
 	WIP    model.WIP `json:"wip"`
+	// Owner/Reason 只用于代为收口另一会话明确存在且已过期的 WIP。
+	// 普通会话操作不接受 AI 自报 owner，仍由 sid+author 唯一确定。
+	Owner  string `json:"owner,omitempty"`
+	Reason string `json:"reason,omitempty" redact:"true"`
 }
+
+const crossSessionWIPStaleAfter = 7 * 24 * time.Hour
 
 // Task 任务态读写:与知识层严格分离,归档时压缩成变更记录。
 func (e *Engine) Task(a TaskArgs, sid, author string) (out string, err error) {
@@ -30,24 +36,67 @@ func (e *Engine) Task(a TaskArgs, sid, author string) (out string, err error) {
 // still stops the operation before it mutates task state.
 func (e *Engine) TaskContext(ctx context.Context, a TaskArgs, sid, author string) (out string, err error) {
 	redaction := RedactSecrets(&a)
-	defer appendRedactionNotice(&out, &err, redaction)
+	// complete 还会把磁盘里的旧 WIP 压缩进 Change；它可能来自尚未实行
+	// 写入脱敏的旧版本，因此最终 redaction report 要到归档对象复扫后再取值。
+	defer func() { appendRedactionNotice(&out, &err, redaction) }()
 	if ctx == nil {
 		return "", fmt.Errorf("kb_task: nil context")
 	}
 	if err := e.requireInit(); err != nil {
 		return "", err
 	}
+	a.Owner = strings.TrimSpace(a.Owner)
+	a.Reason = strings.TrimSpace(a.Reason)
 	switch a.Action {
 	case "start":
 		if strings.TrimSpace(a.WIP.Task) == "" {
 			return "", kbErr("INVALID_ARGUMENT", "start 需要 wip.task", "给任务一句话描述")
 		}
-	case "update", "complete", "get":
+	case "update", "complete", "abandon", "get":
 	default:
-		return "", kbErr("INVALID_ARGUMENT", "非法 action "+a.Action, "action ∈ start|update|complete|get")
+		return "", kbErr("INVALID_ARGUMENT", "非法 action "+a.Action, "action ∈ start|update|complete|abandon|get")
+	}
+	owner := taskOwner(sid, author)
+	if a.Owner != "" && a.Action != "complete" && a.Action != "abandon" {
+		return "", kbErr("INVALID_ARGUMENT", "owner 仅可用于 complete/abandon 代为收口 stale WIP", "普通操作省略 owner；先 kb_task get 获取精确 owner")
+	}
+	// owner 是一个明确的越权目标参数，而不是请求方可以用来自报身份
+	// 的字段。即使它恰好等于服务端推导的当前 owner，也必须走 stale
+	// + reason 闸门；当前会话的普通收口必须完全省略 owner。
+	explicitStaleClosure := a.Owner != ""
+	if !explicitStaleClosure && a.Reason != "" {
+		return "", kbErr("INVALID_ARGUMENT", "reason 仅用于显式 owner 的 stale WIP 收口", "当前会话 complete/abandon 省略 owner 和 reason")
+	}
+	if explicitStaleClosure {
+		if a.Reason == "" {
+			return "", kbErr("INVALID_ARGUMENT", "代为收口 stale WIP 必须提供 reason", "写明 commit/部署/验收证据，或说明任务为何已取消/被取代")
+		}
+		// 拒绝路径必须零写入：在 SyncContext（可能恢复崩溃事务或对账）前，
+		// 先从磁盘只读确认 owner 精确存在且已满 7 天。通过后仍会在写锁内
+		// 二次校验，封住并发 update/complete 的 TOCTOU 窗口。
+		wips, loadErr := e.Store.LoadWIPs()
+		if loadErr != nil {
+			return "", loadErr
+		}
+		if err := validateCrossSessionWIP(wipByOwner(wips, a.Owner), a.Owner, e.now()); err != nil {
+			return "", err
+		}
 	}
 	if err := e.SyncContext(ctx); err != nil {
 		return "", err
+	}
+	var touchingWarnings []string
+	if (a.Action == "start" || a.Action == "update") && a.WIP.Touching != nil {
+		if err := e.rt.mu.RLockContext(ctx); err != nil {
+			return "", err
+		}
+		normalized, warns, normalizeErr := e.normalizeTaskTouchingLocked(a.WIP.Touching)
+		e.rt.mu.RUnlock()
+		if normalizeErr != nil {
+			return "", normalizeErr
+		}
+		a.WIP.Touching = normalized
+		touchingWarnings = warns
 	}
 	decisionWarning := ""
 	if a.Action == "start" {
@@ -66,8 +115,6 @@ func (e *Engine) TaskContext(ctx context.Context, a TaskArgs, sid, author string
 	if err := ctx.Err(); err != nil {
 		return "", err
 	}
-	owner := taskOwner(sid, author)
-
 	switch a.Action {
 	case "start":
 		w := a.WIP
@@ -79,7 +126,8 @@ func (e *Engine) TaskContext(ctx context.Context, a TaskArgs, sid, author string
 		if err := e.reloadLocked(); err != nil {
 			return "", err
 		}
-		return "wip 已建立(owner " + owner + ")。touching 声明的节点在他人 recall/map 时会自动附带此台账。" + decisionWarning, nil
+		out := "wip 已建立(owner " + owner + ")。touching 声明的节点在他人 recall/map 时会自动附带此台账。" + decisionWarning
+		return appendTaskTouchingWarnings(out, touchingWarnings), nil
 
 	case "update":
 		cur := e.wipForSessionLocked(owner, author)
@@ -117,22 +165,24 @@ func (e *Engine) TaskContext(ctx context.Context, a TaskArgs, sid, author string
 		if err := e.reloadLocked(); err != nil {
 			return "", err
 		}
-		return "wip 已更新", nil
+		return appendTaskTouchingWarnings("wip 已更新", touchingWarnings), nil
 
 	case "complete":
 		cur := e.wipForSessionLocked(owner, author)
-		if cur == nil {
+		if explicitStaleClosure {
+			cur = e.wipOfLocked(a.Owner) // 精确 owner；禁止 legacy/session 猜测。
+			if err := validateCrossSessionWIP(cur, a.Owner, e.now()); err != nil {
+				return "", err
+			}
+		} else if cur == nil {
 			return "", kbErr("NODE_NOT_FOUND", "没有你的活跃 wip", "先 kb_task start")
 		}
 		// 归档为变更记录(§7 生命周期第 3 条:半成品状态绝不留在知识层)。
-		var nodes []string
-		for _, t := range cur.Touching {
-			if id := e.rt.ix.ResolveNodeID(t); id != "" {
-				nodes = append(nodes, id)
-			}
-		}
-		if len(nodes) == 0 {
-			nodes = []string{model.ProjectNodeID}
+		nodes, archiveWarnings := e.resolveTaskArchiveNodesLocked(cur.Touching)
+		// 解析 touching 可能需要读取/解析多个源文件。取锁后的早期
+		// 取消检查不能覆盖这个窗口；在生成 ID/WAL/首个写入前再次 fail closed。
+		if err := ctx.Err(); err != nil {
+			return "", err
 		}
 		chID := e.freshChangeIDLocked()
 		what := "完成任务:" + cur.Task
@@ -147,6 +197,21 @@ func (e *Engine) TaskContext(ctx context.Context, a TaskArgs, sid, author string
 			ID: chID, Nodes: nodes, At: e.now().UTC(),
 			Task: cur.Task, What: what, Why: why, Author: author, EffectsVersion: 1,
 		}
+		if explicitStaleClosure {
+			// 代为 complete 必须把“为什么有资格宣称完成”持久化；只把理由
+			// 留在易失的 MCP 调用参数里会让 journal 失去可审计性。
+			change.Verified = "跨会话 stale WIP 收口依据(owner=" + cur.Owner +
+				", closed_by=" + owner + "): " + a.Reason
+		}
+		// a 在入口处只覆盖请求内容。旧 WIP 的 Task/Intent/Done/Owner
+		// 从磁盘读入，必须在它们进入 Git 跟踪的 journal 前对完整 Change
+		// 再扫一次，防止仓外 WIP 里的历史凭据被提升到团队真相。
+		archivedRedaction := RedactSecrets(&change)
+		redaction.Count += archivedRedaction.Count
+		for _, kind := range archivedRedaction.Kinds {
+			redaction.Kinds = appendUnique(redaction.Kinds, kind)
+		}
+		sort.Strings(redaction.Kinds)
 		// WIP 删除与 journal 追加是一个崩溃事务；prepared intent 在 ClearWIP
 		// 前同时收录两者，进程在任一写后退出都会于下次 reload 全量恢复。
 		tx, err := e.prepareTruthTransactionLocked(map[string]bool{
@@ -185,6 +250,9 @@ func (e *Engine) TaskContext(ctx context.Context, a TaskArgs, sid, author string
 			return "", fmt.Errorf("task complete 已提交但 WAL 清理/重载失败(不要重试): %w", commitErr)
 		}
 		out := "已归档为变更记录 " + chID + ",wip 清空。"
+		if explicitStaleClosure {
+			out = "已代为收口 stale wip owner " + cur.Owner + "；" + out
+		}
 		// 任务尾偿还(§12.2 第 3 条,≤3 条,仅本任务读过的)+ 沉淀提醒(§9.3)。
 		if debts := e.sessionSuspectsLocked(sid); len(debts) > 0 {
 			out += "\n任务尾偿还(≤3 条,本任务读过且仍待重验):" + strings.Join(debts, "、") + "(kb_verify)"
@@ -196,7 +264,34 @@ func (e *Engine) TaskContext(ctx context.Context, a TaskArgs, sid, author string
 			n := min(2, len(md))
 			out += fmt.Sprintf("\n顺手维护(≤2 条,§12.7):%d 条欠账,kb_maintain next 取用", n)
 		}
-		return out, nil
+		return appendTaskTouchingWarnings(out, archiveWarnings), nil
+
+	case "abandon":
+		cur := e.wipForSessionLocked(owner, author)
+		if explicitStaleClosure {
+			cur = e.wipOfLocked(a.Owner) // 精确 owner；禁止 legacy/session 猜测。
+			if err := validateCrossSessionWIP(cur, a.Owner, e.now()); err != nil {
+				return "", err
+			}
+		} else if cur == nil {
+			return "", kbErr("NODE_NOT_FOUND", "没有你的活跃 wip", "无需 abandon；用 kb_task get 查看其他会话台账")
+		}
+		// 取消的任务不是已完成的代码事实，因此明确删除纯本地
+		// WIP，绝不伪造 journal 变更记录。它是用户/代理显式动作，
+		// 而非 TTL 自动清理，所以不会误删仍在进行的长任务。
+		if err := ctx.Err(); err != nil {
+			return "", err
+		}
+		if err := e.Store.ClearWIP(cur.Owner); err != nil {
+			return "", err
+		}
+		if err := e.reloadLocked(); err != nil {
+			return "", err
+		}
+		if explicitStaleClosure {
+			return "stale wip owner " + cur.Owner + " 已代为显式放弃并清空；未写入知识层或 journal。", nil
+		}
+		return "wip 已显式放弃并清空；未写入知识层或 journal。", nil
 
 	case "get":
 		if len(e.rt.wips) == 0 {
@@ -209,7 +304,42 @@ func (e *Engine) TaskContext(ctx context.Context, a TaskArgs, sid, author string
 		}
 		return strings.TrimRight(b.String(), "\n"), nil
 	}
-	return "", kbErr("INVALID_ARGUMENT", "非法 action "+a.Action, "action ∈ start|update|complete|get")
+	return "", kbErr("INVALID_ARGUMENT", "非法 action "+a.Action, "action ∈ start|update|complete|abandon|get")
+}
+
+func wipByOwner(wips []model.WIP, owner string) *model.WIP {
+	for i := range wips {
+		if wips[i].Owner == owner {
+			return &wips[i]
+		}
+	}
+	return nil
+}
+
+// validateCrossSessionWIP 是代收口的 fail-closed 闸门。Updated=zero 只说明
+// 年龄未知，不足以证明 stale；未来时间同样按 recent 拒绝。原 owner 自己的
+// complete/abandon 不走本闸门，保持原语义。
+func validateCrossSessionWIP(w *model.WIP, owner string, now time.Time) error {
+	if w == nil {
+		return kbErr("NODE_NOT_FOUND", "指定 owner 的 wip 不存在: "+owner, "先 kb_task get 获取精确 owner，不得猜测")
+	}
+	if w.Updated.IsZero() {
+		return kbErr("INVALID_ARGUMENT", "目标 wip 的更新时间未知，无法证明已 stale 7 天: "+owner, "由原 owner 自行 complete/abandon")
+	}
+	age := now.Sub(w.Updated)
+	if age < crossSessionWIPStaleAfter {
+		return kbErr("INVALID_ARGUMENT",
+			fmt.Sprintf("目标 wip 尚未 stale 7 天: %s(updated %s)", owner, w.Updated.UTC().Format(time.RFC3339)),
+			"不得代收口活跃任务；由原 owner 操作或等待满 7 天")
+	}
+	return nil
+}
+
+func appendTaskTouchingWarnings(out string, warnings []string) string {
+	for _, warning := range warnings {
+		out += "\n⚠ " + warning
+	}
+	return out
 }
 
 func taskDecisionQuery(w model.WIP) string {

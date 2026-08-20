@@ -2,8 +2,11 @@ package engine
 
 import (
 	"context"
+	"crypto/sha256"
 	"fmt"
+	"reflect"
 	"slices"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -32,6 +35,20 @@ type runtime struct {
 	semanticManifest       semanticSourceManifest
 	semanticFlowsHash      [32]byte
 	semanticFlowsHashReady bool
+	flowsReady             bool
+	wipsReady              bool
+	flowWarns              []string
+	// reconcileSourceManifest fingerprints only source files that currently
+	// carry active knowledge or a pending anchor.  Sync hashes these files before
+	// deciding whether the expensive parser reconciliation is necessary; raw
+	// bytes (rather than mtime/size) preserve the old every-request correctness
+	// for same-size replacements and checkouts that restore timestamps.
+	reconcileSourceManifest map[string]reconcileSourceState
+	reconcileSourceReady    bool
+	// The counters are deliberately unexported. Package tests use them to pin the
+	// fast-path contract without adding a production diagnostics/API surface.
+	syncIndexBuilds   uint64
+	syncReconcileRuns uint64
 	// truthTxActive 只在 rt.mu 写锁下访问。事务中途的内部 reload 必须跳过
 	// 崩溃恢复；新进程/下次请求则在加载缓存前恢复仓外 prepared WAL。
 	truthTxActive bool
@@ -62,6 +79,13 @@ type runtime struct {
 	gitCountsMu sync.Mutex
 	gitCounts   map[string]int
 	gitCountsAt time.Time
+
+	// truthGit 是知识正本的 Git 保护状态。检查需要 WalkDir +
+	// git check-ignore/ls-files，kb_status 不应每次重复付费；60s
+	// TTL 既能及时看到 git add/.gitignore 修复，也不拖慢长会话。
+	truthGitMu sync.Mutex
+	truthGit   TruthGitHealth
+	truthGitAt time.Time
 
 	// parseFailed 计数缓存(60s TTL;kb_status 的全库 parse 扫描是最大单项成本,
 	// casino 实测数百毫秒——与 gitCounts 同型,同样锁外算)。
@@ -94,6 +118,11 @@ type runtime struct {
 type trailEntry struct {
 	text string
 	at   time.Time
+}
+
+type reconcileSourceState struct {
+	readable bool
+	digest   [sha256.Size]byte
 }
 
 // pfEntry 是单文件的解析结果指纹。
@@ -390,47 +419,92 @@ func (e *Engine) reloadLockedContext(ctx context.Context) error {
 	}
 	refresh, err := e.rt.cache.Refresh()
 	if err != nil {
+		e.discardTruthSnapshotLocked()
 		return err
 	}
-	// flows/wip 体量小,每次直读(不进 mtime 缓存,switch 分支后天然新鲜)。
+	// flows/wip 体量小,每次直读并比较完整解码值。不只信 mtime/size,
+	// 所以外部 checkout 或同尺寸替换仍然不会跳过。它们很小,这部分成本与
+	// index.Build + 全源码解析不在一个数量级。
 	flows, warns, err := e.Store.LoadFlows()
 	if err != nil {
+		e.discardTruthSnapshotLocked()
 		return err
 	}
 	wips, err := e.Store.LoadWIPs()
 	if err != nil {
+		e.discardTruthSnapshotLocked()
 		return err
 	}
+	flowsChanged := newCache || !e.rt.flowsReady || !reflect.DeepEqual(e.rt.flows, flows)
+	wipsChanged := newCache || !e.rt.wipsReady || !reflect.DeepEqual(e.rt.wips, wips)
 	flowsHash := semanticFlowsFingerprint(flows)
-	flowsChanged := e.rt.semanticFlowsHashReady && flowsHash != e.rt.semanticFlowsHash
-	e.rt.flows, e.rt.warns, e.rt.wips = flows, warns, wips
-	// flow/wip 变化无 mtime 追踪,索引重建成本毫秒级,始终重建保正确。
-	changes, _ := e.rt.cache.Journal()
-	// index 不依赖 store(impl §2 依赖方向):把快照筛成"rel → 节点切片"再交 Build,
-	// conflict/schema 隔离的分片(cs.Err)不进索引;切片头拷贝共享底层数组,
-	// 索引里的节点指针仍指向缓存实体,写路径经索引改节点再存盘的语义不变。
-	healthy := make(map[string][]model.Node, len(e.rt.cache.Shards()))
-	for rel, cs := range e.rt.cache.Shards() {
-		if cs.Err != nil || cs.Shard == nil {
-			continue
+	semanticFlowsChanged := e.rt.semanticFlowsHashReady && flowsHash != e.rt.semanticFlowsHash
+	if flowsChanged {
+		e.rt.flows = flows
+	}
+	if wipsChanged {
+		e.rt.wips = wips
+	}
+	e.rt.flowsReady, e.rt.wipsReady = true, true
+	e.rt.flowWarns = slices.Clone(warns)
+
+	// tree/project/journal 由 store.Cache 的目录清单+mtime+size 对账。
+	// 只要三者和 flow 都没变,就保留不可变的旧 index generation。
+	indexChanged := newCache || e.rt.ix == nil || refreshChangesIndexSource(refresh) || flowsChanged
+	if indexChanged {
+		e.rebuildIndexLocked()
+	} else {
+		e.publishIndexWarningsLocked()
+	}
+
+	// 源码正本不属于 store.Cache。只哈希可能发生锚点状态迁移的文件,
+	// 保留原先“每请求都能发现外部源码变更”的正确性,却不再每次调 parser。
+	sourceFiles := e.reconcileSourceFilesLocked()
+	sourceManifest, sourceBytes, err := e.snapshotReconcileSources(ctx, sourceFiles)
+	if err != nil {
+		e.discardTruthSnapshotLocked()
+		return err
+	}
+	sourceChanged := newCache || !e.rt.reconcileSourceReady ||
+		!reconcileSourceManifestEqual(e.rt.reconcileSourceManifest, sourceManifest)
+	truthNeedsReconcile := newCache || refreshChangesAnchoredTree(refresh)
+
+	// WIP 是纯运行态:变化只换内存快照,不应触发 index/source/semantic 工作。
+	// 稳态最快路径到这里就结束——无 Build,无 parser,无落盘。
+	if !indexChanged && !sourceChanged && !truthNeedsReconcile && !wipsChanged && !semanticFlowsChanged {
+		e.rt.semanticFlowsHash, e.rt.semanticFlowsHashReady = flowsHash, true
+		return ctx.Err()
+	}
+
+	// R29 批次2:读路径状态对账预算(从 reconcileOnReadLocked 外移)。
+	// 只有锚定 tree 或相关源码真的变化才调 parser。journal/flow/WIP
+	// 的独立变化不再误伤全仓对账。
+	reconciled := false
+	reconcileComplete := true
+	if truthNeedsReconcile || sourceChanged {
+		e.rt.syncReconcileRuns++
+		reconciled, reconcileComplete, err = e.reconcileAllLocked(ctx, sourceBytes)
+		if err != nil {
+			// reconcile plans against the current cache entities and may already
+			// have changed node fields before a later parser cancellation or shard
+			// save failure. None of those speculative mutations may survive an
+			// aborted request: discard the whole derived snapshot so the next Sync
+			// must reload durable truth instead of treating memory as committed.
+			e.discardTruthSnapshotLocked()
+			return err
 		}
-		healthy[rel] = cs.Shard.Nodes
 	}
-	e.rt.ix = index.Build(healthy, changes, flows)
-	for _, id := range e.rt.ix.DuplicateNodeIDs() {
-		e.rt.warns = append(e.rt.warns, "重复 node ID 已隔离:"+id+"(检查多个 tree 分片/import remap)")
-	}
-	// R29 批次2:读路径状态对账预算(从 reconcileOnReadLocked 外移)。写锁内做,
-	// 使读路径变纯读——失配降 suspect、pending_anchor 补全、回到锚定恢复 fresh。
-	// 只对有活跃知识且 fresh/suspect/pending 的节点做,成本受限。
-	reconciled := e.reconcileAllLocked()
 	if reconciled {
-		// Build happened from the pre-reconcile status snapshot. Rebuild in the
-		// same Sync turn so a just-suspect/pending node cannot spend one request
-		// in the current lexical lane, and flow/source DTOs observe the same truth.
-		e.rt.ix = index.Build(healthy, changes, flows)
+		// reconcile 原子替换了 tree 分片。立刻把 cache 的 file-state
+		// 基线推进到新文件,否则下一次 Sync 会把自己的写入误判成外部变化,
+		// 多做一轮 Build/reconcile。Refresh 也重读分片,然后同步发布新索引。
+		if _, err := e.rt.cache.Refresh(); err != nil {
+			e.discardTruthSnapshotLocked()
+			return err
+		}
+		e.rebuildIndexLocked()
 	}
-	if newCache || refreshChangesSemanticSource(refresh) || flowsChanged || reconciled {
+	if newCache || refreshChangesSemanticSource(refresh) || semanticFlowsChanged || reconciled {
 		e.semantic.sourceResidentMu.Lock()
 		e.rt.semanticSourceVersion++
 		if e.rt.semanticSourceVersion == 0 { // 理论上的 uint64 回绕也不能复用旧 manifest。
@@ -444,8 +518,144 @@ func (e *Engine) reloadLockedContext(ctx context.Context) error {
 		e.semantic.process.releaseSourceResident(e)
 		e.semantic.sourceResidentMu.Unlock()
 	}
+	// sourceManifest 必须是本轮 reconcile 实际看到的字节。不在发布前
+	// 重读——否则外部编辑若恰好发生在 reconcile 之后,会把未对账的新字节
+	// 错记成已对账。状态迁移只会缩小候选集,按最终 index 取子集即可。
+	finalFiles := e.reconcileSourceFilesLocked()
+	finalManifest := make(map[string]reconcileSourceState, len(finalFiles))
+	manifestComplete := true
+	for _, file := range finalFiles {
+		state, ok := sourceManifest[file]
+		if !ok || !state.readable {
+			manifestComplete = false
+			break
+		}
+		finalManifest[file] = state
+	}
+	if manifestComplete && reconcileComplete {
+		e.rt.reconcileSourceManifest = finalManifest
+		e.rt.reconcileSourceReady = true
+	} else {
+		// 理论上只有并发的外部 tree 替换才会让候选集增长;
+		// fail-open 为“下轮必定重对账”,不冒险发布一份没见过的源码基线。
+		e.rt.reconcileSourceManifest = nil
+		e.rt.reconcileSourceReady = false
+	}
 	e.rt.semanticFlowsHash, e.rt.semanticFlowsHashReady = flowsHash, true
 	return ctx.Err()
+}
+
+func (e *Engine) discardTruthSnapshotLocked() {
+	e.rt.cache = nil
+	e.rt.ix = nil
+	e.rt.reconcileSourceManifest = nil
+	e.rt.reconcileSourceReady = false
+}
+
+// rebuildIndexLocked 从 cache 真相快照发布一个新索引 generation。
+// 前提:已持 rt.mu 写锁。
+func (e *Engine) rebuildIndexLocked() {
+	changes, _ := e.rt.cache.Journal()
+	// index 不依赖 store(impl §2 依赖方向):把快照筛成"rel → 节点切片"再交 Build,
+	// conflict/schema 隔离的分片(cs.Err)不进索引;切片头拷贝共享底层数组,
+	// 索引里的节点指针仍指向缓存实体,写路径经索引改节点再存盘的语义不变。
+	healthy := make(map[string][]model.Node, len(e.rt.cache.Shards()))
+	for rel, cs := range e.rt.cache.Shards() {
+		if cs.Err != nil || cs.Shard == nil {
+			continue
+		}
+		healthy[rel] = cs.Shard.Nodes
+	}
+	e.rt.ix = index.Build(healthy, changes, e.rt.flows)
+	e.rt.syncIndexBuilds++
+	e.publishIndexWarningsLocked()
+}
+
+func (e *Engine) publishIndexWarningsLocked() {
+	e.rt.warns = slices.Clone(e.rt.flowWarns)
+	if e.rt.ix == nil {
+		return
+	}
+	for _, id := range e.rt.ix.DuplicateNodeIDs() {
+		e.rt.warns = append(e.rt.warns, "重复 node ID 已隔离:"+id+"(检查多个 tree 分片/import remap)")
+	}
+}
+
+// reconcileSourceFilesLocked 返回 reconcileAllLocked 可能读取的唯一源文件集。
+// 这里与其预算谓词保持同构;多算只会增加 hash 成本,漏算才会导致腐烂漏报。
+func (e *Engine) reconcileSourceFilesLocked() []string {
+	if e.rt.ix == nil {
+		return nil
+	}
+	seen := make(map[string]bool)
+	for _, ref := range e.rt.ix.Nodes() {
+		n := ref.Node
+		if (!hasActiveEntries(n) && !n.PendingAnchor) ||
+			(n.Status != model.StatusFresh && n.Status != model.StatusSuspect && !n.PendingAnchor) {
+			continue
+		}
+		file, _ := model.SplitNodeID(n.ID)
+		if file == "" || strings.HasSuffix(file, "/") {
+			continue
+		}
+		seen[file] = true
+	}
+	out := make([]string, 0, len(seen))
+	for file := range seen {
+		out = append(out, file)
+	}
+	sort.Strings(out)
+	return out
+}
+
+func (e *Engine) snapshotReconcileSources(ctx context.Context, files []string) (map[string]reconcileSourceState, map[string][]byte, error) {
+	out := make(map[string]reconcileSourceState, len(files))
+	dataByFile := make(map[string][]byte, len(files))
+	for i, file := range files {
+		if err := contextCheckpoint(ctx, i); err != nil {
+			return nil, nil, err
+		}
+		data, err := safeRepoRead(e.Store.RepoRoot(), file)
+		if err != nil {
+			// 不可读/缺失不能作为“已对账”基线：这一轮的
+			// reconcile 同样看不到内容，下轮必须继续 fail-open 重试。
+			out[file] = reconcileSourceState{}
+			continue
+		}
+		out[file] = reconcileSourceState{readable: true, digest: sha256.Sum256(data)}
+		dataByFile[file] = data
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, nil, err
+	}
+	return out, dataByFile, nil
+}
+
+func reconcileSourceManifestEqual(a, b map[string]reconcileSourceState) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for file, state := range a {
+		if b[file] != state {
+			return false
+		}
+	}
+	return true
+}
+
+func refreshChangesIndexSource(rep store.RefreshReport) bool {
+	return len(rep.Added) != 0 || len(rep.Changed) != 0 || len(rep.Removed) != 0
+}
+
+func refreshChangesAnchoredTree(rep store.RefreshReport) bool {
+	for _, paths := range [][]string{rep.Added, rep.Changed, rep.Removed} {
+		for _, rel := range paths {
+			if rel == "project.yaml" || strings.HasPrefix(rel, "tree/") {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func refreshChangesSemanticSource(rep store.RefreshReport) bool {

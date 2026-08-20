@@ -60,13 +60,15 @@ func hooksJSONSnippet() string {
 	return string(data)
 }
 
-// codexTOMLSnippet 是 Codex 接入片段(~/.codex/config.toml;CLI 与桌面 App 共用;
-// 2026-07-04 定案修订):推荐 stdio 桥(command 形态是 Codex 最经典的 MCP 支持路径,
-// 且自动拉起 serve、令牌自读);http 直连留作备选(轮 25 实测 rmcp streamable HTTP 可用)。
+// codexTOMLSnippet 是 Codex 项目级接入片段(<repo>/.codex/config.toml;CLI 与
+// 桌面 App 共用)。repo 专属 MCP 不应默认放进 ~/.codex/config.toml：全局段会让
+// 每个无关任务也各拉起一条 stdio bridge。绝对 repo 路径使从仓库子目录启动的
+// Codex 仍稳定指向同一知识正本；http 直连只作为显式自管服务的备选。
 func codexTOMLSnippet(root string) string {
 	return fmt.Sprintf(`[mcp_servers.knowledge]
 command = "iknowledge"
-args = ["stdio", "--repo", %q]`, root)
+args = ["stdio", "--repo", %q]
+cwd = %q`, root, root)
 }
 
 // codexTOMLHTTPSnippet 是 Codex http 直连备选;token 非空时附 http_headers。
@@ -152,7 +154,9 @@ func runSetup(args []string, out io.Writer) int {
    效果:AI 每次 Read/Edit/Write 一个文件,该文件的知识+过时警报自动进上下文;
    serve 未启动时 hook 静默无操作,不影响任何工具调用。
 
-④ Codex 接入(可选)——把下面段落合并进 ~/.codex/config.toml(CLI 与桌面 App 共用):
+④ Codex 接入(可选)——把下面段落合并进 %s/.codex/config.toml(CLI 与桌面 App 共用;
+   项目需在 Codex 中标记为 trusted)。不要把 repo 专属 knowledge 默认放进
+   ~/.codex/config.toml,否则每个无关任务也会启动它:
 %s
    备选(http 直连):
 %s
@@ -171,7 +175,7 @@ func runSetup(args []string, out io.Writer) int {
 `, root, mcpJSONSnippet(root), mcpJSONHTTPSnippet(root, cfg.Port, token),
 		root, engine.DisciplinePrompt,
 		root, hooksJSONSnippet(),
-		codexTOMLSnippet(root), codexTOMLHTTPSnippet(root, cfg.Port, token),
+		root, codexTOMLSnippet(root), codexTOMLHTTPSnippet(root, cfg.Port, token),
 		root, root, preCommitHookSnippet(), root, cfg.Port); err != nil {
 		fmt.Fprintln(os.Stderr, "错误:写 setup 输出:", err)
 		return 1

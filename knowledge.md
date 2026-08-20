@@ -266,6 +266,7 @@ wip:
 2. 任何 agent 触碰 `touching` 列表中的节点时,注入内容自动附上这份台账:"此处有进行中的任务,状态如下,勿重复/勿冲突";
 3. 任务完成时**归档**:压缩成变更记录(§5)进入历史,任务态清空——半成品状态绝不留在知识层;
 4. **持久化但不进 git**:存在知识库服务里(统一 MCP 入口,协作方都拿得到),落盘防会话中断(新会话能捡起"进行到哪了"),但 git 排除——它是本地工作状态,不是团队资产。
+5. owner 由会话身份决定,正常只能由原会话收口。为处理永久断开的旧会话,仅当一份 WIP **精确 owner 存在且至少 7 天未更新**时,其他会话才可用 `complete|abandon + owner + reason` 单项代收口；理由缺失、年龄未知、未满 7 天或其他 action 全部拒绝且不写入。代 `complete` 把收口依据写入 journal 并与清 WIP 同事务；代 `abandon` 仍只删除任务态,不伪造代码变更历史。
 
 (这也是 aibridge 现有 handoff/NextForPeer 机制的正式化:交接棒本质上就是任务态。)
 
@@ -449,7 +450,7 @@ change:
 | `kb_remember(node, knowledge)` | 沉淀/更新一条知识(满足 §9.1 阈值) | 生长 |
 | `kb_record_change(change)` | 修改代码后提交结构化变更记录(推翻须带 overturns+rebuttal) | N3、决策链 |
 | `kb_verify(node, result)` | 复核一条 suspect/inferred 知识:confirm 升级 / refute 作废(须附原文证据,触发勘误与污染回收 §12.5) | 腐烂修复、自愈 |
-| `kb_task(action, wip)` | 任务态读写:start / update / complete(自动归档为变更记录)/ get | §7 |
+| `kb_task(action, wip)` | 任务态读写:start / update / complete(自动归档为变更记录) / abandon(取消且不写 journal) / get | §7 |
 | `kb_investigate(question)` | 侦查:先查库,未命中秒回侦查简报由宿主子代理执行(委派主模式);自派阻塞为备模式(§10.4,轮 22) | 上下文卫生、定位 |
 | `kb_submit_findings(findings)` | 侦察兵交卷(结论/位置指针/建议/风险):落库、销 job;备模式下额外路由给阻塞等待的主 AI | §10.4 |
 | `kb_adopt(orphan, action)` | 孤儿节点认领(claim 建 remap)或送葬(bury 确认作废) | §12.6 迁移兜底 |
@@ -457,6 +458,13 @@ change:
 | `kb_maintain(action)` | 取一条维护欠账/销账(摘要落后、待压缩、疑似重复) | §12.7 |
 
 完整的 API 规范(端点分流、会话识别、入参校验、KB_ERR 错误码、hook 注入端点 `GET /inject`)见 `knowledge-impl.md` §7。`kb_verify` 含三种判定:confirm(升级)/ refute(勘误,须证据,触发级联回收)/ obsolete(体面退休:没错但不再适用,不触发级联)。
+
+**连接作用域也是正确性边界。** repo 专属 MCP 应跟着项目配置，而不是缺省放进 agent
+宿主的全局配置；以 Codex 为例，默认载体是可信仓库内 `.codex/config.toml`，全局段只用于
+用户明确希望所有项目共享的服务。否则每个无关任务都会启动无关 bridge，既浪费常驻资源，
+又扩大连错仓库的机会。bridge 还必须在本机身份认证后读取后台 daemon 的构建 identity；新 bridge
+发现 executable generation 不同时先优雅排空旧进程再拉起当前构建，不能让“文件已升级、
+驻留进程仍跑旧逻辑”成为长期隐形状态。
 
 **锚点由服务端计算,AI 只报符号名。**
 AI 自己算内容哈希不现实(它看到的是带行号的展示文本,算不准也不该算)。正确分工:AI 调 `kb_remember` / `kb_record_change` 时只提供符号路径(`internal/auth/login.go#Login`);MCP **服务端**解析源码 AST、切出该符号的代码单元、计算内容哈希、落锚。腐烂检测(§12 第 3 条)与过时警报(§9.5)同样由服务端在读取时自动做。
@@ -479,6 +487,15 @@ AI 经常**不知道符号名**——它想问的是"哪里处理登录锁定?"�
    用户决定；最终事实仍须沿 node/facets/refs 精确下钻并阅读源码。每个 hit 还必须匹配当前
    manifest 的 record/node/lane/source hash；知识变化时仅安全复用未变旧卡，provider/model/
    profile 变化则硬拒绝跨向量空间混用。
+
+   这种复用也延伸到获持久 policy 授权的 MCP 同步：系统完整校验旧代，仅在完整 record
+   identity 匹配且 document/query 双模式 canary 未检测到常见向量空间漂移后，把旧向量复制进
+   新的完整 generation，只为新增/变化卡请求 embedding；删除不产生文档 embedding。相似但不完全相同
+   的旧行、损坏旧代或 canary 漂移一律不得复用。例行状态是给 agent 静默消费的控制面，只有
+   本地预检可同步时才发出 `semantic_action`；确需人工介入时只给精简 `semantic_attention`，
+   模型、provider 与记录数等诊断信息不应被反复转述给用户。同一 MCP 会话只有第一次 claim
+   的 sync 可能接触 provider；并发/后续调用是成功的确定性 no-op，且状态不再向该会话重复
+   发出相同 action，避免“保护性拒绝被当成故障继续重试”的自激循环。
 
    用户只能经仓外本机 CLI 显式选择 loopback Ollama 或远程 HTTPS OpenAI-compatible provider；
    它们是 iknowledge 内部实现，不是额外 MCP。仓内配置不能开启外发、改变目标或提供凭据；
@@ -550,6 +567,11 @@ MCP 是**被动**协议——工具只有在 AI 想起来调用时才执行,而 
 
 代码在分支上演化:feature 分支改了 `Login`,该分支上的知识(新快照、新变更记录)也只对这个分支为真;切回 main,知识必须跟着切回去;分支合并,知识随 PR 一起被 review、一起合入。这一切 git 对**文本文件**免费提供——而 SQLite 是二进制单文件,不可 diff、不可 merge、不跟分支走,一旦两个分支各自写库,合并时只能整库二选一,知识层直接崩溃。这个能力差距不是性能问题,是**架构生死问题**。
 
+这项决定只有在正本**真的进入 Git index** 时才成立。仓内存在 `.knowledge/` 或它自己的
+`.gitignore` 不构成证明：外层 ignore 可能吞掉整目录，聚合根也可能根本不是 Git 仓库。系统
+必须诊断 durable truth 的 tracked/partial/untracked/ignored/no-git 状态；非 Git 模式可以本机
+运行，但不得宣称具有随分支、PR review 与团队共享的耐久性，除非为知识根另建 Git 正本。
+
 ### 11.2 其余理由(都指向文件)
 
 1. **人可读可改**:人工写入/修正条目直接编辑文件,即为 `verified` 级(§12 第 4 条);
@@ -560,7 +582,7 @@ MCP 是**被动**协议——工具只有在 AI 想起来调用时才执行,而 
 
 ### 11.3 检索性能的补偿:内存索引
 
-文件方案的短板是跨文件检索(关键词、流程引用反查、决策链跳转)。补偿:服务端启动时全量加载,构建**内存倒排索引 + 引用图**;文件是真相,索引是缓存,随时可重建,文件变动(如 git 切分支)由惰性重载捕捉(每次请求前目录清单+mtime 对账,不引入 fsnotify,impl §4)。
+文件方案的短板是跨文件检索(关键词、流程引用反查、决策链跳转)。补偿:服务端启动时全量加载,构建**内存倒排索引 + 引用图**;文件是真相,索引是缓存,随时可重建,文件变动(如 git 切分支)由惰性重载捕捉(每次请求前目录清单+mtime 对账,不引入 fsnotify,impl §4)。稳态请求保留同一 immutable index generation；只有 project/tree/journal/flow 真相改变才重建。源码腐烂对账只哈希当前带活跃知识或 pending anchor 的文件,字节 manifest 未变就不重新跑 parser；这既保留 checkout/同尺寸替换的正确性，也避免大仓每次调用都接近全量刷新。
 
 规模估算:一万行代码的知识库约几百 KB~几 MB 文本,内存索引毫无压力;十万行量级同样成立。若未来单库真的巨大(百万行、多年历史),再引入 SQLite 作为**从文件构建的派生缓存**(可随时删掉重建,不承载真相)——那是优化,不动架构。
 
@@ -637,6 +659,9 @@ suspect 条目会随代码演进不断产生,如果没人重验就会堆积成"�
 - **矛盾检测**:新知识与已有条目冲突(如"pass 传明文" vs "pass 传密文")→ **矛盾本身是重要信号**:要么代码变了(旧条目该失效),要么有一方理解错了。冲突不静默覆盖,生成一条"待裁决"记录,裁决走 §12.5 的规则。检测覆盖分层(2026-07-05 定案):同节点冲突三层兜底(写入 bigram 查重逼三选一、disputes 矛盾单、dup-entries 债);**跨节点/措辞漂移的语义冲突机器判不了**(可选 embedding preview 默认 disabled;即便用户启用,它也只能扩大候选集合,"两句话是否互相否定"仍是需要读原文的 LLM-complete 裁决)——补位仍是 **kb_maintain patrol 巡检简报**:机器把"最可能同主题"的跨节点知识聚到一张纸上,裁判是读简报的 AI(impl §7.3)。
 - **锚点校验(乐观语义,推演五收窄)**:remember 可携带此前 recall 拿到的 `base_hash`,失配报 ANCHOR_STALE(代码在你读后又变了);未携带则照收并按当前代码重新落锚(impl §7.3)——强制一致会让 suspect 无解除路径("重读后重试"死循环),过时写入由读取时对账兜底。
 - **引用声明**:依据来自其他知识条目的,必须带 `basedOn`(§8.3),可信度封顶 `inferred`。
+- **写锚不可猜**:`record_change` 可机械规范化不改变对象的节点写法,并从当前源码唯一确认
+  尚未入骨架的新文件/符号后原子落锚；split 血缘、同名方法或 typo 只返回有界规范候选，
+  不能为追求“写入成功率”默选第一个或悄悄降级到相似文件。账本优先不等于锚点含糊。
 
 ### 12.5 错误知识的自愈(勘误、污染回收、裁决铁律)
 
@@ -825,7 +850,8 @@ suspect 条目会随代码演进不断产生,如果没人重验就会堆积成"�
 | 23 | 推演五/轮 22 修订后的一致性核查收尾(两批共 9 个独立审查员:6 覆盖镜头 + 3 一致性镜头,首批因会话中断由后续会话接续)。修掉 20+ 处落地遗漏与残余矛盾,其中三处 blocker 级:main 端点表漏改致委派模式交卷路径断裂(impl §7.1)、Entry 缺 author 字段致"来源可溯"无承载(impl §3)、使用日志行格式承载不了自己承诺的两个指标(impl §7.6)。顺带新定案:`init --reanchor-all` 作 mass-suspect 唯一批量出口(impl §6)、journal 行不带 schema 版本只做增量演化(impl §3)、remember 对 orphaned 节点拒收(KB_ERR:NODE_ORPHANED)、record_change 的 base_hash 失配仅警示不拒收(账本优先)、会话台账登记统一二期、二期三件套先落关键词(流程节点三期就位)、LICENSE 延期留痕(impl §1,发布前用户拍板) |
 | 24 | **一次性全量交付**(用户定夺:"不要分什么阶段了",推翻 §15 分期交付的【执行层面】;分期作为设计分层与验收清单保留)。13 个工具 + 双端点 + GET /inject + 台账/过时警报/任务态/侦查委派/维护欠账/时代摘要/使用日志一次落地(~1 万行 Go 含测试),curl 协议级自测全过。实现期新定案:WIP/Flow 结构定稿、流程反向链接不落盘 index 现算(推翻 Node.Flows 字段设想)、维护欠账队列为现算派生值不落盘、时代摘要承载 = Node.EraSummary/EraUntil(呈现层折叠,journal 永不改写)、Entry 补 At/Author/RetiredBy、remaps 粒度定案(销 §16.14)、findings 存 local 不进 git、bury=journal 快照+节点摘除、新错误码 JOB_NOT_FOUND;修掉两个实现 bug(supersedes 指针失效、未知字段合并复活被清零字段——后者以"结构体反射派生已知字段集"根治)。**随后一轮 57-agent 对抗审查(附录 F 方法论,7 镜头 API 齐全性 + 代码审查)确认 42 处真问题(驳回 8),全部修复并加回归测试**:铁律二路径穿越(node-arg/恶意分片 ../ 逃出仓库)、conflict 分片被空壳覆盖致数据丢失、拆分血缘 last-write-wins(改 lineage 为一对多)、remaps 自毁(from 解析到目标)+ 指针失效压缩、record_change 非原子(改为 journal 先行 + 全校验后应用)、init 未加锁、SaveShard 吞错、SaveFlow 未知字段丢失、cache/session/status 并发、lint 误杀事实陈述(违 §16.13,收窄为祈使标记 + 库外动作共现才拒)、错误码语义(补 INVALID_ARGUMENT/SHARD_CONFLICT)、recall 无截断、base_hash 语义反了、kb_flow 补 get、kb_maintain 补 dismiss、kb_verify 补节点级重验、任务尾/落后摘要/非代码知识失效三处 API 留痕。遗留实测项:claude CLI 真实客户端连接(撞账号限额,待重置复测);PTY 自派备模式与 git 历史挖掘按轮 22/设计留白维持延后 |
 | 34 | **2026-07-11 全仓对抗审计与修复**:先 fast-forward 到远端最新主线。落地仓外私有 auth/identity/trust/WAL、无 Bearer 也执行的 loopback 双向 HMAC、writer-lock owner 才能恢复的 prepared/committed 多文件事务、结构化可逆 effects、严格单 gzip/唯一 manifest/容量与便携路径 bundle、默认不覆盖异内容与显式 `--force`。源码与存储均拒根以下 symlink/非普通文件。解析侧补 Go 包代际、Python `-I -S`/PEP263、TS regex/class initializer 等边界;索引按 Change.At/FlowStep.Since 路由同名 ID 代际,重复 node 全隔离,拆分 entry 找真实继承者。全量 race/跨平台构建作为交付门。 |
-| 38 | **2026-07-19 证据感知 semantic preview 与对抗加固**:从 summary-only 候选升级为 current/risk/history 三类时态证据卡；current+lexical RRF，risk/history advisory-only，并接入任务启动历史决策提醒（辅助、不阻断）。source-hash partial 复用、双模式同批 canary、持久 sync policy/每会话硬闸、离线 qrels 门落地。后续审计补齐 remote key origin、MCP 8min/3000 卡上限、source DTO/时态 lineage、`O(lanes×top_k)` Flat、专用 temp、失效 resident 逐出，以及 multi-repo 1GiB 动态 coordinator + 全局 provider/search gate。仍默认 disabled，真实模型质量晋级未完成。 |
+| 38 | **2026-07-19 证据感知 semantic preview 与对抗加固**:从 summary-only 候选升级为 current/risk/history 三类时态证据卡；current+lexical RRF，risk/history advisory-only，并接入任务启动历史决策提醒（辅助、不阻断）。source-hash partial 复用、双模式同批 canary、持久 sync policy/每会话硬闸、离线 qrels 门落地。后续审计补齐 remote key origin、MCP 8min/3000 卡上限、source DTO/时态 lineage、`O(lanes×top_k)` Flat、专用 temp、失效 resident 逐出，以及 multi-repo 1GiB 动态 coordinator + 全局 provider/search gate。**历史说明：本轮关于 status 展开语义状态、按总卡片判断 MCP 上限的说法已由轮 40 取代；现行契约是正常态静默、按安全增量 pending 计限，小仓无可复用旧代时仍可在同次 MCP sync 完整重建。**仍默认 disabled，真实模型质量晋级未完成。 |
+| 41 | **2026-08-20 本机真实使用审计后的运维闭环**:以 casino/apple 的调用日志、进程驻留与 Git 状态为证据，补齐五条系统不变量：持久正本必须实际 Git tracked（doctor 识别 outer ignore/no-git）；Codex repo MCP 缺省项目级配置；请求 Sync 复用未变化的 index generation 并只对知识承载源码做字节 manifest 对账；record_change 规范化/源码唯一确认/有界候选但绝不猜锚；semantic 同会话重复 sync 成功 no-op 且零 provider、status 不再重发 action；daemon 以认证 runtime identity 做构建感知优雅换代。 |
 
 ## 附录 B:全流程纸上推演一(单 agent 排障)
 

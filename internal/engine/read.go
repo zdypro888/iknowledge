@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"path"
 	"path/filepath"
@@ -60,7 +61,8 @@ func (e *Engine) StatusContext(ctx context.Context) (string, error) {
 	// SemanticHealthSnapshot 会在必要时发布 source manifest（短持
 	// rt.mu）并可能淘汰外部已替换的 vector generation。必须在下方
 	// 主 rt.RLock 之外完成，否则 RWMutex 不可升级会死锁。该检查纯本地：
-	// 不联网、不读 API key、不解码大向量 payload。
+	// 不联网、不读 API key；只有大型 partial 首次精确规划会流式校验
+	// payload，且不物化第二块完整矩阵。
 	semanticHealth, err := e.SemanticHealthSnapshotContext(ctx)
 	if err != nil {
 		return "", err
@@ -82,6 +84,10 @@ func (e *Engine) StatusContext(ctx context.Context) (string, error) {
 	// explicit 64 MiB status budget. Read it before taking the truth snapshot
 	// lock so a large local log cannot stall remember/record_change writers.
 	usageRecords, usageErr := e.Store.LoadUsageContext(ctx)
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	truthGit := e.truthGitHealthCachedContext(ctx)
 	if err := ctx.Err(); err != nil {
 		return "", err
 	}
@@ -187,8 +193,10 @@ func (e *Engine) StatusContext(ctx context.Context) (string, error) {
 
 	var b strings.Builder
 	fmt.Fprintf(&b, "repoRoot: %s\nschema: %d\n", e.Store.RepoRoot(), model.SchemaVersion)
-	b.WriteString(semanticHealth.compactText())
-	b.WriteByte('\n')
+	if semanticAction := semanticHealth.operationalText(); semanticAction != "" {
+		b.WriteString(semanticAction)
+		b.WriteByte('\n')
+	}
 	// 覆盖率一位小数:68/15598 取整成 "0%" 会把正常的按需消化误读成没干活。
 	fmt.Fprintf(&b, "节点: %d(已消化 %d,覆盖率 %.1f%%)\n", total, digested, pct(digested, total))
 	fmt.Fprintf(&b, "suspect: %d | 孤儿: %d | 待补锚: %d | 冲突分片: %d | 解析失败文件: %d | journal 坏行: %d\n",
@@ -207,6 +215,12 @@ func (e *Engine) StatusContext(ctx context.Context) (string, error) {
 		b.WriteString(".gitattributes/.gitignore: 在位\n")
 	} else {
 		b.WriteString("⚠ .gitattributes/.gitignore 缺失或缺行——union 合并会静默失效,请重跑 kb_init\n")
+	}
+	if truthGit.protected() {
+		fmt.Fprintf(&b, "Git 正本保护: ok(%d/%d tracked)\n", truthGit.Tracked, truthGit.Files)
+	} else {
+		fmt.Fprintf(&b, "⚠ Git 正本保护: %s(%d/%d tracked) — %s\n",
+			truthGit.State, truthGit.Tracked, truthGit.Files, truthGit.Detail)
 	}
 
 	// 使用日志汇总(impl §7.6:数据裁决的采集底)。
@@ -245,8 +259,8 @@ func (e *Engine) StatusContext(ctx context.Context) (string, error) {
 				}
 			}
 		}
-		fmt.Fprintf(&b, "使用日志: recall %d 次(命中率 %.0f%%,undigested 命中 %d,空手 %d)| remember %d | record_change %d | 读取时对账发现未记账变更 %d\n",
-			recalls, pct(hits, recalls), undigestedHits, recalls-hits, remembers, changes, staleN)
+		fmt.Fprintf(&b, "使用日志: recall %d 次(导航命中率 %.0f%%,非纯骨架命中 %d,undigested 骨架 %d,空手 %d)| remember %d | record_change %d | 读取时对账发现未记账变更 %d\n",
+			recalls, pct(hits, recalls), hits-undigestedHits, undigestedHits, recalls-hits, remembers, changes, staleN)
 		if staleN > 0 && changes*10 < staleN*10 { // 展示记账遵守率信号
 			fmt.Fprintf(&b, "⚠ 记账遵守率信号:未记账变更事件 %d vs 记账 %d\n", staleN, changes)
 		}
@@ -386,8 +400,19 @@ func (e *Engine) StatusContext(ctx context.Context) (string, error) {
 			if err := checkpoint(); err != nil {
 				return "", err
 			}
-			fmt.Fprintf(&b, "  - [%s] %s(todo %d 项,touching %v)\n", w.Owner, w.Task, len(w.Todo), w.Touching)
+			age := e.now().Sub(w.Updated)
+			ageLabel := ""
+			switch {
+			case w.Updated.IsZero():
+				ageLabel = ",stale age-unknown"
+			case age >= 7*24*time.Hour:
+				ageLabel = ",stale " + daysOf(age)
+			case age >= 24*time.Hour:
+				ageLabel = ",idle " + daysOf(age)
+			}
+			fmt.Fprintf(&b, "  - [%s] %s(todo %d 项,touching %v%s)\n", w.Owner, w.Task, len(w.Todo), w.Touching, ageLabel)
 		}
+		b.WriteString("  (超过 7 天未更新的 WIP：原 owner 可直接 complete/abandon；其他会话核实归宿后用精确 owner + reason 单项代收口，不要让 touching 长期污染碰撞提示)\n")
 	}
 	// 维护欠账。
 	debts, err := e.computeDebtsLockedContext(ctx)
@@ -1218,6 +1243,10 @@ func (e *Engine) Session(sid, action string) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	wips, err := e.Store.LoadWIPs()
+	if err != nil {
+		return "", err
+	}
 	writeTools := map[string]bool{
 		"kb_remember": true, "kb_record_change": true, "kb_verify": true,
 		"kb_revert": true, "kb_adopt": true, "kb_flow": true, "kb_maintain": true,
@@ -1266,6 +1295,21 @@ func (e *Engine) Session(sid, action string) (string, error) {
 		if readHits[string(model.StatusSuspect)] > 0 {
 			issues++
 			fmt.Fprintf(&b, "  ! 读到 %d 次 suspect 知识:使用前需重验,准确则 kb_verify confirm,不准则 refute/obsolete。\n", readHits[string(model.StatusSuspect)])
+		}
+		for _, wip := range wips {
+			if !strings.HasSuffix(wip.Owner, "@"+sid) {
+				continue
+			}
+			issues++
+			age := e.now().Sub(wip.Updated)
+			if wip.Updated.IsZero() {
+				fmt.Fprintf(&b, "  ! 当前会话仍有无更新时间的旧 WIP %q:已完成用 kb_task complete,已取消用 abandon。\n", wip.Task)
+			} else if age >= 7*24*time.Hour {
+				fmt.Fprintf(&b, "  ! 当前会话仍有过期 WIP %q(%s 未更新):已完成用 kb_task complete,已取消用 abandon。\n",
+					wip.Task, daysOf(age))
+			} else {
+				fmt.Fprintf(&b, "  ! 当前会话仍有活跃 WIP %q:结束前请 kb_task complete；任务已取消则 abandon。\n", wip.Task)
+			}
 		}
 		if issues == 0 {
 			b.WriteString("  ok:未发现明显收尾风险。仍需人工确认是否改过源码并已记账。\n")
@@ -1766,8 +1810,7 @@ func (e *Engine) reconcileOnReadLocked(ref *index.NodeRef) autoInfo {
 //
 // 成本控制:只对"有活跃知识 且 (fresh|suspect|pending)"的节点做(纯骨架节点跳过),
 // 且每文件 parse 结果用 rcParse 缓存(同文件多符号共享,避免重复解析)。
-func (e *Engine) reconcileAllLocked() bool {
-	repo := e.Store.RepoRoot()
+func (e *Engine) reconcileAllLocked(ctx context.Context, sourceBytes map[string][]byte) (dirtyTruth, complete bool, err error) {
 	type parsed struct {
 		syms []parser.Symbol
 		src  []byte
@@ -1776,8 +1819,14 @@ func (e *Engine) reconcileAllLocked() bool {
 	}
 	fileCache := map[string]*parsed{}
 	dirty := map[string]bool{} // 有状态变更的分片,需落盘
+	complete = true
+	ops := 0
 
 	for _, ref := range e.rt.ix.Nodes() {
+		ops++
+		if err := contextCheckpoint(ctx, ops); err != nil {
+			return len(dirty) > 0, false, err
+		}
 		n := ref.Node
 		if !hasActiveEntries(n) && !n.PendingAnchor {
 			continue
@@ -1793,16 +1842,28 @@ func (e *Engine) reconcileAllLocked() bool {
 		if !ok {
 			pp = &parsed{}
 			fileCache[file] = pp
-			src, err := safeRepoRead(repo, file)
-			if err != nil {
+			src, ok := sourceBytes[file]
+			if !ok {
+				complete = false
 				continue
 			}
 			p := e.Reg.ForFile(file)
 			if p == nil {
+				complete = false
 				continue
 			}
-			syms, err := p.Parse(file, src)
-			if err != nil {
+			var syms []parser.Symbol
+			var parseErr error
+			if cp, ok := p.(parser.ContextParser); ok {
+				syms, parseErr = cp.ParseContext(ctx, file, src)
+			} else {
+				syms, parseErr = p.Parse(file, src)
+			}
+			if err := ctx.Err(); err != nil {
+				return len(dirty) > 0, false, err
+			}
+			if parseErr != nil {
+				complete = false
 				continue // 不可解析:锚保持不降级(PARSE 三态)
 			}
 			pp.syms, pp.src, pp.p, pp.ok = syms, src, p, true
@@ -1848,13 +1909,19 @@ func (e *Engine) reconcileAllLocked() bool {
 			dirty[ref.ShardRel] = true
 		}
 	}
+	var saveErrs []error
 	for shardRel := range dirty {
 		ref := &index.NodeRef{ShardRel: shardRel}
 		if err := e.saveNodeShardLocked(ref); err != nil {
 			e.warnOpsLocked("reconcileAll 落盘失败(下次重试):" + err.Error())
+			complete = false
+			saveErrs = append(saveErrs, fmt.Errorf("落盘 %s: %w", shardRel, err))
 		}
 	}
-	return len(dirty) > 0
+	if len(saveErrs) > 0 {
+		return len(dirty) > 0, false, errors.Join(saveErrs...)
+	}
+	return len(dirty) > 0, complete, nil
 }
 
 // saveNodeShardLocked 把 ref 所在分片写回(未知字段由 store 合并保留)。

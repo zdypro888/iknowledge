@@ -33,6 +33,7 @@ const (
 type semanticHTTPTestProvider struct {
 	server           *httptest.Server
 	requests         atomic.Int64
+	documentInputs   atomic.Int64
 	fail             atomic.Bool
 	authSeen         atomic.Bool
 	blockQuery       atomic.Bool
@@ -154,7 +155,7 @@ func TestSemanticLoadRejectsStaleMetadataBeforeVectorPayload(t *testing.T) {
 	meta := semanticIndexMetadata{
 		Schema: 1, Generation: strings.Repeat("a", 32),
 		SettingsFingerprint: "stale-settings", EmbedderFingerprint: "stale-embedder",
-		ProbeFingerprint: "probe", QueryProbeFingerprint: "query-probe", SourceFingerprint: hex.EncodeToString(source[:]),
+		ProbeFingerprint: strings.Repeat("1", 24), QueryProbeFingerprint: strings.Repeat("2", 24), SourceFingerprint: hex.EncodeToString(source[:]),
 		Dimensions: 3, Records: 1, BuiltAt: time.Now().UTC().Format(time.RFC3339),
 	}
 	metadata, checksum, err := marshalSemanticIndexMetadata(meta)
@@ -765,6 +766,9 @@ func newSemanticHTTPTestProvider(t *testing.T) *semanticHTTPTestProvider {
 			documentCanaryIndex = len(request.Input) - 2
 		}
 		documentBatch := documentCanaryIndex > 0
+		if documentBatch {
+			provider.documentInputs.Add(int64(documentCanaryIndex))
+		}
 		initialRebuildProbe := len(request.Input) == 2 && request.Input[0] == semanticProbeText && request.Input[1] == semanticProbeText
 		if provider.blockRebuild.Load() && initialRebuildProbe {
 			select {
@@ -1204,7 +1208,7 @@ func TestSemanticIndexWrapperRoundTripAndTamper(t *testing.T) {
 	}
 	meta := semanticIndexMetadata{
 		Schema: 1, Generation: strings.Repeat("a", 32), SettingsFingerprint: "v1:settings", EmbedderFingerprint: "embedder:test",
-		ProbeFingerprint: "probe-test", QueryProbeFingerprint: "query-probe-test", SourceFingerprint: hex.EncodeToString(source[:]),
+		ProbeFingerprint: strings.Repeat("3", 24), QueryProbeFingerprint: strings.Repeat("4", 24), SourceFingerprint: hex.EncodeToString(source[:]),
 		Dimensions: 3, Records: 1, BuiltAt: time.Date(2026, 7, 19, 1, 2, 3, 0, time.UTC).Format(time.RFC3339),
 	}
 	var encoded bytes.Buffer
@@ -1218,6 +1222,24 @@ func TestSemanticIndexWrapperRoundTripAndTamper(t *testing.T) {
 	if decodedMeta != meta || decodedSnapshot.Status() != snapshot.Status() {
 		t.Fatalf("roundtrip meta=%+v status=%+v", decodedMeta, decodedSnapshot.Status())
 	}
+
+	t.Run("canonical canary fingerprints", func(t *testing.T) {
+		badDocument := meta
+		badDocument.ProbeFingerprint = "short"
+		if err := validateSemanticIndexMetadata(badDocument); err == nil {
+			t.Fatal("accepted noncanonical document canary fingerprint")
+		}
+		badQuery := meta
+		badQuery.QueryProbeFingerprint = strings.Repeat("A", 24)
+		if err := validateSemanticIndexMetadata(badQuery); err == nil {
+			t.Fatal("accepted noncanonical query canary fingerprint")
+		}
+		legacy := meta
+		legacy.QueryProbeFingerprint = ""
+		if err := validateSemanticIndexMetadata(legacy); err != nil {
+			t.Fatalf("legacy missing query canary should remain stale/rebuildable: %v", err)
+		}
+	})
 
 	t.Run("metadata checksum", func(t *testing.T) {
 		tampered := bytes.Clone(encoded.Bytes())
@@ -1383,8 +1405,8 @@ func writeSemanticHealthIndex(t *testing.T, e *Engine, cfg SemanticSettings, bui
 		Schema: 1, Generation: "0123456789abcdef0123456789abcdef",
 		SettingsFingerprint:   SemanticSettingsFingerprint(cfg),
 		EmbedderFingerprint:   embedderFingerprint,
-		ProbeFingerprint:      "offline-test-probe",
-		QueryProbeFingerprint: "offline-test-query-probe",
+		ProbeFingerprint:      strings.Repeat("5", 24),
+		QueryProbeFingerprint: strings.Repeat("6", 24),
 		SourceFingerprint:     hex.EncodeToString(manifest.fingerprint[:]),
 		Dimensions:            3,
 		Records:               len(records),
@@ -1466,9 +1488,15 @@ func TestSemanticHealthSnapshotStableStatesStayOffline(t *testing.T) {
 			t.Fatalf("health=%+v", health)
 		}
 		status, err := e.Status()
-		if err != nil || !strings.Contains(status, "semantic: ready | provider: unchecked | next_action: none") ||
-			!strings.Contains(status, "model=health-embed") || !strings.Contains(status, "built_at="+builtAt) {
+		if err != nil || strings.Contains(status, "semantic:") || strings.Contains(status, "provider") ||
+			strings.Contains(status, "model=health-embed") || strings.Contains(status, "built_at="+builtAt) {
 			t.Fatalf("kb_status=%q err=%v", status, err)
+		}
+		detailed, err := e.SemanticStatusText()
+		if err != nil || !strings.Contains(detailed, "status: ready") ||
+			!strings.Contains(detailed, "provider_probe: deferred") ||
+			!strings.Contains(detailed, "model: health-embed") || !strings.Contains(detailed, "built_at: "+builtAt) {
+			t.Fatalf("semantic status=%q err=%v", detailed, err)
 		}
 	})
 
@@ -1505,6 +1533,11 @@ func TestSemanticHealthSnapshotStableStatesStayOffline(t *testing.T) {
 			!strings.Contains(health.Detail, "source hash") {
 			t.Fatalf("health=%+v", health)
 		}
+		status, err := e.Status()
+		if err != nil || !strings.Contains(status, "semantic_attention: status=partial") ||
+			strings.Contains(status, "model=health-embed") || strings.Contains(status, "provider") {
+			t.Fatalf("manual partial kb_status=%q err=%v", status, err)
+		}
 	})
 
 	t.Run("stale-provider", func(t *testing.T) {
@@ -1534,6 +1567,10 @@ func TestSemanticHealthSnapshotStableStatesStayOffline(t *testing.T) {
 		health := e.SemanticHealthSnapshot()
 		if health.Status != SemanticHealthCorrupt {
 			t.Fatalf("health=%+v", health)
+		}
+		status, err := e.Status()
+		if err != nil || !strings.Contains(status, "semantic_attention: status=corrupt") || strings.Contains(status, "provider") {
+			t.Fatalf("corrupt kb_status=%q err=%v", status, err)
 		}
 	})
 

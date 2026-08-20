@@ -444,6 +444,56 @@ func TestSemanticBuildReservationPreservesOrSafelyEvictsOldGeneration(t *testing
 	})
 }
 
+func TestSemanticIncrementalReservationPromotesWithoutDoubleCounting(t *testing.T) {
+	const (
+		oldResident = uint64(12 << 20)
+		newMatrix   = uint64(13 << 20)
+		oldDecoded  = uint64(12 << 20)
+		otherRepo   = uint64(512 << 20)
+	)
+	coordinator := NewSemanticProcessCoordinator(1024)
+	e, other := &Engine{}, &Engine{}
+	if err := e.SetSemanticProcessCoordinator(coordinator); err != nil {
+		t.Fatal(err)
+	}
+	if err := other.SetSemanticProcessCoordinator(coordinator); err != nil {
+		t.Fatal(err)
+	}
+	e.semantic.snapshot = &vector.Snapshot{}
+	if err := coordinator.reserveResident(e, oldResident); err != nil {
+		t.Fatal(err)
+	}
+	if err := coordinator.reserveResident(other, otherRepo); err != nil {
+		t.Fatal(err)
+	}
+	cfg := DefaultSemanticSettings()
+	cfg.MaxVectorMiB = 512
+	if err := e.beginSemanticBuildReservationContext(context.Background(), cfg, newMatrix, oldDecoded); err != nil {
+		t.Fatal(err)
+	}
+	if e.semantic.snapshot == nil {
+		t.Fatal("exact incremental reservation unnecessarily evicted the old resident")
+	}
+	if got, want := coordinator.reservedBytes(e), oldResident+newMatrix+oldDecoded; got != want {
+		t.Fatalf("incremental reservation=%d, want %d", got, want)
+	}
+	if err := coordinator.promoteTransient(e, newMatrix+1); err == nil {
+		t.Fatal("promotion larger than new-matrix authorization succeeded")
+	}
+	if got, want := coordinator.reservedBytes(e), oldResident+newMatrix+oldDecoded; got != want {
+		t.Fatalf("failed promotion changed reservation=%d, want %d", got, want)
+	}
+	if err := coordinator.promoteTransient(e, newMatrix); err != nil {
+		t.Fatal(err)
+	}
+	if got := coordinator.reservedBytes(e); got != newMatrix {
+		t.Fatalf("promoted reservation=%d, want %d", got, newMatrix)
+	}
+	e.semantic.mu.Lock()
+	e.semantic.building = false
+	e.semantic.mu.Unlock()
+}
+
 func TestSemanticNextActionNeverSuggestsImpossibleInteractiveSync(t *testing.T) {
 	e, _ := initEngine(t, map[string]string{"x.go": "package sample\nfunc X() {}\n"})
 	if got := e.semanticRebuildNextAction(string(SemanticRebuildAILocal), semanticMCPSyncMaxRecords); got != "kb_semantic action=sync" {
@@ -455,5 +505,33 @@ func TestSemanticNextActionNeverSuggestsImpossibleInteractiveSync(t *testing.T) 
 	}
 	if detail := semanticSyncLimitDetail(semanticMCPSyncMaxRecords + 1); !strings.Contains(detail, "唯一 sync 尝试") {
 		t.Fatalf("oversized detail=%q", detail)
+	}
+	old := semanticIndexInspection{meta: semanticIndexMetadata{Records: 100, Dimensions: 3}, vectorBytes: 100 * 3 * 4}
+	cfg := DefaultSemanticSettings()
+	if got := e.semanticIncrementalNextAction(string(SemanticRebuildAILocal), cfg, old, 4000); !strings.HasPrefix(got, "iknowledge semantic rebuild --repo ") {
+		t.Fatalf("known minimum delta over limit still suggested MCP sync: %q", got)
+	}
+}
+
+func TestSemanticHealthSyncTooLargeClassificationIsStructured(t *testing.T) {
+	cli := "iknowledge semantic rebuild --repo /tmp/repo"
+	for _, test := range []struct {
+		name    string
+		health  SemanticHealth
+		records int
+		want    bool
+	}{
+		{name: "ai local corrupt", health: SemanticHealth{Status: SemanticHealthCorrupt, Policy: string(SemanticRebuildAILocal), NextAction: cli}, records: semanticMCPSyncMaxRecords + 1, want: true},
+		{name: "ai remote stale provider", health: SemanticHealth{Status: SemanticHealthStaleProvider, Policy: string(SemanticRebuildAIRemote), NextAction: cli}, records: semanticMCPSyncMaxRecords + 1, want: true},
+		{name: "exact boundary", health: SemanticHealth{Policy: string(SemanticRebuildAILocal), NextAction: cli}, records: semanticMCPSyncMaxRecords},
+		{name: "retry unstable generation", health: SemanticHealth{Policy: string(SemanticRebuildAILocal), NextAction: "retry kb_status"}, records: semanticMCPSyncMaxRecords + 1},
+		{name: "actionable delta", health: SemanticHealth{Policy: string(SemanticRebuildAILocal), NextAction: "kb_semantic action=sync"}, records: semanticMCPSyncMaxRecords + 1},
+		{name: "manual policy", health: SemanticHealth{Policy: string(SemanticRebuildManual), NextAction: cli}, records: semanticMCPSyncMaxRecords + 1},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := semanticHealthSyncTooLarge(test.health, test.records); got != test.want {
+				t.Fatalf("classification=%v, want %v: %+v records=%d", got, test.want, test.health, test.records)
+			}
+		})
 	}
 }

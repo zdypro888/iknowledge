@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -12,6 +13,21 @@ import (
 	"strings"
 	"time"
 )
+
+// ErrLocalAuthScopeUnsupported means a listener understood the local-auth
+// challenge protocol but rejected the requested scope. Callers must still
+// authenticate a scope supported by the listener before treating it as a
+// trusted legacy iknowledge daemon.
+var ErrLocalAuthScopeUnsupported = errors.New("store: 本机服务不支持请求的 session scope")
+
+type localAuthHTTPError struct{ status int }
+
+func (e *localAuthHTTPError) Error() string { return fmt.Sprintf("HTTP %d", e.status) }
+
+func localAuthHTTPStatus(err error, status int) bool {
+	var httpErr *localAuthHTTPError
+	return errors.As(err, &httpErr) && httpErr.status == status
+}
 
 // LocalAuthSession 是长期根密钥经双向 HMAC 握手换得的短期 bearer 替代物。
 // 它只存在于进程内/临时 scout 配置；根密钥从不发给未知 listener。
@@ -73,6 +89,9 @@ func (s *Store) AcquireLocalAuthSession(ctx context.Context, base, scope string,
 	var challenge localChallengeResponse
 	if err := postLocalAuthJSON(ctx, &hc, base+LocalAuthChallengePath,
 		localChallengeRequest{Client: clientNonce, Scope: scope}, &challenge); err != nil {
+		if localAuthHTTPStatus(err, http.StatusBadRequest) {
+			return LocalAuthSession{}, fmt.Errorf("%w (challenge %v)", ErrLocalAuthScopeUnsupported, err)
+		}
 		return LocalAuthSession{}, fmt.Errorf("store: 获取本机鉴权 challenge: %w", err)
 	}
 	if !ValidLocalAuthValue(challenge.Challenge) {
@@ -142,7 +161,7 @@ func postLocalAuthJSON(ctx context.Context, client *http.Client, endpoint string
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
-		return fmt.Errorf("HTTP %d", resp.StatusCode)
+		return &localAuthHTTPError{status: resp.StatusCode}
 	}
 	dec := json.NewDecoder(io.LimitReader(resp.Body, 8192))
 	dec.DisallowUnknownFields()

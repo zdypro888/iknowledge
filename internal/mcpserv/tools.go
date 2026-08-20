@@ -24,10 +24,42 @@ func toolDefs(role string) []any {
 	var out []any
 	for _, name := range toolOrder {
 		if toolVisible(role, name) {
-			out = append(out, allTools[name])
+			definition := allTools[name]
+			if role == "scout" && name == "kb_task" {
+				definition = scoutTaskToolDef()
+			}
+			out = append(out, definition)
 		}
 	}
 	return out
+}
+
+// scoutTaskToolDef 保留侦察兵自己的 WIP 生命周期，但不在它的
+// 协议能力中广告 main-only 的跨会话 owner/reason 收口。浅拷贝只
+// 替换要改的 map，不会污染 allTools 的 main 定义。
+func scoutTaskToolDef() map[string]any {
+	base := allTools["kb_task"].(map[string]any)
+	definition := make(map[string]any, len(base))
+	for key, value := range base {
+		definition[key] = value
+	}
+	definition["description"] = "侦察兵当前会话的任务态(WIP)台账:start/update/complete/abandon/get。不得指定其他 owner 代为收口；跨会话 stale WIP 只由 main 会话核实处理。"
+
+	baseSchema := base["inputSchema"].(map[string]any)
+	schema := make(map[string]any, len(baseSchema))
+	for key, value := range baseSchema {
+		schema[key] = value
+	}
+	baseProperties := baseSchema["properties"].(map[string]any)
+	properties := make(map[string]any, len(baseProperties)-2)
+	for key, value := range baseProperties {
+		if key != "owner" && key != "reason" {
+			properties[key] = value
+		}
+	}
+	schema["properties"] = properties
+	definition["inputSchema"] = schema
+	return definition
 }
 
 var toolOrder = []string{
@@ -62,12 +94,12 @@ var allTools = map[string]any{
 	},
 	"kb_status": map[string]any{
 		"name":        "kb_status",
-		"description": "库状态:覆盖率、suspect/孤儿/冲突分片、使用日志、任务/维护欠账及 semantic 健康。每会话先读它。semantic 检查纯本地；provider=unchecked 表示未联网探测，不是故障。只有 next_action 明确为 kb_semantic action=sync 且 policy=ai-local/ai-remote 时才允许 AI 同步；其他情况不要重复配置或同步。",
+		"description": "库运行态:覆盖率、suspect/孤儿/冲突分片、使用日志、任务/维护欠账。每会话先读且静默消费；正常 semantic 状态不向用户复述。仅当结果明确给出 semantic_action: kb_semantic action=sync 时按既有授权静默同步一次；semantic_attention 只在当前任务依赖语义召回或用户询问状态时简短说明一次。",
 		"inputSchema": obj(map[string]any{}),
 	},
 	"kb_semantic": map[string]any{
 		"name":        "kb_semantic",
-		"description": "semantic 本地状态/同步。status 永不联网；sync 只在 kb_status 的 next_action 明确为 kb_semantic action=sync，且用户已通过 CLI 持久授权 ai-local/ai-remote 时重建派生索引。每会话最多 sync 一次；ready/none 不调用。绝不修改 endpoint/model/profile/policy、下载或切换模型、开启远端外发。",
+		"description": "semantic 诊断/同步。只有用户询问或诊断时调用 status，status 永不联网；sync 只在 kb_status 明确给出 semantic_action，且用户已通过 CLI 持久授权 ai-local/ai-remote 时执行。每会话最多一次；绝不修改 endpoint/model/profile/policy、下载或切换模型、开启远端外发。",
 		"inputSchema": obj(map[string]any{
 			"action": map[string]any{"type": "string", "enum": []string{"status", "sync"}, "description": "status=纯本地健康；sync=按既有授权同步"},
 		}, "action"),
@@ -149,9 +181,11 @@ var allTools = map[string]any{
 	},
 	"kb_task": map[string]any{
 		"name":        "kb_task",
-		"description": "任务态(WIP)台账:start/update/complete/get。进行中状态与知识严格分离;touching 声明『正在动谁』,他人触碰时自动看到;complete 自动归档为变更记录。",
+		"description": "任务态(WIP)台账:start/update/complete/abandon/get。进行中状态与知识严格分离;touching 声明『正在动谁』,他人触碰时自动看到;complete 归档真实变更,abandon 只清理已取消任务且不伪造 journal。通常只能收口当前会话；核实其他 owner 的 WIP 已 stale 至少 7 天后，才可用 complete/abandon + 精确 owner + 必填 reason 单项代收口。",
 		"inputSchema": obj(map[string]any{
-			"action": map[string]any{"type": "string", "enum": []string{"start", "update", "complete", "get"}},
+			"action": map[string]any{"type": "string", "enum": []string{"start", "update", "complete", "abandon", "get"}},
+			"owner":  str("可选且仅用于 complete/abandon：要代为收口的精确 WIP owner；目标必须存在且至少 7 天未更新。当前会话操作省略"),
+			"reason": str("指定其他 owner 时必填：complete 写 commit/部署/验收等完成证据，abandon 写取消/被取代依据"),
 			"wip": obj(map[string]any{
 				"task":     str("任务一句话(含 issue 引用)"),
 				"intent":   str("意图"),

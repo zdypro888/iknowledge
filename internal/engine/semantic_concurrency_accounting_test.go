@@ -115,6 +115,71 @@ func TestSemanticResidentWaitsHonorCancellation(t *testing.T) {
 	})
 }
 
+func TestSemanticPartialHealthReleasesSourceLeaseBeforeResidentInvalidation(t *testing.T) {
+	e, cfg := semanticHealthTestEngine(t, "http://127.0.0.1:11434/v1")
+	if err := SaveSemanticSettings(e.Store, cfg); err != nil {
+		t.Fatal(err)
+	}
+	writeSemanticHealthIndex(t, e, cfg, "2026-07-20T12:34:56Z")
+	if _, err := e.Remember(RememberArgs{Node: "vault.go#Vault", Entries: []RememberEntry{{
+		Kind: "summary", Text: "new source generation for lock-order regression",
+	}}}, "semantic-lock-order", "test"); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := e.semanticSourceSnapshot(context.Background(), false); err != nil {
+		t.Fatal(err)
+	}
+
+	// Force partial-health invalidation to wait at residentMu. While it waits,
+	// the source-generation write lock must remain obtainable: holding a source
+	// read lease here would invert clear's resident -> source order and deadlock.
+	e.semantic.residentMu.Lock()
+	residentLocked := true
+	defer func() {
+		if residentLocked {
+			e.semantic.residentMu.Unlock()
+		}
+	}()
+	waitObserved := make(chan struct{})
+	waitCtx := &observedDoneContext{Context: context.Background(), observed: waitObserved}
+	type healthResult struct {
+		health SemanticHealth
+		err    error
+	}
+	healthDone := make(chan healthResult, 1)
+	go func() {
+		health, err := e.SemanticHealthSnapshotContext(waitCtx)
+		healthDone <- healthResult{health: health, err: err}
+	}()
+	// With the current source manifest prebuilt, all prior context-aware locks
+	// are uncontended TryLock paths. The first observed Done() select is therefore
+	// the deliberate wait on residentMu below, making this a deterministic
+	// assertion rather than a scheduler-dependent sleep.
+	select {
+	case <-waitObserved:
+	case <-time.After(5 * time.Second):
+		t.Fatal("partial health did not reach resident invalidation")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := e.semantic.sourceResidentMu.LockContext(ctx); err != nil {
+		t.Fatalf("partial status retained source lease while waiting for resident invalidation: %v", err)
+	}
+	e.semantic.sourceResidentMu.Unlock()
+	e.semantic.residentMu.Unlock()
+	residentLocked = false
+
+	select {
+	case result := <-healthDone:
+		if result.err != nil || result.health.Status != SemanticHealthPartial {
+			t.Fatalf("health=%+v err=%v, want partial", result.health, result.err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("partial health remained blocked after resident invalidation resumed")
+	}
+}
+
 func TestSyncSemanticDisabledReleasesSemanticProcessCharges(t *testing.T) {
 	e, _ := initEngine(t, map[string]string{
 		"worker.go": "package worker\n\nfunc Run() {}\n",

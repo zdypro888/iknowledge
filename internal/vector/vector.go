@@ -289,6 +289,46 @@ func (b *Builder) Append(ctx context.Context, vectors [][]float32) error {
 	return nil
 }
 
+// AppendFromSnapshot copies one already-normalized row from an immutable
+// snapshot into the next row of this builder. Reuse is allowed only when the
+// complete record identity (ID, node, kind and source hash) matches the target
+// plan and both snapshots use the same dimensions. The stored vector is never
+// exposed to callers, and a failed validation never advances the builder.
+func (b *Builder) AppendFromSnapshot(ctx context.Context, source *Snapshot, row int) error {
+	if err := b.ready(ctx); err != nil {
+		return err
+	}
+	if source == nil || source.dimensions <= 0 ||
+		len(source.vectors) != len(source.records)*source.dimensions {
+		return fmt.Errorf("%w: source snapshot is nil or invalid", ErrInvalidInput)
+	}
+	if row < 0 || row >= len(source.records) {
+		return fmt.Errorf("%w: source row %d out of range", ErrInvalidInput, row)
+	}
+	if b.appended >= len(b.plan.records) {
+		return fmt.Errorf("%w: no target records remain", ErrInvalidInput)
+	}
+	if source.dimensions != b.plan.dimensions {
+		return fmt.Errorf("%w: source dimensions %d, want %d", ErrInvalidInput, source.dimensions, b.plan.dimensions)
+	}
+	sourceMeta := source.records[row]
+	targetMeta := b.plan.records[b.appended]
+	if sourceMeta != targetMeta {
+		return fmt.Errorf("%w: source record %q does not match target %q", ErrInvalidInput, sourceMeta.id, targetMeta.id)
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	sourceStart := row * source.dimensions
+	targetStart := b.appended * b.plan.dimensions
+	copy(b.vectors[targetStart:targetStart+b.plan.dimensions], source.vectors[sourceStart:sourceStart+source.dimensions])
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	b.appended++
+	return nil
+}
+
 func (b *Builder) appendRecords(ctx context.Context, records []Record) error {
 	if err := b.ready(ctx); err != nil {
 		return err
@@ -372,6 +412,18 @@ func (s *Snapshot) Status() Status {
 		MetadataBytes: s.metadataBytes,
 		Normalized:    true,
 	}
+}
+
+// RecordMetadataAt returns a value copy of one row's metadata without exposing
+// the stored vector. It is safe to call concurrently with searches.
+func (s *Snapshot) RecordMetadataAt(row int) (RecordMetadata, bool) {
+	if s == nil || row < 0 || row >= len(s.records) {
+		return RecordMetadata{}, false
+	}
+	record := s.records[row]
+	return RecordMetadata{
+		ID: record.id, NodeID: record.nodeID, Kind: record.kind, SourceHash: record.sourceHash,
+	}, true
 }
 
 // Search performs an exact cosine search. The query is validated and

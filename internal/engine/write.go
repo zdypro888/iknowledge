@@ -423,14 +423,226 @@ type newSymbolPlan struct {
 	shardRel string
 }
 
+// normalizeCodeNodeQuery only canonicalizes syntax that cannot change the
+// referenced source object: surrounding whitespace, repo-local "./" prefixes,
+// path separators, and the call-site-only trailing "()" that is never part of
+// a canonical symbol name. In particular it does not case-fold paths/symbols,
+// guess receiver types, or strip line numbers; those transformations could
+// silently attach a write to the wrong node.
+func normalizeCodeNodeQuery(query string) string {
+	q := model.ToSlash(strings.TrimSpace(query))
+	normalizeFile := func(file string) string {
+		file = strings.TrimSpace(file)
+		for strings.HasPrefix(file, "./") {
+			file = strings.TrimPrefix(file, "./")
+		}
+		return file
+	}
+	if file, symbol, ok := strings.Cut(q, "#"); ok {
+		file = normalizeFile(file)
+		symbol = strings.TrimSpace(symbol)
+		if strings.HasSuffix(symbol, "()") {
+			symbol = strings.TrimSpace(strings.TrimSuffix(symbol, "()"))
+		}
+		return file + "#" + symbol
+	}
+	q = normalizeFile(q)
+	if strings.HasSuffix(q, "()") {
+		q = strings.TrimSpace(strings.TrimSuffix(q, "()"))
+	}
+	return q
+}
+
+func explicitEmptyCodeSymbol(query string) bool {
+	_, symbol, ok := strings.Cut(query, "#")
+	return ok && strings.TrimSpace(symbol) == ""
+}
+
+func emptyCodeSymbolError(query string) error {
+	return kbErr("INVALID_ARGUMENT", "节点 "+query+" 显式包含 # 但符号名为空",
+		"文件级节点请直接写 repo 相对路径；符号节点请在 # 后填写规范符号名")
+}
+
+const nodeCandidateLimit = 5
+
+// boundedNodeCandidates keeps corrective errors useful without allowing a
+// short/ambiguous symbol such as "Run" to dump thousands of node IDs into one
+// MCP response. Callers pass deterministic candidates; preserving their order
+// also preserves relevance ranking from source correction.
+func boundedNodeCandidates(candidates []string) []string {
+	out := make([]string, 0, min(nodeCandidateLimit, len(candidates)))
+	for _, candidate := range candidates {
+		if !writeContainsString(out, candidate) {
+			out = append(out, candidate)
+		}
+		if len(out) == nodeCandidateLimit {
+			break
+		}
+	}
+	return out
+}
+
+func nodeCandidateHint(prefix string, candidates []string) string {
+	candidates = boundedNodeCandidates(candidates)
+	if len(candidates) == 0 {
+		return prefix
+	}
+	return prefix + ";候选:" + strings.Join(candidates, "、")
+}
+
+type sourceSymbolCandidate struct {
+	id    string
+	rank  int
+	delta int
+}
+
+// closestSourceNodeIDs returns deterministic same-file corrective candidates.
+// The rank deliberately favours case-only mistakes and a receiver-less method
+// name, but candidates are suggestions only: the write is still rejected and
+// no file-level fallback happens for a bad symbol.
+func closestSourceNodeIDs(file, query string, syms []parser.Symbol) []string {
+	q := strings.ToLower(model.BaseSymbol(strings.TrimSpace(query)))
+	if len(q) > 256 { // hostile/accidental giant input must not amplify work
+		return nil
+	}
+	var ranked []sourceSymbolCandidate
+	for i := range syms {
+		name := model.BaseSymbol(syms[i].Name)
+		lower := strings.ToLower(name)
+		tail := lower
+		if dot := strings.LastIndexByte(tail, '.'); dot >= 0 {
+			tail = tail[dot+1:]
+		}
+		rank := 4
+		switch {
+		case lower == q:
+			rank = 0
+		case tail == q:
+			rank = 1
+		case strings.HasPrefix(lower, q) || strings.HasPrefix(q, lower) ||
+			strings.HasPrefix(tail, q) || strings.HasPrefix(q, tail):
+			rank = 2
+		case strings.Contains(lower, q) || strings.Contains(q, lower) ||
+			strings.Contains(tail, q) || strings.Contains(q, tail):
+			rank = 3
+		}
+		delta := len(lower) - len(q)
+		if delta < 0 {
+			delta = -delta
+		}
+		ranked = append(ranked, sourceSymbolCandidate{
+			id: model.SymbolNodeID(file, syms[i].Name), rank: rank, delta: delta,
+		})
+	}
+	sort.Slice(ranked, func(i, j int) bool {
+		if ranked[i].rank != ranked[j].rank {
+			return ranked[i].rank < ranked[j].rank
+		}
+		if ranked[i].delta != ranked[j].delta {
+			return ranked[i].delta < ranked[j].delta
+		}
+		return ranked[i].id < ranked[j].id
+	})
+	out := make([]string, 0, min(nodeCandidateLimit, len(ranked)))
+	for _, candidate := range ranked {
+		if !writeContainsString(out, candidate.id) {
+			out = append(out, candidate.id)
+		}
+		if len(out) == nodeCandidateLimit {
+			break
+		}
+	}
+	return out
+}
+
+func writeContainsString(in []string, value string) bool {
+	for _, item := range in {
+		if item == value {
+			return true
+		}
+	}
+	return false
+}
+
+// sourceFileCandidatesLocked uses the already bounded in-memory truth index;
+// it never walks the repository on an error path. Returned IDs are file nodes
+// only, so a miss cannot misleadingly suggest an arbitrary symbol.
+func (e *Engine) sourceFileCandidatesLocked(query string) []string {
+	q := strings.ToLower(query)
+	base := strings.ToLower(filepath.Base(query))
+	var ranked []sourceSymbolCandidate
+	for id, ref := range e.rt.ix.Nodes() {
+		if ref == nil || ref.Node == nil || ref.Node.Level != model.LevelFile {
+			continue
+		}
+		lower := strings.ToLower(id)
+		idBase := strings.ToLower(filepath.Base(id))
+		rank := 4
+		switch {
+		case lower == q:
+			rank = 0
+		case idBase == base:
+			rank = 1
+		case strings.HasPrefix(lower, q) || strings.HasPrefix(q, lower) ||
+			strings.HasPrefix(idBase, base) || strings.HasPrefix(base, idBase):
+			rank = 2
+		case strings.Contains(lower, q) || strings.Contains(q, lower) ||
+			strings.Contains(idBase, base) || strings.Contains(base, idBase):
+			rank = 3
+		}
+		delta := len(lower) - len(q)
+		if delta < 0 {
+			delta = -delta
+		}
+		ranked = append(ranked, sourceSymbolCandidate{id: id, rank: rank, delta: delta})
+	}
+	sort.Slice(ranked, func(i, j int) bool {
+		if ranked[i].rank != ranked[j].rank {
+			return ranked[i].rank < ranked[j].rank
+		}
+		if ranked[i].delta != ranked[j].delta {
+			return ranked[i].delta < ranked[j].delta
+		}
+		return ranked[i].id < ranked[j].id
+	})
+	out := make([]string, 0, min(nodeCandidateLimit, len(ranked)))
+	for _, candidate := range ranked {
+		out = append(out, candidate.id)
+		if len(out) == nodeCandidateLimit {
+			break
+		}
+	}
+	return out
+}
+
+// resolveWriteQueryLocked is stricter than the read-side resolver. Reads may
+// choose the first current heir for a historical ID as a deterministic
+// navigation default, but a truth write must never pick one branch of a split
+// lineage silently.
+func (e *Engine) resolveWriteQueryLocked(query string) (string, []string) {
+	query = normalizeCodeNodeQuery(query)
+	if heirs := e.rt.ix.ResolveNodeIDs(query); len(heirs) == 1 {
+		return heirs[0], nil
+	} else if len(heirs) > 1 {
+		out := append([]string(nil), heirs...)
+		sort.Strings(out)
+		return "", out
+	}
+	return e.resolveQueryLocked(query)
+}
+
 // planNewSymbolLocked 解析一个新符号并规划增量落锚,【不落盘、不重建索引】。
 // 会失败的分支(路径穿越/文件缺失/解析错/符号不在/多命中)全在此拒收——供
 // record_change 的两遍式在 journal 前完成全部校验(impl §7.3)。
 func (e *Engine) planNewSymbolLocked(query string) (*newSymbolPlan, error) {
+	query = normalizeCodeNodeQuery(query)
+	if explicitEmptyCodeSymbol(query) {
+		return nil, emptyCodeSymbolError(query)
+	}
 	file, symbol := model.SplitNodeID(query)
-	if symbol == "" {
+	if file == "" || (symbol == "" && (file == model.ProjectNodeID || strings.HasSuffix(file, "/"))) {
 		return nil, kbErr("NODE_NOT_FOUND", "节点 "+query+" 不存在",
-			"用 kb_map 确认路径/符号;新文件先 kb_init 对账")
+			"用 kb_map 确认 repo 相对路径/规范符号名")
 	}
 	// 铁律二防线:AI 报的节点 ID 直达文件系统前必须消毒,拒绝 ../ 逃出仓库。
 	if _, ok := model.SafeRel(file); !ok {
@@ -443,46 +655,96 @@ func (e *Engine) planNewSymbolLocked(query string) (*newSymbolPlan, error) {
 		return nil, kbErr("SHARD_CONFLICT", "文件 "+file+" 的知识分片不可用:"+cerr.Error(),
 			"先人工解决 .knowledge/tree/"+file+".yaml 的合并冲突或升级 iknowledge,再写入")
 	}
+	if parser.ExcludedPath(file) {
+		return nil, kbErr("NODE_NOT_FOUND", "文件 "+file+" 属于默认排除目录",
+			"vendor/testdata/.knowledge 不建立源码节点;把记录挂到调用它的仓内源码节点")
+	}
+	cfg, cfgErr := e.Store.LoadConfig()
+	if cfgErr != nil {
+		return nil, cfgErr
+	}
+	if !cfgAllows(cfg, file) {
+		return nil, kbErr("NODE_NOT_FOUND", "文件 "+file+" 被知识库 include/exclude 规则排除",
+			"核对 .knowledge/config.yaml;不要把记录静默挂到其他文件")
+	}
 	src, err := safeRepoRead(e.Store.RepoRoot(), file)
 	if err != nil {
 		return nil, kbErr("NODE_NOT_FOUND", "文件 "+file+" 不存在",
-			"路径须相对仓库根、正斜杠;用 kb_map 确认")
+			nodeCandidateHint("路径须相对仓库根、正斜杠;用 kb_map 确认", e.sourceFileCandidatesLocked(file)))
 	}
 	p := e.Reg.ForFile(file)
 	if p == nil {
 		return nil, kbErr("NODE_NOT_FOUND", "文件 "+file+" 无注册解析器",
-			"一期仅支持 Go 源文件")
+			"支持 Go/Python/JS/TS/Rust/Java;其他扩展需在 .knowledge/config.yaml 的 extensions 显式启用文件级索引")
+	}
+	if parser.IsGenerated(src) {
+		return nil, kbErr("NODE_NOT_FOUND", "文件 "+file+" 是生成代码,不建立知识节点",
+			"把变更记录挂到生成器或稳定的手写调用方;不要锚到会被覆盖的制品")
 	}
 	syms, err := p.Parse(file, src)
 	if err != nil {
 		return nil, kbErr("PARSE_FAILED", "文件 "+file+" 当前不可解析:"+err.Error(),
 			"修完语法后重试")
 	}
+	shardRel := "tree/" + file + ".yaml"
+	if symbol == "" {
+		node := model.Node{
+			ID: file, Level: model.LevelFile,
+			Anchor: model.Anchor{File: file, Hash: parser.HashFileFor(p, syms, src)},
+			Status: model.StatusFresh, Since: e.now().UTC(),
+		}
+		for _, cs := range e.rt.cache.Shards() {
+			if cs != nil && cs.Shard != nil && shardHasNode(cs.Shard, node.ID) {
+				return nil, kbErr("SHARD_CONFLICT", "节点 "+node.ID+" 被重复分片隔离",
+					"先修复 kb_status 报出的重复 Node ID，再重试")
+			}
+		}
+		return &newSymbolPlan{node: node, shardRel: shardRel}, nil
+	}
+
+	// Exact canonical name always wins. Only after exact failure may the
+	// receiver/pointer-insensitive matcher participate; otherwise a new top-level
+	// Run would be rejected merely because A.Run and B.Run also exist.
 	var target *parser.Symbol
 	for i := range syms {
-		if syms[i].Name == symbol || model.LooseSymbolMatch(symbol, syms[i].Name) {
-			if target != nil {
-				return nil, kbErr("NODE_NOT_FOUND", "符号 "+symbol+" 在 "+file+" 有多个宽松命中",
-					"用规范名(方法带接收者)重试")
-			}
+		if syms[i].Name == symbol {
 			target = &syms[i]
+			break
+		}
+	}
+	if target == nil {
+		var loose []int
+		for i := range syms {
+			if model.LooseSymbolMatch(symbol, syms[i].Name) {
+				loose = append(loose, i)
+			}
+		}
+		if len(loose) == 1 {
+			target = &syms[loose[0]]
+		} else if len(loose) > 1 {
+			candidates := make([]string, 0, len(loose))
+			for _, idx := range loose {
+				candidates = append(candidates, model.SymbolNodeID(file, syms[idx].Name))
+			}
+			return nil, kbErr("NODE_NOT_FOUND", "符号 "+symbol+" 在 "+file+" 有多个宽松命中",
+				nodeCandidateHint("用完整规范名(方法带接收者)重试", candidates))
 		}
 	}
 	if target == nil {
 		return nil, kbErr("NODE_NOT_FOUND", "符号 "+symbol+" 不在 "+file+" 中",
-			"用 kb_map 确认符号名(方法带接收者、同名带 ~n 序号)")
+			nodeCandidateHint("用 kb_map 确认符号名(方法带接收者、同名带 ~n 序号);不会自动降级挂到文件", closestSourceNodeIDs(file, symbol, syms)))
 	}
 	node := e.nodeFromSymbol(file, *target)
 	// 索引会隔离跨分片重复 ID。隔离态不能被当成“新符号”重新创建或覆盖，
 	// 否则一次 remember/record_change 会悄悄改写其中一个副本。
 	for _, cs := range e.rt.cache.Shards() {
-		if cs != nil && shardHasNode(cs.Shard, node.ID) {
+		if cs != nil && cs.Shard != nil && shardHasNode(cs.Shard, node.ID) {
 			return nil, kbErr("SHARD_CONFLICT", "节点 "+node.ID+" 被重复分片隔离",
 				"先修复 kb_status 报出的重复 Node ID，再重试")
 		}
 	}
-	plan := &newSymbolPlan{node: node, shardRel: "tree/" + file + ".yaml"}
-	if cs := e.rt.cache.Shards()[plan.shardRel]; cs == nil || cs.Shard == nil {
+	plan := &newSymbolPlan{node: node, shardRel: shardRel}
+	if cs := e.rt.cache.Shards()[plan.shardRel]; cs == nil || cs.Shard == nil || !shardHasNode(cs.Shard, file) {
 		plan.fileNode = &model.Node{
 			ID: file, Level: model.LevelFile,
 			Anchor: model.Anchor{File: file, Hash: parser.HashFileFor(p, syms, src)},
@@ -490,6 +752,167 @@ func (e *Engine) planNewSymbolLocked(query string) (*newSymbolPlan, error) {
 		}
 	}
 	return plan, nil
+}
+
+// plannedTouchingAllowedLocked distinguishes a legitimate future source target
+// from arbitrary free text. A task may name a file/symbol before the main agent
+// creates it, so task start/update cannot require present source. It still must
+// be an explicit, safe, configured source path; generated/excluded/symlinked
+// files are never accepted as latent targets.
+func (e *Engine) plannedTouchingAllowedLocked(query string) bool {
+	query = normalizeCodeNodeQuery(query)
+	file, symbol := model.SplitNodeID(query)
+	if file == "" || (strings.Contains(query, "#") && symbol == "") {
+		return false
+	}
+	if _, ok := model.SafeRel(file); !ok || parser.ExcludedPath(file) || e.Reg.ForFile(file) == nil {
+		return false
+	}
+	cfg, err := e.Store.LoadConfig()
+	if err != nil || !cfgAllows(cfg, file) {
+		return false
+	}
+	src, err := safeRepoRead(e.Store.RepoRoot(), file)
+	if err != nil {
+		return errors.Is(err, os.ErrNotExist)
+	}
+	return !parser.IsGenerated(src)
+}
+
+// normalizeTaskTouchingLocked canonicalizes WIP collision keys without
+// inventing truth nodes. Existing and source-confirmed targets use canonical
+// IDs; an explicit safe future target is retained with a warning. Ambiguous
+// current nodes are rejected with candidates, because picking one would make
+// the concurrency warning protect the wrong code.
+func (e *Engine) normalizeTaskTouchingLocked(inputs []string) ([]string, []string, error) {
+	out := make([]string, 0, len(inputs))
+	var warns []string
+	for _, raw := range inputs {
+		trimmed := strings.TrimSpace(raw)
+		query := normalizeCodeNodeQuery(raw)
+		if query == "" {
+			return nil, nil, kbErr("INVALID_ARGUMENT", "touching 含空节点", "删除空项或填写 repo 相对节点 ID")
+		}
+		if explicitEmptyCodeSymbol(query) {
+			return nil, nil, emptyCodeSymbolError(query)
+		}
+
+		// A split historical ID deliberately expands to every current heir: WIP
+		// collision protection is conservative and must not lose a branch.
+		if heirs := e.rt.ix.ResolveNodeIDs(query); len(heirs) > 0 {
+			heirs = append([]string(nil), heirs...)
+			sort.Strings(heirs)
+			for _, id := range heirs {
+				if !writeContainsString(out, id) {
+					out = append(out, id)
+				}
+			}
+			if trimmed != query || len(heirs) != 1 || heirs[0] != query {
+				warns = append(warns, "touching "+trimmed+" 已规范化为 "+strings.Join(heirs, "、"))
+			}
+			continue
+		}
+
+		id, candidates := e.resolveQueryLocked(query)
+		if id != "" {
+			if !writeContainsString(out, id) {
+				out = append(out, id)
+			}
+			if trimmed != query || id != query {
+				warns = append(warns, "touching "+trimmed+" 已唯一解析为 "+id)
+			}
+			continue
+		}
+		if len(candidates) > 1 {
+			return nil, nil, kbErr("NODE_NOT_FOUND", "touching "+query+" 有多个当前节点候选",
+				nodeCandidateHint("改用完整节点 ID;不会替你猜接收者", candidates))
+		}
+
+		plan, planErr := e.planNewSymbolLocked(query)
+		if planErr == nil {
+			id = plan.node.ID
+			if !writeContainsString(out, id) {
+				out = append(out, id)
+			}
+			warns = append(warns, "touching "+trimmed+" 已由当前源码确认并规范化为 "+id+
+				"(尚未写入知识骨架;任务态只登记,变更记账时再原子落锚)")
+			continue
+		}
+
+		var kbe *KBError
+		if errors.As(planErr, &kbe) &&
+			(kbe.Code == "NODE_NOT_FOUND" || kbe.Code == "PARSE_FAILED") &&
+			e.plannedTouchingAllowedLocked(query) {
+			if !writeContainsString(out, query) {
+				out = append(out, query)
+			}
+			warns = append(warns, "touching "+query+" 尚不是可确认的当前节点,已作为显式计划目标保留;"+
+				"写码后 kb_record_change 会严格解析且不会静默挂到文件。原检查:"+kbe.Msg+
+				";"+kbe.Hint)
+			continue
+		}
+		return nil, nil, planErr
+	}
+	return out, warns, nil
+}
+
+// resolveTaskArchiveNodesLocked maps WIP targets to journal truth without
+// creating tree nodes inside the separate task-complete transaction. A
+// source-confirmed symbol absent from the skeleton may explicitly fall back to
+// its existing file node; a typo/ambiguous/unparseable symbol never does.
+func (e *Engine) resolveTaskArchiveNodesLocked(touching []string) ([]string, []string) {
+	if len(touching) == 0 {
+		return []string{model.ProjectNodeID}, nil
+	}
+	var nodes, warns []string
+	for _, raw := range touching {
+		query := normalizeCodeNodeQuery(raw)
+		if heirs := e.rt.ix.ResolveNodeIDs(query); len(heirs) > 0 {
+			heirs = append([]string(nil), heirs...)
+			sort.Strings(heirs)
+			for _, id := range heirs {
+				if !writeContainsString(nodes, id) {
+					nodes = append(nodes, id)
+				}
+			}
+			continue
+		}
+		if id, candidates := e.resolveQueryLocked(query); id != "" {
+			if !writeContainsString(nodes, id) {
+				nodes = append(nodes, id)
+			}
+			continue
+		} else if len(candidates) > 1 {
+			warns = append(warns, "touching "+query+" 归档时仍有多个候选("+
+				strings.Join(boundedNodeCandidates(candidates), "、")+
+				"),未选择任一节点")
+			continue
+		}
+
+		plan, err := e.planNewSymbolLocked(query)
+		if err != nil {
+			warns = append(warns, "touching "+query+" 未归档到其他源码节点:"+err.Error())
+			continue
+		}
+		file := plan.node.Anchor.File
+		if plan.node.Level != model.LevelFile {
+			if fileID := e.rt.ix.ResolveNodeID(file); fileID != "" {
+				if !writeContainsString(nodes, fileID) {
+					nodes = append(nodes, fileID)
+				}
+				warns = append(warns, "touching "+query+" 已由源码确认,但符号骨架尚不存在;"+
+					"本次任务归档显式降级到其文件节点 "+fileID+
+					"(后续 kb_record_change/init 可补符号锚)")
+				continue
+			}
+		}
+		warns = append(warns, "touching "+query+" 已由源码确认,但没有可用的现存知识节点;未猜测其他锚点")
+	}
+	if len(nodes) == 0 {
+		nodes = []string{model.ProjectNodeID}
+		warns = append(warns, "全部 touching 均无可验证的现存节点;任务归档显式落到项目节点,未静默借用相似符号/文件")
+	}
+	return nodes, warns
 }
 
 type rememberNodePlan struct {
@@ -500,7 +923,11 @@ type rememberNodePlan struct {
 // planRememberNodeLocked 只构造独立工作副本，不改缓存、不落盘。这样新符号的
 // 增量落锚也要等 entry/keyword/supersedes 全部校验通过后才与知识一起提交。
 func (e *Engine) planRememberNodeLocked(query string) (*rememberNodePlan, []string, error) {
-	id, cands := e.resolveQueryLocked(query)
+	query = normalizeCodeNodeQuery(query)
+	if explicitEmptyCodeSymbol(query) {
+		return nil, nil, emptyCodeSymbolError(query)
+	}
+	id, cands := e.resolveWriteQueryLocked(query)
 	if id != "" {
 		original := e.rt.ix.Node(id)
 		return &rememberNodePlan{ref: &index.NodeRef{
@@ -510,7 +937,8 @@ func (e *Engine) planRememberNodeLocked(query string) (*rememberNodePlan, []stri
 	}
 	if len(cands) > 1 {
 		return nil, nil, kbErr("NODE_NOT_FOUND",
-			"符号 "+query+" 有多个候选:"+strings.Join(cands, "、"), "用完整节点 ID 重试")
+			"符号 "+query+" 有多个候选",
+			nodeCandidateHint("用完整节点 ID 重试", cands))
 	}
 	plan, err := e.planNewSymbolLocked(query)
 	if err != nil {
@@ -519,7 +947,7 @@ func (e *Engine) planRememberNodeLocked(query string) (*rememberNodePlan, []stri
 	return &rememberNodePlan{
 		ref:        &index.NodeRef{ShardRel: plan.shardRel, Node: cloneModelNode(&plan.node)},
 		fileEnsure: cloneModelNode(plan.fileNode),
-	}, []string{"节点 " + plan.node.ID + " 为新符号增量落锚自动创建"}, nil
+	}, []string{"节点 " + plan.node.ID + " 为新源码节点增量落锚自动创建"}, nil
 }
 
 func (e *Engine) commitRememberNodeLocked(plan *rememberNodePlan) error {
@@ -604,6 +1032,17 @@ func (e *Engine) RecordChange(a ChangeArgs, sid, author string) (out string, err
 		return "", kbErr("INVALID_ARGUMENT", "nodes/what/why 必填",
 			"一个逻辑修改=一条记录,nodes 首位为主节点")
 	}
+	var warns []string
+	for i := range a.Nodes {
+		original := strings.TrimSpace(a.Nodes[i])
+		a.Nodes[i] = normalizeCodeNodeQuery(a.Nodes[i])
+		if explicitEmptyCodeSymbol(a.Nodes[i]) {
+			return "", emptyCodeSymbolError(a.Nodes[i])
+		}
+		if original != a.Nodes[i] {
+			warns = append(warns, "节点 "+original+" 已按无歧义语法规范化为 "+a.Nodes[i])
+		}
+	}
 	// 决策链校验(impl §7.3)。
 	if a.Overturns != "" {
 		if strings.TrimSpace(a.Rebuttal) == "" {
@@ -630,7 +1069,6 @@ func (e *Engine) RecordChange(a ChangeArgs, sid, author string) (out string, err
 		}
 	}
 
-	var warns []string
 	var reanchored, orphaned, pendingAnchor, created []string
 
 	// 【第一遍:纯解析与校验,不落任何盘】——任何会失败的分支(多候选、新符号解析
@@ -646,10 +1084,19 @@ func (e *Engine) RecordChange(a ChangeArgs, sid, author string) (out string, err
 	}
 	var actions []nodeAction
 	resolved := make([]string, 0, len(a.Nodes))
+	resolvedSeen := map[string]bool{}
 	for _, q := range a.Nodes {
-		id, cands := e.resolveQueryLocked(q)
+		id, cands := e.resolveWriteQueryLocked(q)
 		switch {
 		case id != "":
+			if id != q {
+				warns = append(warns, "节点 "+q+" 已唯一解析为规范 ID "+id)
+			}
+			if resolvedSeen[id] {
+				warns = append(warns, "重复节点 "+id+" 已合并")
+				continue
+			}
+			resolvedSeen[id] = true
 			ref := e.rt.ix.Node(id)
 			cur := e.currentAnchorLocked(ref)
 			act := nodeAction{id: id, shardRel: ref.ShardRel}
@@ -667,13 +1114,21 @@ func (e *Engine) RecordChange(a ChangeArgs, sid, author string) (out string, err
 			actions = append(actions, act)
 			resolved = append(resolved, id)
 		case len(cands) > 1:
-			return "", kbErr("NODE_NOT_FOUND", "符号 "+q+" 有多个候选:"+strings.Join(cands, "、"),
-				"用完整节点 ID")
+			return "", kbErr("NODE_NOT_FOUND", "符号 "+q+" 有多个候选",
+				nodeCandidateHint("用完整节点 ID", cands))
 		default: // 情形② 新增符号:先规划(可能失败:解析错/符号不在/多命中),不落盘
 			plan, err := e.planNewSymbolLocked(q)
 			if err != nil {
 				return "", err
 			}
+			if plan.node.ID != q {
+				warns = append(warns, "节点 "+q+" 已按源码唯一解析为规范 ID "+plan.node.ID)
+			}
+			if resolvedSeen[plan.node.ID] {
+				warns = append(warns, "重复节点 "+plan.node.ID+" 已合并")
+				continue
+			}
+			resolvedSeen[plan.node.ID] = true
 			actions = append(actions, nodeAction{id: plan.node.ID, kind: "create",
 				newNode: &plan.node, fileEnsure: plan.fileNode, shardRel: plan.shardRel})
 			created = append(created, plan.node.ID)
@@ -761,11 +1216,15 @@ func (e *Engine) RecordChange(a ChangeArgs, sid, author string) (out string, err
 	for ids[chID] {
 		chID = model.NewChangeID(e.now())
 	}
+	var canonicalRemaps []model.Remap
+	if remapPlan != nil {
+		canonicalRemaps = remapPlan.canonical
+	}
 	change := model.Change{
 		ID: chID, Nodes: resolved, At: e.now().UTC(),
 		Task: a.Task, What: a.What, Why: a.Why,
 		Rejected: a.Rejected, Overturns: a.Overturns, Rebuttal: a.Rebuttal,
-		Remaps: a.Remaps, Verified: a.Verified, Author: author,
+		Remaps: canonicalRemaps, Verified: a.Verified, Author: author,
 		Commit: gitHead(e.Store.RepoRoot()), EffectsVersion: 1,
 	}
 	// prepared WAL 必须在首个分片写之前包含全部目标，包括最后才追加的月
@@ -1200,6 +1659,11 @@ type remapApplyPlan struct {
 	edits     map[string]*remapEdit
 	removeSet map[string]bool
 	rawMoves  []remapRawMove
+	// canonical is the exact remap truth that was validated and executed. Never
+	// persist the caller spelling here: accepted conveniences such as ./, \\ or
+	// trailing () are not portable node IDs and would make our own journal fail
+	// bundle validation later.
+	canonical []model.Remap
 }
 
 type remapRawMove struct {
@@ -1222,10 +1686,11 @@ func (e *Engine) planRemapsLocked(remaps []model.Remap, plannedNodes map[string]
 		raw      model.Remap
 	}
 	resolveTarget := func(q string) (string, []string) {
+		q = normalizeCodeNodeQuery(q)
 		if plannedNodes[q] != nil {
 			return q, nil
 		}
-		if id, cands := e.resolveQueryLocked(q); id != "" || len(cands) > 0 {
+		if id, cands := e.resolveWriteQueryLocked(q); id != "" || len(cands) > 0 {
 			return id, cands
 		}
 		qFile, qSym := model.SplitNodeID(q)
@@ -1246,7 +1711,15 @@ func (e *Engine) planRemapsLocked(remaps []model.Remap, plannedNodes map[string]
 	resolved := make([]resolvedRemap, 0, len(remaps))
 	sources := map[string]bool{}
 	for _, rm := range remaps {
-		fromID := e.rt.ix.ResolveNodeID(rm.From)
+		rm.From = normalizeCodeNodeQuery(rm.From)
+		if explicitEmptyCodeSymbol(rm.From) {
+			return nil, emptyCodeSymbolError(rm.From)
+		}
+		fromID, fromCandidates := e.resolveWriteQueryLocked(rm.From)
+		if fromID == "" && len(fromCandidates) > 1 {
+			return nil, kbErr("NODE_NOT_FOUND", "remaps.from "+rm.From+" 对应多个现任节点",
+				nodeCandidateHint("拆分血缘不能静默选一支；用完整现任节点 ID 明确申报", fromCandidates))
+		}
 		fromRef := e.rt.ix.Node(fromID)
 		if fromID == "" || fromRef == nil {
 			return nil, kbErr("NODE_NOT_FOUND", "remaps.from "+rm.From+" 不存在", "核对节点 ID")
@@ -1260,11 +1733,16 @@ func (e *Engine) planRemapsLocked(remaps []model.Remap, plannedNodes map[string]
 		}
 		rr := resolvedRemap{fromID: fromID, fromNode: fromRef.Node, raw: rm, toByName: map[string]string{}}
 		seenTo := map[string]bool{}
-		for _, to := range rm.To {
+		for _, rawTo := range rm.To {
+			to := normalizeCodeNodeQuery(rawTo)
+			if explicitEmptyCodeSymbol(to) {
+				return nil, emptyCodeSymbolError(to)
+			}
 			toID, cands := resolveTarget(to)
 			if toID == "" {
 				if len(cands) > 1 {
-					return nil, kbErr("NODE_NOT_FOUND", "remaps.to "+to+" 有多个候选", "用完整节点 ID")
+					return nil, kbErr("NODE_NOT_FOUND", "remaps.to "+to+" 有多个候选",
+						nodeCandidateHint("拆分血缘不能静默选一支；用完整节点 ID", cands))
 				}
 				return nil, kbErr("NODE_NOT_FOUND", "remaps.to "+to+" 不存在",
 					"目标符号须已在代码中或列进本次 nodes 完成增量落锚")
@@ -1278,6 +1756,7 @@ func (e *Engine) planRemapsLocked(remaps []model.Remap, plannedNodes map[string]
 			}
 			seenTo[toID] = true
 			rr.to = append(rr.to, toID)
+			rr.toByName[rawTo] = toID
 			rr.toByName[to] = toID
 			rr.toByName[toID] = toID
 		}
@@ -1331,6 +1810,17 @@ func (e *Engine) planRemapsLocked(remaps []model.Remap, plannedNodes map[string]
 				return nil, kbErr("NODE_NOT_FOUND", "remaps.entries 目标 "+dst+" 不在 to 列表", "核对映射")
 			}
 		}
+		canonical := model.Remap{
+			From: rr.fromID,
+			To:   append([]string(nil), rr.to...),
+		}
+		if len(rr.raw.Entries) > 0 {
+			canonical.Entries = make(map[string]string, len(rr.raw.Entries))
+			for entryID, dst := range rr.raw.Entries {
+				canonical.Entries[entryID] = rr.toByName[dst]
+			}
+		}
+		plan.canonical = append(plan.canonical, canonical)
 		lineage := appendUnique(append([]string{}, rr.fromNode.Lineage...), rr.fromID)
 		for i := range rr.fromNode.Entries {
 			en := rr.fromNode.Entries[i]

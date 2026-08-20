@@ -106,6 +106,52 @@ func DecodeWithLimits(r io.Reader, limits Limits) (*Snapshot, error) {
 // between records, vector chunks, and reader calls. It cannot interrupt a
 // Reader already blocked inside Read.
 func DecodeWithLimitsContext(ctx context.Context, r io.Reader, limits Limits) (*Snapshot, error) {
+	return decodeWithLimitsContext(ctx, r, limits, nil, true)
+}
+
+// DecodeExpectedWithLimitsContext is DecodeWithLimitsContext with an
+// authenticated outer-container shape. The inner header must match that shape
+// before the decoder allocates its matrix. Container formats can therefore
+// reserve the exact declared matrix size without trusting a corrupt inner
+// record count or dimension field.
+func DecodeExpectedWithLimitsContext(ctx context.Context, r io.Reader, expectedRecords, expectedDimensions int, limits Limits) (*Snapshot, error) {
+	if expectedRecords < 0 || expectedDimensions <= 0 {
+		return nil, fmt.Errorf("%w: expected shape must have non-negative records and positive dimensions", ErrInvalidInput)
+	}
+	expected := decodeExpectedShape{records: uint64(expectedRecords), dimensions: uint64(expectedDimensions)}
+	return decodeWithLimitsContext(ctx, r, limits, &expected, true)
+}
+
+// ScanRecordMetadataExpectedWithLimitsContext validates the complete encoded
+// index, including every normalized vector and the checksum, while retaining
+// only record metadata and one vector row at a time. The authenticated outer
+// shape is checked before allocation. This is intended for bounded planning
+// paths that need exact record identities without materializing a second full
+// matrix.
+func ScanRecordMetadataExpectedWithLimitsContext(ctx context.Context, r io.Reader, expectedRecords, expectedDimensions int, limits Limits) ([]RecordMetadata, error) {
+	if expectedRecords < 0 || expectedDimensions <= 0 {
+		return nil, fmt.Errorf("%w: expected shape must have non-negative records and positive dimensions", ErrInvalidInput)
+	}
+	expected := decodeExpectedShape{records: uint64(expectedRecords), dimensions: uint64(expectedDimensions)}
+	snapshot, err := decodeWithLimitsContext(ctx, r, limits, &expected, false)
+	if err != nil {
+		return nil, err
+	}
+	records := make([]RecordMetadata, len(snapshot.records))
+	for i, record := range snapshot.records {
+		records[i] = RecordMetadata{
+			ID: record.id, NodeID: record.nodeID, Kind: record.kind, SourceHash: record.sourceHash,
+		}
+	}
+	return records, nil
+}
+
+type decodeExpectedShape struct {
+	records    uint64
+	dimensions uint64
+}
+
+func decodeWithLimitsContext(ctx context.Context, r io.Reader, limits Limits, expectedShape *decodeExpectedShape, retainMatrix bool) (*Snapshot, error) {
 	if ctx == nil {
 		return nil, fmt.Errorf("%w: nil context", ErrInvalidInput)
 	}
@@ -129,6 +175,10 @@ func DecodeWithLimitsContext(ctx context.Context, r io.Reader, limits Limits) (*
 	dimensions, count, payloadBytes, err := parseHeader(header, limits)
 	if err != nil {
 		return nil, err
+	}
+	if expectedShape != nil && (count != expectedShape.records || uint64(dimensions) != expectedShape.dimensions) {
+		return nil, corruptf("header shape records=%d dimensions=%d does not match outer shape records=%d dimensions=%d",
+			count, dimensions, expectedShape.records, expectedShape.dimensions)
 	}
 	elements, vectorBytes, err := checkedVectorSize(count, dimensions, limits)
 	if err != nil {
@@ -164,7 +214,13 @@ func DecodeWithLimitsContext(ctx context.Context, r io.Reader, limits Limits) (*
 		return nil, err
 	}
 	metas := make([]metadata, recordCount)
-	vectors := make([]float32, elements)
+	var vectors []float32
+	var vectorRow []float32
+	if retainMatrix {
+		vectors = make([]float32, elements)
+	} else {
+		vectorRow = make([]float32, int(dimensions))
+	}
 	seen := make(map[string]struct{}, recordCount)
 	decoder := payloadDecoder{ctx: ctx, r: payload, limits: limits}
 	dimensionsInt := int(dimensions)
@@ -203,14 +259,18 @@ func DecodeWithLimitsContext(ctx context.Context, r io.Reader, limits Limits) (*
 		if _, err := io.ReadFull(payload, sourceHash[:]); err != nil {
 			return nil, corruptf("read record %d source hash: %v", i, err)
 		}
-		start := i * dimensionsInt
-		if err := readVector(ctx, payload, vectors[start:start+dimensionsInt]); err != nil {
+		values := vectorRow
+		if retainMatrix {
+			start := i * dimensionsInt
+			values = vectors[start : start+dimensionsInt]
+		}
+		if err := readVector(ctx, payload, values); err != nil {
 			if isContextError(err) {
 				return nil, err
 			}
 			return nil, corruptf("read record %q vector: %v", id, err)
 		}
-		if err := validateNormalizedVectorContext(ctx, vectors[start:start+dimensionsInt]); err != nil {
+		if err := validateNormalizedVectorContext(ctx, values); err != nil {
 			if isContextError(err) {
 				return nil, err
 			}

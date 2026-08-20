@@ -23,7 +23,7 @@ iknowledge stdio  --repo /path/to/repo                              # 推荐接�
 iknowledge serve  --repo /path/to/repo [--addr 127.0.0.1:<port>] [--auth] [--allow-insecure-bind]
 iknowledge init   --repo /path/to/repo [--reanchor-all]            # 骨架秒建(纯 AST,零 LLM);批量重锚见 §6 第 7 步
 iknowledge status --repo /path/to/repo [--prompt]                  # 覆盖率/新鲜度/债务统计;--prompt 打印纪律提示词
-iknowledge doctor --repo /path/to/repo [--deploy] [--strict]       # 配置/parser/部署自检
+iknowledge doctor --repo /path/to/repo [--deploy] [--strict]       # 配置/parser/Git 正本/WIP/部署进程与构建自检
 iknowledge brief --repo /path/to/repo [--budget 1200]              # 防投毒数据框内的一屏 Markdown;严守 300..4000 预算
 iknowledge precheck --repo /path/to/repo [--working] [--strict]    # 源码增改删逐文件关联相对 HEAD 新增 journal nodes;缺省只告警
 iknowledge setup  --repo /path/to/repo                             # 打印 MCP/纪律/hook/Codex/pre-commit 片段,只打印不代写
@@ -54,6 +54,11 @@ ReadHeader/Read/Idle/**Write**Timeout;WriteTimeout 按 self scout 上限扩展�
   "url": "http://127.0.0.1:<port>/mcp/main?repo=<url-encoded repo 绝对路径>" } } }
 ```
 
+  Codex 的 repo 专属 stdio 段缺省打印到 `<repo>/.codex/config.toml`,并同时固定绝对
+  `--repo` 与 `cwd=<repo>`；项目须由用户在 Codex 中标为 trusted。只有用户明确希望每个
+  无关 Codex 项目也启动该知识库时,才把同一段放入 `~/.codex/config.toml`。全局配置不是
+  repo MCP 的便利默认值,否则每个 task 都会多拉一条无关 bridge。
+
 - **连错仓库防护(定案)**:`initialize` 结果与 `kb_status` 都返回 `repoRoot` 绝对路径;
   URL 带 `?repo=` 参数时服务端校验,不匹配返回 `KB_ERR:WRONG_REPO`——把"agent 连上了
   别的仓库的服务、把 B 仓知识写进 A 仓并随 git 固化"从静默事故变成硬错误。
@@ -68,6 +73,15 @@ ReadHeader/Read/Idle/**Write**Timeout;WriteTimeout 按 self scout 上限扩展�
   绑定的短期 `IKnowledgeSession`;每条 stdio 业务请求前重验当前 listener。长期 identity
   永不发给未知端口。仓外 auth token 同时是持久化 Bearer 模式标记:后台不在时必须
   重启为 `serve --auth`,不得静默降级。客户端配置仍零密钥。
+  daemon 构造时固定捕获 version/revision/dirty 与当前 executable SHA-256；stdio 先完成
+  listener 双向 HMAC 认证,再由 `GET /runtime` 读取该构建身份、repo、启动时间与会话数。
+  bridge 在转发前比较当前
+  executable 与 daemon generation：不同时经独立 scope 的本机 HMAC session 调
+  `POST /runtime/shutdown`,旧 daemon 停收新请求、取消可取消的长读/embedding并在 10s 内
+  排空原子写，listener 释放后由 bridge 自动拉起当前构建。没有 runtime endpoint 的历史
+  daemon 不接受猜测式/未认证停服：首次跨越该版本时 fail closed,由 `doctor --deploy`
+  标明后人工优雅停止一次。`initialize.serverInfo` 同步返回构建身份,避免“磁盘已升级、常驻
+  进程仍跑旧码”长期不可见。
   桥随会话退场,serve 留守供 hook/只读腿/后续会话复用——**用户视角零服务管理,
   机器重启后下一个 AI 会话自动带起一切**。底层仍是同一个 HTTP 常驻实例
   (hook 注入/多客户端共享/单一写入口/子代理只读腿都需要它),只是启动权交给了客户端。
@@ -111,7 +125,7 @@ ReadHeader/Read/Idle/**Write**Timeout;WriteTimeout 按 self scout 上限扩展�
 ```
 cmd/iknowledge/main.go       # CLI 解析与装配(薄 main 风格)
 internal/
-  buildinfo/ # CLI/MCP 共用构建版本、revision、dirty 元数据;release 以 -ldflags -X 注入 tag
+  buildinfo/ # CLI/MCP 共用版本/revision/dirty 与 executable SHA-256;release 以 -ldflags -X 注入 tag
   model/    # 纯数据:Node/Entry/Change/WIP 结构体、Status/Confidence 枚举、schema 版本
   parser/   # Parser 插件接口 + 多语言实现;符号提取、代码单元、语义哈希、调用引用提取
   store/    # 文件存储:.knowledge/ 布局的读写、journal 追加、原子写、惰性重载、写者互斥锁
@@ -322,8 +336,13 @@ revert 可精确比较当前最终态;任何后续编辑都会形成冲突而不
   ② 已缓存文件按 mtime+size 快查内容变更,变了才重读(size 兜住同秒两次写入的 mtime 粒度盲区)。
   ①② 对 **tree 分片与 journal 月份文件同等适用**——checkout 后 journal 常是同名但内容不同
   (不增不删、仅内容变),必须经 ② 重读,否则 recall(history) 会持续返回另一分支的幽灵决策链。
-  索引(index 包)随重读增量更新。
-  源码文件不在此监听——源码新鲜度由读取时锚点对账负责(§7.3 kb_recall)。
+  对账后以 generation 快路径发布：project/tree/journal/flow 的解码真相都未变化时复用旧
+  immutable index generation,不再每请求 `index.Build`；WIP 变化只换 WIP 快照。只有真相
+  输入变化才重建索引。源码不纳入 store 清单,但每请求对“含活跃知识或 pending anchor”的
+  有界文件集按真实字节做 SHA-256 manifest；manifest 未变就不调 parser/reconcile，同尺寸替换
+  与恢复 mtime 的 checkout 仍会被发现。只有 tree 锚定真相或该 manifest 变化才对账源码；若
+  reconcile 写回分片,同一请求立刻推进 cache 基线并发布一个新 index generation,避免下一请求
+  把自身写入误判为外部变化。journal/flow/WIP 的独立变化不触发全源码解析。
 - **合并冲突容错(定案)**:tree 分片不设 merge driver(结构化 YAML 无可靠的行级自动合并)。
   读到无法解析的分片(含 `<<<<<<<` 冲突标记)→ 隔离为 conflict 状态,kb_status 报告,
   涉及节点的 recall 返回"该分片有未解决的合并冲突,知识暂不可用,请人工解决 diff"。
@@ -333,6 +352,12 @@ revert 可精确比较当前最终态;任何后续编辑都会形成冲突而不
   可选语义 preview 另有可删重建、永不进 bundle 的 `vector.idx`(不含类型卡正文/凭据,
   版本头+checksum,0600 安全原子替换);`wip/` 同样 git 排除。
   两者都写进 init 生成的 `.knowledge/.gitignore`。
+- **Git 正本健康(2026-08-20)**:生成 `.knowledge/.gitignore` 只证明局部规则正确,不证明
+  知识已耐久。`doctor` 枚举 project/config/tree/journal/flows/topics 与 merge/ignore 文件,
+  以实际 Git top-level、`check-ignore --no-index` 和 `ls-files` 判定
+  `tracked|partial|untracked|ignored|no-git|unavailable`；外层 `.gitignore` 整体忽略
+  `.knowledge/`、只跟踪部分旧分片、以及非 Git 聚合根都会明确告警。只有全部持久正本已进入
+  Git index 才兑现“随分支/PR/团队共享”；非 Git 模式仍可本机使用,但不冒充这项保证。
 - **仓外用户私有态**:auth token、local identity、scout trust、事务 WAL 按 canonical repo
   path 的 SHA-256 分仓。可选语义 preview 的 provider endpoint/model/dimensions/
   revision/enabled、具体 query_profile、rebuild_policy 与 top_k/min_score/max_vector_mib/timeout_seconds 也只写这里的
@@ -517,7 +542,9 @@ type Parser interface {
 - **会话识别**(读取台账/过时警报的基础):`initialize` 响应带 `Mcp-Session-Id` 头,客户端
   后续请求回带(streamable-http 标准行为);不回带则视为匿名连接,台账类功能对其退化关闭。
   **(新增)** 未知/失效的 `Mcp-Session-Id` 返回 HTTP 404——规范要求,客户端据此自动重新
-  initialize;服务端升级重启后存量会话由此自愈,不是莫名报错。容忍并忽略客户端发来的
+  initialize;stdio bridge 缓存首个成功 initialize 请求,404 时先重新做本机身份验证、隐藏
+  re-initialize,再在下一次身份验证后安全重放原业务请求一次。服务端升级重启后存量会话
+  由此自愈,不是莫名报错。容忍并忽略客户端发来的
   `MCP-Protocol-Version` 头。
 - **(新增)** capabilities 声明 `tools: { listChanged: true }`,分期上新工具/升级后发
   `notifications/tools/list_changed`(部分客户端忽略亦无害);发布说明仍建议"升级后重启 agent 会话"。
@@ -525,7 +552,7 @@ type Parser interface {
   (如 "claude-code"/"codex"),不接受 AI 自报,防冒名(同机恶意进程伪造 clientInfo 不在
   一期威胁模型内,见 §1 威胁边界)。
 - `initialize` 返回:`{protocolVersion: "2025-06-18", capabilities: {tools:{listChanged:true}},
-  serverInfo: {name:"knowledge", version}, repoRoot}` + 会话头;附 `instructions` 字段带一段
+  serverInfo: {name:"knowledge", version, revision, dirty, executableSHA256}, repoRoot}` + 会话头;附 `instructions` 字段带一段
   最短纪律(读前 recall、改后 record_change、知识仅导航)。**instructions 定位为增强而非依赖**
   ——纪律的正身是 §9 的粘贴提示词(客户端是否把 instructions 注入上下文,见下方实测清单)。
 - **hook 注入端点(非 MCP;端点随全量实现交付,客户端接线轮 25 定案)**:
@@ -549,6 +576,12 @@ type Parser interface {
   任务书作者附 curl 只读腿;**侦查简报自带降级门**(与纪律段首句同哲学):简报里的
   kb_* 指令对受限子代理是死指令——简报尾附只读腿 URL(服务端自知地址)+ 代沉淀/
   代交卷条款。
+- **本机构建控制面(非 MCP;2026-08-20)**:bridge 必须先经 loopback 双向 HMAC 证明当前
+  listener 属于本 repo,才读取 `GET /runtime`；该只读端点仍受通常的 Origin/可选 Bearer guard。
+  `POST /runtime/shutdown` 更进一步,无论 Bearer 是否启用都只接受为该 path 新签发的 HMAC 短
+  session,不接受匿名、不复用业务 scope,也不向未知 listener 发送根身份。前者返回有界构建
+  身份,后者只排空并退出已证明属于本 repo 的 daemon；用途限 stdio 自动换代与
+  `doctor --deploy` 诊断。
 - **hook 写事件记账提醒(2026-07-04 增)**:hook 桥透传 tool_name(&tool= 参数),
   Edit/Write/MultiEdit/NotebookEdit 触发的注入在尾部追加记账提醒(预算裁剪之后,
   提醒必须存活)——"改完的当下"是记账遵守率的黄金时点,纪律依赖的又一机械解。
@@ -624,7 +657,7 @@ type Parser interface {
 | `kb_record_change` | 修改代码后的变更记录(决策链;nodes 复数) | main | 一(remaps 二期) |
 | `kb_verify` | confirm/refute/obsolete 一条知识(勘误与污染回收) | main | 二 |
 | `kb_revert` | 结构化 effects 驱动的事务化追加式撤销 | main | 全量后增 |
-| `kb_task` | 任务态 start/update/complete/get | main+scout | 二 |
+| `kb_task` | 任务态 start/update/complete/abandon/get | main+scout | 二 |
 | `kb_investigate` | 侦查:委派模式秒回简报(主),自派阻塞(备) | main | 二 |
 | `kb_submit_findings` | 侦查 agent 交卷(落库销 job) | main+scout(委派模式下侦察兵连 main) | 二 |
 | `kb_adopt` | 孤儿节点处置:claim(建 remap 认领)/ bury(确认作废) | main | 二 |
@@ -672,28 +705,40 @@ Change/Rejected/WIP/Flow/Findings 对应文本字段同样带标签,结构性 ID
       热度 =(1 + git 90 天改动次数)×(1 + 跨文件被调入边数),+1 平滑使非 git 仓库/
       新文件退化为单因子;只列有未消化符号的文件,含消化比;git 统计与调用图均锁外/现算。
       消化本身仍由 AI 会话做——本清单只供优先级,也是 M1.4 种子消化的选点依据)、
-      活跃 wip 列表(二期)、维护欠账队列长度(二期)、schema 版本;
-      semantic 纯本地健康(`unconfigured/disabled/configured-no-index/ready/partial/
-      stale-source/stale-provider/corrupt`)、model/query profile/rebuild policy、dimensions/
-      records/built_at/provider=unchecked 与精确 next_action。状态读取不读 API key、不探测
-      provider、不解码大 vector payload;`unchecked` 不是故障。
+      活跃 wip 列表(二期)、维护欠账队列长度(二期)、schema 版本。semantic 例行控制面只在
+      既有 ai-local/ai-remote 授权下通过本地预检、有可执行同步动作时追加
+      `semantic_action: kb_semantic action=sync`;正常 semantic 状态完全静默，不展开
+      model/provider/records 等诊断。启用后确需人工处理的退化只追加精简 `semantic_attention`，
+      agent 仅在当前任务依赖语义召回或用户询问状态时说明一次。详细健康仅在用户询问或排障时
+      显式调用 `kb_semantic status`。两条状态路径都不读 API key、不探测 provider；常规只读
+      wrapper/≤64KiB metadata。首次评估尚无缓存的大仓 partial 时，为精确判断 delta 会流式完整
+      校验旧 payload，但只保留一行向量与紧凑 record metadata，不物化第二块完整矩阵。
+      当前 Mcp-Session-Id 已 claim 过 sync 后,即使全局 health 仍需同步,本会话的 kb_status 也
+      移除 `semantic_action`；其他库健康内容不变,防 agent 被同一动作反复触发。
       未初始化时:明确提示"先调 kb_init"。
 ```
 
 #### kb_semantic(可选语义 preview 后增)
 ```
 入参: { "action": "status"|"sync" }
-行为: status 与 kb_status 共用纯本地健康快照,永不联网。
+行为: status 与 kb_status 共用纯本地健康快照,永不联网；它是显式诊断面，展示完整 health/
+      model/profile/policy/dimensions/records/built_at/next_action，并以
+      `provider_probe: deferred (offline status; not an error)` 表达未联网探测而非故障。
       sync 是唯一 MCP 语义写动作,只重建可删派生索引,绝不改 endpoint/model/profile/
       policy/enabled,不下载或切换模型。仅当用户此前经本机 CLI 把 canonical repo 的
       rebuild_policy 设为 ai-local(loopback)或 ai-remote(非回环 HTTPS),且 health
-      next_action 明确要求 `kb_semantic action=sync` 时允许;manual 拒绝。ready 直接返回
+      控制面明确给出 `semantic_action: kb_semantic action=sync` 时允许;manual 拒绝。ready 直接返回
       无需 provider。server 以 session mutex 在同一 Mcp-Session-Id 下原子 claim 第一次
-      sync 尝试;成功、未授权或 provider 失败都会消耗该会话额度,并发/后续调用在 provider
-      前返回 SEMANTIC_SYNC_ALREADY_ATTEMPTED。交互式路径总时限 8min、最多 3000 source
-      card/100 batch；超限在首次 probe 前返回，status 直接建议 CLI rebuild。CLI semantic
-      rebuild 不受此闸门影响。
-返回: 本地状态 / rebuild 报告。provider、取消、模型漂移及原子 rename 前的构建/写入失败
+      sync 尝试;成功、未授权或 provider 失败都会消耗该会话额度。并发/后续调用不再返回
+      可重试错误,而是成功的确定性 no-op：`skipped/already-attempted-in-session` 且
+      `provider_contacted=false`；同会话始终只有 claim 获胜者可能接触 provider。交互式路径总时限 8min、最多为 3000 条待
+      embedding 的新增/变化卡、100 batch。若存在静态绑定可复用的旧 generation，sync 会先
+      完整校验 payload/checksum/codec，再按 RecordID+NodeID+lane(kind)+SourceHash 精确复用
+      未变向量；删除卡无需文档 embedding。无有效旧代时仍是完整重建：总 source 不超过 3000
+      可在同一次 MCP sync 完成，超过 3000 才在 provider 前拒绝；精确 delta 超过 3000 也在 provider 前拒绝。若旧代直到初始双 canary
+      才发现向量空间漂移，大仓会止于这一次无文档 probe 并保留旧代，不发送文档批次。CLI
+      semantic rebuild 不受此闸门影响且保持强制完整重建。
+返回: 本地状态 / rebuild 报告(`records/reused/embedded`)。provider、取消、模型漂移及原子 rename 前的构建/写入失败
       保留上一 generation；rename 成功后的目录 fsync/post-commit 失败不承诺回滚，后续以
       binding/checksum 拒绝坏代，并可用 semantic clear/rebuild 恢复。
 ```
@@ -814,6 +859,12 @@ Change/Rejected/WIP/Flow/Findings 对应文本字段同样带标签,结构性 ID
       记录照收,返回附警示"你的修改可能基于过时读取,建议重读原文核对"。
       what/why/rejected 不过指令形态 lint(2026-07-04 轮 25 定案):账本如实记录人话,
       拒收即毁账;防投毒靠渲染侧数据框架(§12.8)+ framed 对伪造框架标记的消毒兜底。
+      nodes 先做不改变对象的确定性语法规范化(去首尾空白、repo 内 `./`、反斜杠与调用侧
+      尾随 `()`),再按写侧严格 resolver 处理：历史 ID 只有唯一 current heir 才采用，split
+      lineage/同名方法等歧义绝不选第一项；最多返回 5 个排序稳定的规范候选。源码当前已经
+      存在但骨架尚未收录的文件/符号,由配置内 parser 对真实源码唯一确认后与 journal 在同一
+      事务原子建锚；重复解析到同一规范 ID 的 nodes 合并并告警。路径 typo、生成代码、exclude、
+      symlink、无 parser 或不唯一符号一律拒绝,不得为提高成功率静默降级挂到相似文件/文件节点。
 效果: 先解析全部 nodes/remaps 并构造最终分片克隆,任何歧义、非法 entry 分派、目标冲突
       都在首个写入前拒绝。随后按确定顺序保存分片,全部成功才把 journal 当提交标记追加;
       Save/reload/append 任一失败恢复所有原始字节(包含“rename 已成但目录 fsync 报错”的
@@ -963,13 +1014,26 @@ Change/Rejected/WIP/Flow/Findings 对应文本字段同样带标签,结构性 ID
 
 #### kb_task(二期)
 ```
-入参: { "action": "start"|"update"|"complete"|"get", "wip": {...} }
+入参: { "action": "start"|"update"|"complete"|"abandon"|"get", "wip": {...},
+        "owner"?: "精确 WIP owner", "reason"?: "代收口依据" }
 行为: start → 建 wip(owner=`clientInfo.name@Mcp-Session-Id`);update → 改 done/todo/touching;
       complete → 归档为变更记录、清空 wip;get → 读全部活跃 wip。
+      缺省仍只操作当前会话,保持原语义。只有 complete/abandon 可指定**其他** owner；
+      服务端在任何可能写入的 Sync 前只读预检、并在 writer lock 内二次核验：目标 owner
+      必须精确存在、Updated 非零且距今 ≥7 天、reason 非空。目标刚被 update/收口、未满
+      7 天、年龄未知、owner 猜错、空 reason 或 start/update/get 携带 owner 均 fail closed，
+      WIP/journal 零写入。代 complete 把 `owner + reason` 持久化到 Change.Verified，且沿用
+      prepared/committed WAL 将 journal 追加与目标 WIP 删除原子提交；代 abandon 仅删除该
+      owner 的 WIP，仍不写 journal。并发代收口最多一个成功，recent WIP 不可被旁路清理。
       start 在写 WIP 前把 task/intent/plan/todo 组成脱敏 query,调用可选 semantic 的
       risk/history lane 做“历史决策提醒”;touching 直接命中的风险优先,回执附 node/
       facets/refs/cosine。该机制**只告警、不阻断、相似不等于裁决**;provider/索引不可用
       不妨碍建立 WIP,也绝不自动拒绝方案、refute 知识或改代码。调用方取消则在写入前传播。
+      start/update 的 touching 与 record_change 共用保守语法规范化；当前唯一节点/唯一 heir
+      存规范 ID，当前源码可确认但未入骨架的目标存其规范 ID，安全且受 config 管辖的未来文件/
+      符号可带明确警示保留为计划目标，歧义候选拒绝。complete 不在任务归档事务里偷建 tree
+      节点：若未来符号此时已由源码唯一确认但骨架仍缺失，可显式降级到其现存文件节点；未确认
+      typo/歧义不借用相似节点，全部 touching 都不可归档时才显式落 project 并告警。
       任何 recall/map 触碰某 wip 的 touching 节点时自动附带该台账。
       wip 自由文本与 record_change 的 what/why 同口径(轮 25 定案):不过指令形态 lint,
       渲染经数据框架隔离。
@@ -1029,7 +1093,7 @@ Change/Rejected/WIP/Flow/Findings 对应文本字段同样带标签,结构性 ID
       重执行,零额度);真 claude 驱动与 M1.4 一并实测(链路同一条,只差 scout_command)。
 并发与递归护栏: 存在活跃 job 时再调 → KB_ERR:SCOUT_BUSY。这同时就是委派模式的
       递归护栏——侦察兵(连的也是 main 端点)调 kb_investigate 必撞它,深度=1。
-返回: 库内命中 → findings{ conclusion, locations[](node-id 指针), plan, risks,
+返回: 库内命中 → findings{ conclusion, `locations[]`(node-id 指针), plan, risks,
       distilled{remembered: n, wip: id} };未命中 → { jobId, briefing }。均附铁律尾注。
 ```
 
@@ -1053,11 +1117,11 @@ Change/Rejected/WIP/Flow/Findings 对应文本字段同样带标签,结构性 ID
 |------|------|-----------|
 | NOT_INITIALIZED | 库未初始化 | 先调 kb_init |
 | INVALID_ARGUMENT | 入参本身非法(空必填、非法枚举 kind/action/verdict、路径穿越等,轮 24 补——与"节点不存在"区分) | 对照工具 inputSchema 修正参数 |
-| NODE_NOT_FOUND | 节点 ID 不存在(宽松匹配也无唯一命中) | 用 kb_map 确认路径/符号;多候选时按附带列表自选 |
+| NODE_NOT_FOUND | 节点 ID 不存在，或写侧无法从当前源码/血缘唯一确认目标 | 用 kb_map 或附带的最多 5 个稳定规范候选确认；系统不会静默猜 heir 或降级挂到相似文件 |
 | SHARD_CONFLICT | 目标文件分片处于合并冲突/版本不兼容隔离态(轮 24 补:防增量落锚空壳覆盖) | 先人工解决 .knowledge/tree/<file>.yaml 的冲突或升级 iknowledge,再写入 |
 | ANCHOR_STALE | base_hash 乐观校验失败(代码在你读后又变了;仅 kb_remember——record_change 失配不拒收只警示) | 重读原文后按当前代码重试 |
 | NODE_ORPHANED | remember 目标节点的符号已消失 | 符号在新位置则对新节点 remember;认领/送葬走 kb_adopt(二期) |
-| PARSE_FAILED | 该文件当前不可解析(语法错误/改到中间态) | 修完语法后重试;record_change 不受此限 |
+| PARSE_FAILED | 该文件当前不可解析(语法错误/改到中间态) | 已有节点的 record_change 仍可账本优先并标 pending anchor；尚未建锚的新节点无法由源码唯一确认，须修完语法后重试 |
 | SCHEMA_TOO_NEW | 该分片 schema 版本高于二进制 | 升级 iknowledge |
 | WRONG_REPO | URL 的 repo 参数与本服务不符 | 检查 .mcp.json 指向与端口 |
 | BUDGET_EXCEEDED | 条目超 token 预算(附估算值/上限/规则) | 按估算规则精炼或拆分 |
@@ -1155,14 +1219,21 @@ CLI precheck 同源追加 `tool=cli_precheck,source=cli,warnings,blocked`;kb_sta
   profile 会重新 auto,防旧 instruction 泄漏。Qwen profile 只预处理 query,documents 不加
   instruction;具体 profile 进入 settings/embedder fingerprint。
 - **同步 policy/MCP**:`rebuild_policy=manual|ai-local|ai-remote`;manual 缺省且拒绝 MCP sync;
-  ai-local 只允许 loopback,ai-remote 只允许非回环 HTTPS。`kb_status`/`kb_semantic status` 纯
-  本地报告 health/model/profile/policy/dimensions/records/built_at/next_action,不读 key、不探测
-  provider。只有 next_action 明确为 `kb_semantic action=sync` 且 policy 为 ai-* 时,AI 才可
-  每会话 sync 一次;server 在 `Mcp-Session-Id` 下并发安全地硬限制第一次 sync 尝试,首次失败
-  也消耗额度,重复调用零 provider 并返回 `SEMANTIC_SYNC_ALREADY_ATTEMPTED`。sync 只重建派生
-  索引,绝不改配置/下载/切换模型；交互式 sync 总时限 8min、最多 3000 source card/100 batch，
-  status 对超限源直接给 CLI rebuild 而不诱导 AI 消耗唯一尝试。CLI `semantic rebuild` 不受会话
-  闸门影响,始终是用户手动路径。
+  ai-local 只允许 loopback,ai-remote 只允许非回环 HTTPS。日常 `kb_status` 是纯本地、供 agent
+  静默消费的 action-only 控制面：正常态不输出 semantic 诊断，仅在本地预检可执行时追加
+  `semantic_action: kb_semantic action=sync`；启用后的人工介入态只给不含模型/provider/记录数的
+  `semantic_attention`，且仅在当前任务依赖语义召回或用户询问状态时说明一次。完整 health/model/profile/policy/dimensions/records/
+  built_at/next_action 只由用户询问或排障时显式调用的 `kb_semantic status` 展示，其中
+  `provider_probe: deferred (offline status; not an error)` 明确表示未联网；两者都不读 key、
+  不探测 provider。只有控制面给出上述 action 且 policy 为 ai-* 时,AI 才可每会话 sync 一次;
+  server 在 `Mcp-Session-Id` 下并发安全地硬限制第一次 sync 尝试,首次失败
+  也消耗额度；重复/并发输家成功返回 deterministic skipped no-op、明确零 provider,且本会话
+  后续 `kb_status` 抑制 `semantic_action`。sync 只重建派生
+  索引,绝不改配置/下载/切换模型；交互式 sync 总时限 8min、最多 3000 条待 embedding 的
+  新增/变化卡、100 batch。没有安全旧代时把全部当前卡视为 pending：不超过 3000 可在同次 MCP
+  sync 完整重建，超过 3000 才给 CLI rebuild；有候选旧代
+  时 action 可先进入精确校验，若最终 delta 仍超限则在文档请求前拒绝。CLI `semantic rebuild`
+  不受会话闸门影响,始终是用户手动强制完整重建路径。
   配置写另取跨进程排他锁,query/rebuild 每个 HTTP request/batch 只在边界持共享锁并重读完整
   配置；在途请求期间 disable 明确 busy,成功返回后旧授权的排队请求/下一批必在 HTTP 前终止。
   共享锁不覆盖整代 rebuild,所以用户可在批次间撤回授权。
@@ -1186,6 +1257,20 @@ CLI precheck 同源追加 `tool=cli_precheck,source=cli,warnings,blocked`;kb_sta
   持久 metadata **只**存 schema、generation、settings/embedder、document/query probe、source
   fingerprints、dimensions、records、built_at,不单列 raw model/revision;内存完整 immutable
   snapshot 一次替换。
+- **增量同步/旧向量复用**:仅获持久 policy 授权的 MCP sync 可增量物化新 generation；CLI
+  `semantic rebuild` 保持强制完整重建。候选旧代须同时满足 settings/embedder/dimensions 静态
+  绑定、完整 payload checksum/codec 校验，以及当前 document/query 双 canary 一致。逐行只按
+  `RecordID+NodeID+lane(kind)+SourceHash` 完整 identity 复用，仍新建完整不可变 generation；
+  新增/变化卡重新 embedding，删除卡自然消失且没有文档 embedding。旧 wrapper 的校验后 shape
+  与内层 codec header 在矩阵分配前必须一致；旧矩阵实际字节与新 builder 授权同时纳入 transient
+  资源闭环，coordinator 分开记录 total transient 与“可晋升为新 resident”的上限，旧代复用
+  预算不能冒充新 resident；复制结束后释放旧矩阵再发布新 resident。任一 rename 前失败保留
+  旧代，禁止混合向量空间；报告明确返回 `records/reused/embedded`。大仓 partial 的完整本地
+  流式评估会精确缓存 pending；精确 pending/delta 评估（含超限）与 canary block 按
+  `(immutable index identity,source fingerprint,settings)` 有界缓存，任一输入变化自动失效。
+  已经完整 payload 校验确认的 corruption 则另按 immutable index identity 缓存，source/settings
+  变化不能把同一坏文件洗白。两类缓存共同避免新 MCP 会话反复扫描同一 payload、重复失败或
+  重复 canary probe。
 - **双模式同批 canary**:OpenAI-compatible 初始 probe 与每个 rebuild batch 都在同一次 HTTP
   请求携带 document/query 两个 mode 的 canary(最多 30 卡+2 canary);任一批 fingerprint 漂移
   立即放弃整代,原子 writer 前不碰上一索引。普通 query cache miss 同样 query+query-canary
@@ -1217,8 +1302,10 @@ CLI precheck 同源追加 `tool=cli_precheck,source=cli,warnings,blocked`;kb_sta
 - **缓存/status/资源**:`.knowledge/local/vector.idx` 是 0600、带版本头/checksum
   的不可变派生文件,只存指纹 metadata、record table 与 float32,不存正文/key/raw model/
   revision。写入使用专用 `.vector.idx-*.tmp`;rebuild/clear 在 semantic 锁内只回收这个前缀的
-  普通文件，symlink/目录 fail closed，不误删其他临时文件。冷进程 `semantic status` 只校验固定 wrapper 与 `≤64KiB` metadata/binding;
-  payload 的有界 decode 和完整 checksum 校验延迟到首次 semantic recall。source shape 输入
+  普通文件，symlink/目录 fail closed，不误删其他临时文件。冷进程普通 `semantic status` 通常只校验固定 wrapper 与 `≤64KiB` metadata/binding；
+  payload 的有界 decode 和完整 checksum 校验通常延迟到首次 semantic recall。首次评估尚无
+  assessment cache 的大仓 partial status 时，为决定 MCP delta 会以单行缓冲流式扫描并完整校验
+  payload/identity；后续同 key 状态读取复用缓存，不物化完整矩阵。source shape 输入
   合计最多 250,000 items；普通字段、Node ID、reference 分别最多 1MiB、4032 bytes、8065 bytes，
   单引用 lineage 候选最多 4096；source DTO/body 与 output metadata 各 64MiB，单条待格式化内容/
   单张原始知识卡各 1MiB。vector record metadata 另限 64MiB，与 wrapper metadata 的 64KiB
@@ -1227,10 +1314,15 @@ CLI precheck 同源追加 `tool=cli_precheck,source=cli,warnings,blocked`;kb_sta
   daemon 全部仓库合计 provider 在途请求上限为 1、Flat 扫描为 2;拿到 slot 后 query/probe
   会二次查缓存。dimensions
   为 0(auto)或 1..4096,实际 snapshot 为 1..4096;每仓 100k record、vector 512MiB、top_k 100
-  均为硬上限,单次 HTTP timeout 硬上限 30s。MCP sync 另有 8min 总时限、3000 source
-  card/100 batch 上限，超限在首次 probe 前返回；status 会直接指向 CLI rebuild，避免消耗会话
-  唯一尝试。`serve` 在任何 lock/listener 前预检 enabled 仓 `max_vector_mib` 合计≤1024MiB，
-  运行中 hot enable/load/rebuild 仍经共享 coordinator 动态 reserve/release；搜索用 resident lease，
+  均为硬上限,单次 HTTP timeout 硬上限 30s。MCP sync 另有 8min 总时限、3000 条待 embedding
+  卡/100 batch 上限。无安全旧代时全部 source 都是 pending，仅在总量超过上限时于 provider 前拒绝，
+  较小仓库可在同次 MCP sync 完整重建；完整校验后按精确 delta
+  在 provider 前拒绝。唯一例外是候选旧代通过离线校验却在初始双 canary 发现模型空间漂移：
+  大仓会发生一次无文档 probe 后停止，不发文档批次、不替换旧代；同 key 的结论会阻止后续
+  会话重复 probe。`serve` 在任何 lock/listener 前仍预检 enabled 仓 `max_vector_mib` 合计≤1024MiB，
+  运行中 hot enable/load/rebuild 则在外层 metadata 与内层 codec shape 分配前绑定后按实际矩阵
+  字节动态 reserve/release；auto dimensions 且没有旧代时，在 probe 前仍保守使用配置上限。
+  搜索用 resident lease，
   generation 替换不会与仍被引用的旧矩阵无界叠加。typed source manifest 另共享 384MiB
   进程级累计预算（单构造代保守授权 192MiB，发布后按驻留估算记账），构造 gate 与 DTO/card
   处理响应 context 取消；disabled/clear/no-index/shutdown 归还对应额度。工作集有界且超限时
@@ -1280,7 +1372,7 @@ MCP `kb_semantic sync` 是两条显式批量发送类型卡路径,`clear` 只删
 另附操作型 skill `skills/kb-bootstrap`(轮 25,双宿主):装进 `~/.claude/skills/` 与
 `$CODEX_HOME/skills/`(SKILL.md 是两家共同支持的 Agent Skills 格式)后,对任一 agent 说
 "初始化当前项目知识库"即由主 AI 代跑 init/写全部接入配置(Claude Code 三件套 + Codex
-config.toml/AGENTS.md,CODEX_HOME 感知)/nohup 起服务/验证——代写主体是 agent 而非
+项目级 `.codex/config.toml`/`AGENTS.md`,CODEX_HOME 感知;全局段仅用户明确选择)/nohup 起服务/验证——代写主体是 agent 而非
 iknowledge 二进制,与铁律二不冲突(impl §1"由用户/主 AI 自行粘贴"的落地形态)。
 仓库根 `install.sh` 一条命令装机:优先取 release 的 macOS/Linux/Windows ×
 amd64/arm64 预编译资产,只有 `sha256sums.txt`、本资产记录与本机 sha256 工具三者齐全
@@ -1345,11 +1437,17 @@ kb_investigate/kb_task,属文档滞后。hook 自动注入、读取台账、过�
   **双向唯一迁移(孪生函数体不迁、标孤儿)**、record/verify/revert/import 普通失败与
   panic/进程崩溃恢复、Flow/History 代际路由、真实 entry heir/supersedes 链解析、
   重复 Node ID 全隔离、共享 session ledger/callgraph 快照 race、同 author 多 session WIP 隔离、
+  Sync 稳态保留 index generation/源码 manifest 不变时零 reconcile、record_change 严格唯一解析+
+  新文件/符号原子落锚+有界候选且不猜锚、Git truth tracked/ignored/no-git 诊断、
   lint 正反语料表驱动(**必须含 knowledge.md §8.1 的 usage 范例作"不许误杀"回归用例**)。
 - `semantic/vector`(可选语义 preview):fake Embedder 确定性;真实 current/risk/history 类型卡
-  manifest;query profile auto 具体化、三种 sync policy 与同 MCP session 失败后也零重试的硬闸;
-  provider/source fingerprint、partial
-  逐条 source-hash 复用与重建中变代丢弃;immutable snapshot 并发 Search/replace race、三 lane
+  manifest;query profile auto 具体化、三种 sync policy 与同 MCP session 失败后也零重试的硬闸
+  (重复调用成功 no-op/零 provider/status action 抑制);
+  provider/source fingerprint、partial 逐条 source-hash 过滤与重建中变代丢弃;总卡数 >3000 的
+  add/modify/delete 小 delta 增量 sync（删除 `embedded=0`）、delta >3000 provider 前拒绝且旧文件
+  不变、初始 canary 漂移只允许无文档 probe 且绝不混代、完整 record identity 旧向量复用、
+  旧+新矩阵 transient 资源记账、`kb_status` 静默与显式 `kb_semantic status` 分流;
+  immutable snapshot 并发 Search/replace race、三 lane
   一次 Flat 扫描与 lane 内 distinct-node Top-K;截断、坏 checksum、NaN/Inf/零向量、维度/
   计数/乘法溢出/超限文件 fail closed;
   仓外 configure/enable 权限与 canonical-repo 隔离;仓内 config/import/MCP 不能触发外发;
@@ -1361,6 +1459,7 @@ kb_investigate/kb_task,属文档滞后。hook 自动注入、读取台账、过�
   engine 测试另守住 advisory-only 边界;并保留 100+ 真实模型 qrels 晋级门。
 - `mcpserv`:参照 `bridge/mcp_test.go` 的 `httptest` 风格,一期六工具(M1.2 四只读 +
   M1.3 的 remember/record_change)的 happy path + 错误码 + 未知 session 404 +
+  stdio 隐藏 re-initialize、同会话 semantic 幂等 no-op、构建身份与认证 graceful shutdown、
   使用日志落盘(M1.3)。
 - e2e:**fixture 定案**——testdata 存源码树(不嵌套 .git,git 不跟踪嵌套仓库),
   测试 setup 复制进 `t.TempDir()` 后 `git init` + `git add` 再跑全链路:

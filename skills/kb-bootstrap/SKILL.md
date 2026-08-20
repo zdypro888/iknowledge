@@ -24,8 +24,10 @@ description: 一句话初始化/接入/卸载 iknowledge 代码知识库(MCP)。
      `command` 字段直接写第 1 步解析出的**绝对路径**;
    - `<root>/CLAUDE.md`:追加 setup 输出的纪律段(文件里已含"本仓库配有 knowledge MCP"则跳过);
    - `<root>/.claude/settings.json`:把 hooks 片段合并进 `hooks.PostToolUse`(已有相同 `iknowledge hook` command 的条目则跳过)。
-5. **写 Codex 接入(本机存在 Codex 时;判定:`${CODEX_HOME:-$HOME/.codex}` 目录存在)**:
-   - `${CODEX_HOME:-$HOME/.codex}/config.toml`:追加 setup 输出 ④ 的 `[mcp_servers.knowledge]` 段(stdio 形态:`command = "iknowledge"`、`args = ["stdio","--repo","<root>"]`;已有同名段则整体替换升级;该文件已有其他 `[mcp_servers.*]` 条目时,几个仓库共存要把段名改成 `knowledge-<项目名>` 防撞名);
+5. **写 Codex 项目级接入(本机存在 Codex 时;判定:`${CODEX_HOME:-$HOME/.codex}` 目录存在)**:
+   - `<root>/.codex/config.toml`:合并 setup 输出 ④ 的 `[mcp_servers.knowledge]` 段(stdio 形态:`command = "iknowledge"`、`args = ["stdio","--repo","<root>"]`、`cwd = "<root>"`;已有同名段则只替换该段及其 `tools.*` 子段,保留项目其他 Codex 设置)。每个仓库都用自己的同名 `knowledge`,不需要 `knowledge-<项目名>`;
+   - **禁止把带 `--repo <root>` 的 server 写到** `${CODEX_HOME:-$HOME/.codex}/config.toml`:全局 repo server 会被每个 Codex 任务重复拉起,多仓库后造成 bridge 数量和内存成倍增长;
+   - 升级旧接入时,读取 `${CODEX_HOME:-$HOME/.codex}/config.toml`,仅当某个 `[mcp_servers.*]` 的 `args` **精确包含当前 `<root>`** 时,删掉该旧 server 段和它的 `.tools.*` 子段;不动其他仓库或全局通用 server;
    - `<root>/AGENTS.md`:追加与 CLAUDE.md 相同的纪律段(已含则跳过)。Codex 无 hook 注入机制,不写 hooks。
 6. **验证(顺便完成首次拉起)**:stdio 桥会按需自动拉起后台 serve,无需手动起服务。验证一条命令:
    `printf '%s\n' '{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"clientInfo":{"name":"probe"}}}' | iknowledge stdio --repo <root>`
@@ -48,7 +50,8 @@ description: 一句话初始化/接入/卸载 iknowledge 代码知识库(MCP)。
    - `<root>/.mcp.json`:删 `mcpServers.knowledge` 键(删后 `mcpServers` 为空且文件无其他内容则删文件);
    - `<root>/CLAUDE.md` 与 `<root>/AGENTS.md`:删"本仓库配有 knowledge MCP"起到最后一条编号规则止的整段;
    - `<root>/.claude/settings.json`:删 `hooks.PostToolUse` 里 command 含 `iknowledge hook` 的条目(数组因此为空则连同空壳一起收干净);
-   - `${CODEX_HOME:-$HOME/.codex}/config.toml`:删 `[mcp_servers.knowledge]`(或本仓库对应的 `knowledge-<项目名>`)整段。
+   - `<root>/.codex/config.toml`:删 `[mcp_servers.knowledge]` 及其 `.tools.*` 子段;文件还有其他项目设置就保留;
+   - `${CODEX_HOME:-$HOME/.codex}/config.toml`:兼容清理旧版接入——只删 `args` 精确指向当前 `<root>` 的 `[mcp_servers.*]` 段及其 `.tools.*` 子段,绝不按名字猜测或影响其他仓库。
 4. **汇报**:列出实际删除/修改的每个文件;提醒机器级卸载(二进制与 skill 本体)另有一条命令:
    `curl -fsSL https://raw.githubusercontent.com/zdypro888/iknowledge/main/uninstall.sh | sh`。
 

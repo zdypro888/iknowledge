@@ -3,6 +3,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -229,6 +230,7 @@ func runServe(args []string) int {
 		cancel context.CancelFunc
 	}
 	var units []unit
+	runtimeShutdown := make(chan struct{}, 1)
 	// Startup cleanup is quiescent. Once Serve begins, semantic resident locks
 	// are released only after every HTTP server has drained successfully. If the
 	// 10-second shutdown budget expires, the process is already exiting; waiting
@@ -252,6 +254,10 @@ func runServe(args []string) int {
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "错误:", err)
 		return 1
+	}
+	runtimeRepos := make([]string, 0, len(stores))
+	for _, store := range stores {
+		runtimeRepos = append(runtimeRepos, store.RepoRoot())
 	}
 	semanticProcess := engine.NewSemanticProcessCoordinator(int(serveSemanticResidentMaxMiB))
 	for _, s := range stores {
@@ -306,6 +312,13 @@ func runServe(args []string) int {
 		srv := mcpserv.New(e)
 		srv.AuthToken = tok
 		srv.LocalIdentity = identity
+		srv.RuntimeRepos = append([]string(nil), runtimeRepos...)
+		srv.Shutdown = func() {
+			select {
+			case runtimeShutdown <- struct{}{}:
+			default:
+			}
+		}
 		if actualAuth {
 			tokenPath, _ := s.AuthTokenFile()
 			fmt.Printf("鉴权已启用(%s):根 token 在用户私有状态 %s；手工/stdio 重启均保持鉴权。\n", s.RepoRoot(), tokenPath)
@@ -372,6 +385,7 @@ func runServe(args []string) int {
 	for _, u := range units {
 		go func() { errCh <- u.hs.Serve(u.ln) }()
 	}
+	shutdownReason := "收到退出信号"
 	select {
 	case err := <-errCh:
 		if err != nil && !errors.Is(err, http.ErrServerClosed) {
@@ -381,7 +395,12 @@ func runServe(args []string) int {
 		}
 	case <-ctx.Done():
 		stop()
-		fmt.Println("收到退出信号,优雅停机中(等待在途请求,上限 10s)…")
+	case <-runtimeShutdown:
+		shutdownReason = "收到已认证的本机构建换代请求"
+		stop()
+	}
+	if len(units) > 0 {
+		fmt.Println(shutdownReason + ",优雅停机中(等待在途请求,上限 10s)…")
 		// 先取消请求 context，让可选 embedding/向量长读立即停止；既有写工具
 		// 不依赖请求 context，仍由 Shutdown 等待原子落盘。
 		for _, u := range units {
@@ -535,8 +554,33 @@ func runDoctor(args []string, w io.Writer) int {
 		fmt.Fprintln(os.Stderr, "错误:", err)
 		return 1
 	}
+	// Deploy/process/runtime probing must happen before trying the repository
+	// writer lock: a healthy live daemon intentionally owns that lock for its
+	// whole lifetime and is exactly the process --deploy needs to inspect.
+	deployText, deployWarnings := "", 0
+	if *deploy {
+		deployText, deployWarnings = deployDoctorText(s)
+	}
 	releaseView, err := acquireRecoveredView(s)
 	if err != nil {
+		if errors.Is(err, store.ErrLocked) {
+			text, liveWarnings, liveErr := probeLiveDoctor(s)
+			if liveErr == nil {
+				fmt.Fprintln(w, text)
+				if deployText != "" {
+					fmt.Fprintln(w, deployText)
+				}
+				if *strict && liveWarnings+deployWarnings > 0 {
+					return 1
+				}
+				return 0
+			}
+			fmt.Fprintln(os.Stderr, "错误: 活跃 serve 持有一致视图，但无法读取其 doctor 报告:", liveErr)
+			if deployText != "" {
+				fmt.Fprintln(w, deployText)
+			}
+			return 1
+		}
 		fmt.Fprintln(os.Stderr, "错误: 无法取得一致知识视图:", err)
 		return 1
 	}
@@ -547,13 +591,9 @@ func runDoctor(args []string, w io.Writer) int {
 		return 1
 	}
 	fmt.Fprintln(w, rep.Text())
-	warnings := len(rep.Warnings)
-	if *deploy {
-		text, n := deployDoctorText()
-		if text != "" {
-			fmt.Fprintln(w, text)
-		}
-		warnings += n
+	warnings := len(rep.Warnings) + deployWarnings
+	if deployText != "" {
+		fmt.Fprintln(w, deployText)
 	}
 	if *strict && warnings > 0 {
 		return 1
@@ -561,10 +601,67 @@ func runDoctor(args []string, w io.Writer) int {
 	return 0
 }
 
-func deployDoctorText() (string, int) {
+func probeLiveDoctor(s *store.Store) (string, int, error) {
+	if s == nil || !s.Initialized() {
+		return "", 0, errors.New("知识库未初始化")
+	}
+	cfg, err := s.LoadConfig()
+	if err != nil {
+		return "", 0, fmt.Errorf("读取 serve 配置: %w", err)
+	}
+	if cfg == nil {
+		return "", 0, errors.New("读取 serve 配置: config 不存在")
+	}
+	base := fmt.Sprintf("http://127.0.0.1:%d", cfg.Port)
+	client := &http.Client{
+		Timeout:       30 * time.Second,
+		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+	}
+	session, err := s.AcquireLocalAuthSession(context.Background(), base, "/doctor", client)
+	if err != nil {
+		return "", 0, err
+	}
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, base+"/doctor", nil)
+	if err != nil {
+		return "", 0, err
+	}
+	req.Header.Set("Authorization", store.LocalSessionAuthScheme+" "+session.Token)
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", 0, err
+	}
+	body, tooLarge, readErr := readBounded(resp.Body, 4<<20)
+	closeErr := resp.Body.Close()
+	if readErr == nil {
+		readErr = closeErr
+	}
+	if readErr != nil {
+		return "", 0, readErr
+	}
+	if tooLarge {
+		return "", 0, errors.New("doctor 响应超过 4MiB")
+	}
+	if resp.StatusCode != http.StatusOK {
+		return "", 0, fmt.Errorf("doctor HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+	var envelope struct {
+		Text     string `json:"text"`
+		Warnings int    `json:"warnings"`
+	}
+	if err := json.Unmarshal(body, &envelope); err != nil {
+		return "", 0, fmt.Errorf("doctor JSON: %w", err)
+	}
+	if strings.TrimSpace(envelope.Text) == "" || envelope.Warnings < 0 {
+		return "", 0, errors.New("doctor 响应不完整")
+	}
+	return envelope.Text, envelope.Warnings, nil
+}
+
+func deployDoctorText(s *store.Store) (string, int) {
 	var b strings.Builder
 	warnings := 0
 	b.WriteString("deploy:\n")
+	fmt.Fprintf(&b, "  current build: %s\n", versionText())
 	if p, err := exec.LookPath("iknowledge"); err == nil {
 		fmt.Fprintf(&b, "  PATH iknowledge: %s\n", p)
 		if real, err := filepath.EvalSymlinks(p); err == nil && real != p {
@@ -594,11 +691,33 @@ func deployDoctorText() (string, int) {
 		}
 		b.WriteString("\n")
 	}
-	if out, err := exec.Command("pgrep", "-fl", "iknowledge serve").Output(); err == nil && strings.TrimSpace(string(out)) != "" {
-		warnings++
-		b.WriteString("  ⚠ 检测到 iknowledge serve 进程(若客户端应自行拉起,不需要服务模式):\n")
-		for line := range strings.SplitSeq(strings.TrimSpace(string(out)), "\n") {
-			fmt.Fprintf(&b, "    %s\n", line)
+	processText, processWarnings := deployProcessText()
+	if processText != "" {
+		b.WriteString(processText)
+		if !strings.HasSuffix(processText, "\n") {
+			b.WriteByte('\n')
+		}
+		warnings += processWarnings
+	}
+	if s != nil && s.Initialized() {
+		if cfg, err := s.LoadConfig(); err == nil && cfg != nil {
+			base := fmt.Sprintf("http://127.0.0.1:%d", cfg.Port)
+			status, probeErr := probeServeRuntime(s, base)
+			switch {
+			case probeErr == nil:
+				fmt.Fprintf(&b, "  repo daemon: started=%s sessions=%d repos=%d build=%s/%s\n",
+					status.StartedAt, status.Sessions, max(1, len(status.RepoRoots)), status.Build.Version, shortBuildDigest(status.Build))
+				if !buildinfo.SameRuntime(status.Build, buildinfo.Runtime()) {
+					warnings++
+					b.WriteString("  ⚠ repo daemon 与当前 executable 不是同一构建；下次 stdio 连接将认证后优雅换代\n")
+				}
+			case errors.Is(probeErr, errRuntimeEndpointMissing):
+				warnings++
+				b.WriteString("  ⚠ repo daemon 为旧版，未暴露构建身份；首次升级需人工优雅停止一次\n")
+			case !localServeUnavailable(probeErr):
+				warnings++
+				fmt.Fprintf(&b, "  ⚠ repo daemon: runtime probe unavailable(%v)\n", probeErr)
+			}
 		}
 	}
 	return strings.TrimRight(b.String(), "\n"), warnings
