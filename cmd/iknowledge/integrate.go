@@ -138,45 +138,51 @@ func runSetup(args []string, out io.Writer) int {
 	if token != "" {
 		authNote = "\n   ⚠ 已启用鉴权:http 备选片段含 token,勿提交版本库;stdio 桥无此问题(令牌自读)。"
 	}
+	mcpConfigPath := filepath.Join(root, ".mcp.json")
+	claudeInstructionsPath := filepath.Join(root, "CLAUDE.md")
+	claudeSettingsPath := filepath.Join(root, ".claude", "settings.json")
+	codexConfigPath := filepath.Join(root, ".codex", "config.toml")
+	codexInstructionsPath := filepath.Join(root, "AGENTS.md")
+	preCommitPath := filepath.Join(root, ".git", "hooks", "pre-commit")
 	if _, err := fmt.Fprintf(out, `接入配置(iknowledge 只打印不代写,铁律二):
 
-① MCP 服务(必装)——贴进 %s/.mcp.json:
+① MCP 服务(必装)——贴进 %s:
 %s
    stdio 桥按需自动拉起后台 serve(零服务管理,机器重启也不用管);鉴权令牌自动携带。
    备选(远程/自管 serve/多客户端显式共享时用 http 直连,需先手动 iknowledge serve):
 %s`+authNote+`
 
-② 纪律提示词(必装)——贴进 %s/CLAUDE.md(或 codex 等 agent 的指令文件):
+② 纪律提示词(必装)——贴进 %s(或 codex 等 agent 的指令文件):
 %s
 
-③ hook 自动注入(推荐)——贴进 %s/.claude/settings.json(已有 hooks 则合并):
+③ hook 自动注入(推荐)——贴进 %s(已有 hooks 则合并):
 %s
    效果:AI 每次 Read/Edit/Write 一个文件,该文件的知识+过时警报自动进上下文;
    serve 未启动时 hook 静默无操作,不影响任何工具调用。
 
-④ Codex 接入(可选)——把下面段落合并进 %s/.codex/config.toml(CLI 与桌面 App 共用;
+④ Codex 接入(可选)——把下面段落合并进 %s(CLI 与桌面 App 共用;
    项目需在 Codex 中标记为 trusted)。不要把 repo 专属 knowledge 默认放进
    ~/.codex/config.toml,否则每个无关任务也会启动它:
 %s
    备选(http 直连):
 %s
-   纪律提示词贴进 %s/AGENTS.md(内容同②)。Codex 无 hook 注入机制,靠纪律主动查询。
+   纪律提示词贴进 %s(内容同②)。Codex 无 hook 注入机制,靠纪律主动查询。
    注意:Codex 对 MCP 工具调用会弹审批,交互界面点允许即可;headless exec 需
-   --dangerously-bypass-approvals-and-sandbox。多仓库共存时把条目名 knowledge
-   改成不重复的名字(如 knowledge-<项目名>)。
+   --dangerously-bypass-approvals-and-sandbox。项目级配置中每个仓库都可使用
+   条目名 knowledge,无需为多仓库改名;只有把多个仓库条目合并到同一份配置时才需唯一名称。
 
-⑤ Git pre-commit 预检(可选)——合并进 %s/.git/hooks/pre-commit,不要覆盖已有 hook:
+⑤ Git pre-commit 预检(可选)——合并进 %s,不要覆盖已有 hook:
 %s
    效果:提交前呈现历史否决方案、腐烂知识、未决矛盾、雷区,并逐文件核对新增 journal nodes;
    缺省只告警不阻断,需要门禁时自行追加 --strict。
 
 验证:任一 AI 会话连上后调 kb_status;或手动 iknowledge serve --repo %s 后
   curl "http://127.0.0.1:%d/inject?file=<某个 .go 文件路径>"
-`, root, mcpJSONSnippet(root), mcpJSONHTTPSnippet(root, cfg.Port, token),
-		root, engine.DisciplinePrompt,
-		root, hooksJSONSnippet(),
-		root, codexTOMLSnippet(root), codexTOMLHTTPSnippet(root, cfg.Port, token),
-		root, root, preCommitHookSnippet(), root, cfg.Port); err != nil {
+`, mcpConfigPath, mcpJSONSnippet(root), mcpJSONHTTPSnippet(root, cfg.Port, token),
+		claudeInstructionsPath, engine.DisciplinePrompt,
+		claudeSettingsPath, hooksJSONSnippet(),
+		codexConfigPath, codexTOMLSnippet(root), codexTOMLHTTPSnippet(root, cfg.Port, token),
+		codexInstructionsPath, preCommitPath, preCommitHookSnippet(), root, cfg.Port); err != nil {
 		fmt.Fprintln(os.Stderr, "错误:写 setup 输出:", err)
 		return 1
 	}

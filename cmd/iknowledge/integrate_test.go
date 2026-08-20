@@ -193,8 +193,9 @@ func TestSetupPrints(t *testing.T) {
 		"本仓库配有 knowledge MCP", // 纪律段(engine.DisciplinePrompt 首行)
 		"PostToolUse", `"command": "iknowledge hook"`,
 		"[mcp_servers.knowledge]", "AGENTS.md", // Codex 段(config.toml + 纪律载体)
-		filepath.Join(repo, ".codex/config.toml"), `cwd = "` + repo + `"`,
+		filepath.Join(repo, ".codex", "config.toml"), fmt.Sprintf("cwd = %q", repo),
 		"不要把 repo 专属 knowledge 默认放进\n   ~/.codex/config.toml",
+		"项目级配置中每个仓库都可使用\n   条目名 knowledge,无需为多仓库改名",
 		"Git pre-commit 预检", "iknowledge precheck --repo .",
 	} {
 		if !strings.Contains(out.String(), want) {

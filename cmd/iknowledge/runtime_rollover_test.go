@@ -191,7 +191,11 @@ func TestDeployDoctorCountsAuthenticatedRuntimeProbeFailure(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Symlink(exe, filepath.Join(binDir, "iknowledge")); err != nil {
+	binName := "iknowledge"
+	if strings.EqualFold(filepath.Ext(exe), ".exe") {
+		binName += ".exe"
+	}
+	if err := os.Symlink(exe, filepath.Join(binDir, binName)); err != nil {
 		t.Skipf("cannot create deterministic PATH fixture: %v", err)
 	}
 	t.Setenv("PATH", binDir)
